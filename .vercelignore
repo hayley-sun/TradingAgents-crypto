@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Results and cache
+results/
+eval_results/
+data_cache/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local development
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Dependencies (use requirements_vercel.txt instead)
+requirements.txt
+requirements_web.txt
+
+# Documentation
+WEB_INTERFACE_README.md
+WEB_UPDATES_SUMMARY.md
+CRYPTO_MODIFICATIONS.md
+
+# CLI application
+cli/
+main.py
+test_crypto.py
+
+# Original web app with SocketIO
+web_app.py
+simple_web.py
+run_web.py 

@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Agents Crypto - Analysis Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root {
+            /* Clean Light Mode - Simple & Professional */
+            --bg-primary: #ffffff;
+            --bg-secondary: #ffffff;
+            --bg-panel: #ffffff;
+            --bg-progress: #f8fafc;
+            --bg-header: #f8fafc;
+            --text-primary: #1e293b;
+            --text-secondary: #1e293b;
+            --text-muted: #64748b;
+            --text-white: #1e293b;
+            --border-color: #e2e8f0;
+            --border-hover: #0ea5e9;
+            --shadow: rgba(0,0,0,0.08);
+            --shadow-light: rgba(0, 0, 0, 0.05);
+            --progress-bg: #0ea5e9;
+            --message-bg: #f8fafc;
+            --agent-pending: #f8fafc;
+            --agent-progress: rgba(255, 193, 7, 0.1);
+            --agent-completed: rgba(14, 165, 233, 0.1);
+        }
+        
+        [data-theme="dark"] {
+            /* Clean Dark Mode */
+            --bg-primary: #0f172a;
+            --bg-secondary: #0f172a;
+            --bg-panel: #1e293b;
+            --bg-progress: #1e293b;
+            --bg-header: #1e293b;
+            --text-primary: #f1f5f9;
+            --text-secondary: #f1f5f9;
+            --text-muted: #94a3b8;
+            --text-white: #f1f5f9;
+            --border-color: #475569;
+            --border-hover: #06b6d4;
+            --shadow: rgba(0,0,0,0.3);
+            --shadow-light: rgba(0, 0, 0, 0.2);
+            --progress-bg: #06b6d4;
+            --message-bg: #334155;
+            --agent-pending: #334155;
+            --agent-progress: rgba(255, 193, 7, 0.2);
+            --agent-completed: rgba(6, 182, 212, 0.2);
+        }
+
+        body {
+            background: var(--bg-primary);
+            min-height: 100vh;
+            font-family: 'Arial', sans-serif;
+            color: var(--text-primary);
+            transition: all 0.3s ease;
+        }
+        
+        .dashboard-container {
+            background: var(--bg-secondary);
+            border-radius: 20px;
+            box-shadow: 0 20px 40px var(--shadow);
+            margin: 20px;
+            overflow: hidden;
+            min-height: 90vh;
+            transition: all 0.3s ease;
+        }
+        
+        .header-section {
+            background: var(--bg-header);
+            color: var(--text-white);
+            padding: 20px;
+            position: relative;
+        }
+        
+        .theme-toggle {
+            background: var(--bg-panel);
+            border: 2px solid var(--border-color);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .theme-toggle:hover {
+            border-color: var(--border-hover);
+            transform: scale(1.05);
+        }
+        
+        .light-icon, .dark-icon {
+            font-size: 16px;
+            transition: all 0.3s ease;
+            position: absolute;
+        }
+        
+        /* Light mode - show moon icon */
+        .light-icon {
+            opacity: 1;
+            transform: rotate(0deg);
+        }
+        
+        .dark-icon {
+            opacity: 0;
+            transform: rotate(180deg);
+        }
+        
+        /* Dark mode - show sun icon */
+        [data-theme="dark"] .light-icon {
+            opacity: 0;
+            transform: rotate(-180deg);
+        }
+        
+        [data-theme="dark"] .dark-icon {
+            opacity: 1;
+            transform: rotate(0deg);
+        }
+        
+        /* Social Media Links */
+        .social-links {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            margin-right: 10px;
+        }
+        
+        .social-link {
+            background: var(--bg-card);
+            border: 2px solid var(--border-color);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            color: var(--text-primary);
+            font-size: 16px;
+        }
+        
+        .social-link:hover {
+            border-color: var(--border-hover);
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px var(--shadow-hover);
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+        
+        .social-link.twitter:hover {
+            background: #1da1f2;
+            border-color: #1da1f2;
+            color: white;
+        }
+        
+        .social-link.github:hover {
+            background: #333;
+            border-color: #333;
+            color: white;
+        }
+        
+        [data-theme="dark"] .social-link.github:hover {
+            background: #f0f6fc;
+            border-color: #f0f6fc;
+            color: #24292f;
+        }
+        
+        /* Responsive Design for Social Links */
+        @media (max-width: 768px) {
+            .social-links {
+                margin-right: 5px;
+                gap: 8px;
+            }
+            
+            .social-link {
+                width: 35px;
+                height: 35px;
+                font-size: 14px;
+            }
+            
+            .header-section .col-md-4 {
+                margin-top: 10px;
+            }
+        }
+        
+
+        
+        .progress-section {
+            background: var(--bg-progress);
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .progress-bar-custom {
+            height: 25px;
+            border-radius: 15px;
+            background: var(--progress-bg);
+            transition: all 0.3s ease;
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+            height: calc(100vh - 250px);
+        }
+        
+        .panel {
+            background: var(--bg-panel);
+            border: 2px solid var(--border-color);
+            border-radius: 15px;
+            padding: 20px;
+            overflow-y: auto;
+            box-shadow: 0 5px 15px var(--shadow-light);
+            transition: all 0.3s ease;
+        }
+        
+        .panel h5 {
+            color: var(--text-secondary);
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid var(--border-color);
+        }
+        
+        .agent-status {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 10px;
+            transition: all 0.3s ease;
+        }
+        
+        .agent-status.pending {
+            background: var(--agent-pending);
+            border: 1px solid var(--border-color);
+        }
+        
+        .agent-status.in_progress {
+            background: var(--agent-progress);
+            border: 1px solid #ffc107;
+        }
+        
+        .agent-status.completed {
+            background: var(--agent-completed);
+            border: 1px solid var(--border-hover);
+        }
+        
+        .status-icon {
+            margin-right: 10px;
+            width: 20px;
+            text-align: center;
+        }
+        
+        .status-icon.pending {
+            color: #6c757d;
+        }
+        
+        .status-icon.in_progress {
+            color: #ffc107;
+        }
+        
+        .status-icon.completed {
+            color: var(--border-hover);
+        }
+        
+        .message-item {
+            background: var(--message-bg);
+            border-left: 4px solid var(--border-hover);
+            padding: 10px 15px;
+            margin-bottom: 10px;
+            border-radius: 0 10px 10px 0;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            color: var(--text-primary);
+        }
+        
+        .message-timestamp {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            margin-bottom: 5px;
+        }
+        
+        .message-type {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+        
+        .message-system {
+            border-left-color: #28a745;
+        }
+        
+        .message-system .message-type {
+            background: #28a745;
+        }
+        
+        .message-error {
+            border-left-color: #dc3545;
+            background: rgba(220, 53, 69, 0.1);
+        }
+        
+        .message-error .message-type {
+            background: #dc3545;
+        }
+        
+        .message-bull {
+            border-left-color: #28a745;
+            background: rgba(40, 167, 69, 0.05);
+        }
+        
+        .message-bull .message-type {
+            background: #28a745;
+        }
+        
+        .message-bear {
+            border-left-color: #dc3545;
+            background: rgba(220, 53, 69, 0.05);
+        }
+        
+        .message-bear .message-type {
+            background: #dc3545;
+        }
+        
+        .message-research {
+            border-left-color: #ffc107;
+            background: rgba(255, 193, 7, 0.05);
+        }
+        
+        .message-research .message-type {
+            background: #ffc107;
+            color: #000;
+        }
+        
+        .message-content {
+            word-wrap: break-word;
+            white-space: pre-wrap;
+        }
+        
+        .report-content {
+            line-height: 1.6;
+        }
+        
+        .report-content h1,
+        .report-content h2,
+        .report-content h3 {
+            color: var(--text-secondary);
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
+        
+        .copyright-notice {
+            background: var(--bg-panel);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+        
+        .copyright-notice a {
+            color: var(--border-hover);
+            text-decoration: none;
+        }
+        
+        .copyright-notice a:hover {
+            text-decoration: underline;
+        }
+        
+        .report-content ul {
+            padding-left: 20px;
+        }
+        
+        .report-content blockquote {
+            border-left: 4px solid #667eea;
+            padding-left: 15px;
+            margin: 15px 0;
+            color: #6c757d;
+        }
+        
+        .loading-spinner {
+            text-align: center;
+            padding: 20px;
+            color: #6c757d;
+        }
+        
+        .connection-status {
+            display: none; /* Hidden for cleaner UI */
+        }
+        
+        .toolbar {
+            padding: 10px 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .btn-export {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            border: none;
+            border-radius: 20px;
+            color: white;
+            padding: 8px 20px;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-export:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 5px 15px rgba(40, 167, 69, 0.3);
+            color: white;
+        }
+        
+        .btn-restart {
+            background: var(--bg-panel);
+            border: 2px solid var(--border-hover);
+            border-radius: 20px;
+            color: var(--border-hover);
+            padding: 8px 20px;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+            font-weight: 500;
+        }
+        
+        .btn-restart:hover {
+            background: var(--border-hover);
+            color: white;
+            transform: translateY(-1px);
+            box-shadow: 0 5px 15px rgba(14, 165, 233, 0.3);
+        }
+        
+        [data-theme="dark"] .btn-restart:hover {
+            box-shadow: 0 5px 15px rgba(6, 182, 212, 0.3);
+        }
+        
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+                height: auto;
+            }
+            
+            .panel {
+                height: 300px;
+            }
+            
+            .header-section .col-md-4 {
+                margin-top: 15px;
+                text-align: center !important;
+            }
+            
+            .btn-export, .btn-restart {
+                padding: 6px 12px;
+                font-size: 0.8rem;
+                margin-bottom: 5px;
+            }
+            
+            .theme-toggle {
+                width: 35px;
+                height: 35px;
+                margin-left: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status" id="connectionStatus">
+        <i class="fas fa-circle"></i> Connected
+    </div>
+    
+    <div class="dashboard-container">
+        <div class="header-section">
+            <div class="row align-items-center">
+                <div class="col-md-8">
+                    <h2><i class="fas fa-chart-line"></i> Trading Agents Crypto Dashboard</h2>
+                    <p class="mb-0" id="analysisInfo">Analysis in progress...</p>
+                </div>
+                <div class="col-md-4 text-end">
+                    <button class="btn btn-export me-2" onclick="exportReport()">
+                        <i class="fas fa-download"></i> Export Report
+                    </button>
+                    <button class="btn btn-restart me-2" onclick="restartAnalysis()">
+                        <i class="fas fa-redo"></i> New Analysis
+                    </button>
+                    <div class="social-links">
+                        <a href="https://x.com/0x0funky/" target="_blank" rel="noopener noreferrer" 
+                           class="social-link twitter" title="Follow on Twitter">
+                            <i class="fab fa-twitter"></i>
+                        </a>
+                        <a href="https://github.com/0x0funky/TradingAgents-crypto" target="_blank" rel="noopener noreferrer" 
+                           class="social-link github" title="View on GitHub">
+                            <i class="fab fa-github"></i>
+                        </a>
+                    </div>
+                    <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme">
+                        <span class="light-icon">☀️</span>
+                        <span class="dark-icon">🌙</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="progress-section">
+            <div class="row align-items-center">
+                <div class="col-md-8">
+                    <div class="progress" style="height: 25px; border-radius: 15px;">
+                        <div class="progress-bar progress-bar-custom" id="progressBar" 
+                             role="progressbar" style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                            0%
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-muted" id="progressText">Waiting to start...</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="main-content">
+            <!-- Agent Status Panel -->
+            <div class="panel">
+                <h5><i class="fas fa-users"></i> Agent Status</h5>
+                <div id="agentStatus">
+                    <div class="agent-status pending" data-agent="Market Analyst">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Market Analyst</strong>
+                            <div class="small text-muted">Technical analysis</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Social Analyst">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Social Analyst</strong>
+                            <div class="small text-muted">Social sentiment</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="News Analyst">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>News Analyst</strong>
+                            <div class="small text-muted">News analysis</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Fundamentals Analyst">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Fundamentals Analyst</strong>
+                            <div class="small text-muted">Financial fundamentals</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Bull Researcher">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Bull Researcher</strong>
+                            <div class="small text-muted">Bullish research</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Bear Researcher">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Bear Researcher</strong>
+                            <div class="small text-muted">Bearish research</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Research Manager">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Research Manager</strong>
+                            <div class="small text-muted">Research coordination</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Trader">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Trader</strong>
+                            <div class="small text-muted">Trading strategy</div>
+                        </div>
+                    </div>
+                    <div class="agent-status pending" data-agent="Portfolio Manager">
+                        <div class="status-icon pending"><i class="fas fa-circle"></i></div>
+                        <div>
+                            <strong>Portfolio Manager</strong>
+                            <div class="small text-muted">Portfolio decisions</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Messages Panel -->
+            <div class="panel">
+                <h5><i class="fas fa-comments"></i> Analysis Messages</h5>
+                <div id="messagesContainer">
+                    <div class="loading-spinner">
+                        <i class="fas fa-spinner fa-spin"></i>
+                        <p>Waiting for analysis to start...</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Reports Panel -->
+            <div class="panel">
+                <h5><i class="fas fa-file-alt"></i> Analysis Reports</h5>
+                <div id="reportsContainer">
+                    <div class="loading-spinner">
+                        <i class="fas fa-chart-area"></i>
+                        <p>Reports will appear here as analysis progresses...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="copyright-notice">
+        <p class="mb-0">
+            This is a modified version of 
+            <a href="https://github.com/TauricResearch/TradingAgents" target="_blank" rel="noopener noreferrer">
+                TauricResearch/TradingAgents
+            </a>, 
+            with added support for cryptocurrency trading. Licensed under Apache 2.0.
+        </p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Get session ID from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const sessionId = urlParams.get('session');
+        
+        if (!sessionId) {
+            alert('No session ID found. Redirecting to home page.');
+            window.location.href = '/';
+        }
+        
+        // Theme Management
+        function toggleTheme() {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            
+            document.documentElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('tradingAgentsCrypto_theme', newTheme);
+        }
+        
+        function loadSavedTheme() {
+            const savedTheme = localStorage.getItem('tradingAgentsCrypto_theme') || 'light';
+            document.documentElement.setAttribute('data-theme', savedTheme);
+        }
+        
+        // Load saved theme on page load
+        loadSavedTheme();
+        
+        // Initialize WebSocket connection
+        const socket = io();
+        
+        // Update connection status
+        socket.on('connect', function() {
+            document.getElementById('connectionStatus').innerHTML = '<i class="fas fa-circle"></i> Connected';
+            document.getElementById('connectionStatus').className = 'connection-status';
+        });
+        
+        socket.on('disconnect', function() {
+            document.getElementById('connectionStatus').innerHTML = '<i class="fas fa-circle"></i> Disconnected';
+            document.getElementById('connectionStatus').className = 'connection-status disconnected';
+        });
+        
+        // Update analysis info when session starts
+        socket.on('session_state', function(data) {
+            updateAgentStatus(data.agent_status);
+            updateMessages(data.messages);
+            updateReports(data.report_sections);
+            updateProgress(data.progress, data.current_step);
+        });
+        
+        // Join session room
+        socket.emit('join_session', {'session_id': sessionId});
+        
+        // Handle session state updates
+        socket.on('session_state', function(data) {
+            updateAgentStatus(data.agent_status);
+            updateMessages(data.messages);
+            updateReports(data.report_sections);
+            updateProgress(data.progress, data.current_step);
+        });
+        
+        // Handle real-time updates
+        socket.on('new_message', function(message) {
+            addMessage(message);
+        });
+        
+        socket.on('agent_status_update', function(data) {
+            updateAgentStatusSingle(data.agent, data.status);
+        });
+        
+        socket.on('report_update', function(data) {
+            updateReportSection(data.section, data.content);
+        });
+        
+        socket.on('analysis_info_update', function(data) {
+            document.getElementById('analysisInfo').textContent = `Analyzing ${data.ticker} on ${data.analysis_date}`;
+        });
+        
+        // Removed duplicate progress_update listener - handled below with completion notification
+        
+        // Update functions
+        function updateProgress(progress, step) {
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            
+            progressBar.style.width = progress + '%';
+            progressBar.textContent = progress + '%';
+            progressBar.setAttribute('aria-valuenow', progress);
+            progressText.textContent = step;
+        }
+        
+        function updateAgentStatus(agentStatus) {
+            Object.keys(agentStatus).forEach(agent => {
+                updateAgentStatusSingle(agent, agentStatus[agent]);
+            });
+        }
+        
+        function updateAgentStatusSingle(agent, status) {
+            const agentElement = document.querySelector(`[data-agent="${agent}"]`);
+            if (agentElement) {
+                agentElement.className = `agent-status ${status}`;
+                const icon = agentElement.querySelector('.status-icon');
+                icon.className = `status-icon ${status}`;
+                
+                const iconSymbol = icon.querySelector('i');
+                if (status === 'pending') {
+                    iconSymbol.className = 'fas fa-circle';
+                } else if (status === 'in_progress') {
+                    iconSymbol.className = 'fas fa-spinner fa-spin';
+                } else if (status === 'completed') {
+                    iconSymbol.className = 'fas fa-check-circle';
+                }
+            }
+        }
+        
+        function updateMessages(messages) {
+            const container = document.getElementById('messagesContainer');
+            container.innerHTML = '';
+            
+            messages.forEach(message => {
+                addMessage(message);
+            });
+        }
+        
+        function addMessage(message) {
+            const container = document.getElementById('messagesContainer');
+            const messageElement = document.createElement('div');
+            
+            // Determine message class based on type
+            let messageClass = `message-item message-${message.type.toLowerCase().replace(' ', '')}`;
+            if (message.type.includes('Bull')) messageClass += ' message-bull';
+            if (message.type.includes('Bear')) messageClass += ' message-bear';
+            if (message.type.includes('Research')) messageClass += ' message-research';
+            
+            messageElement.className = messageClass;
+            
+            // Clean and format content
+            let content = message.content;
+            if (typeof content === 'string') {
+                // Remove excessive markdown formatting and clean up
+                content = content
+                    .replace(/#{1,6}\s*/g, '') // Remove markdown headers
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // Bold
+                    .replace(/\*(.*?)\*/g, '<em>$1</em>') // Italic
+                    .replace(/```[\s\S]*?```/g, '<code>$&</code>') // Code blocks
+                    .replace(/\n\n+/g, '\n\n') // Reduce multiple newlines
+                    .trim();
+                
+                // Truncate very long messages
+                if (content.length > 800) {
+                    content = content.substring(0, 800) + '...';
+                }
+            }
+            
+            messageElement.innerHTML = `
+                <div class="message-timestamp">${message.timestamp}</div>
+                <span class="message-type">${message.type}</span>
+                <div class="message-content">${content}</div>
+            `;
+            
+            container.appendChild(messageElement);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        function updateReports(reportSections) {
+            const container = document.getElementById('reportsContainer');
+            container.innerHTML = '';
+            
+            Object.keys(reportSections).forEach(section => {
+                if (reportSections[section]) {
+                    updateReportSection(section, reportSections[section]);
+                }
+            });
+        }
+        
+        function updateReportSection(section, content) {
+            const container = document.getElementById('reportsContainer');
+            
+            // Remove existing section if it exists
+            const existingSection = document.querySelector(`[data-section="${section}"]`);
+            if (existingSection) {
+                existingSection.remove();
+            }
+            
+            const sectionElement = document.createElement('div');
+            sectionElement.setAttribute('data-section', section);
+            sectionElement.className = 'report-section mb-4';
+            
+            const sectionTitles = {
+                'market_report': 'Market Analysis',
+                'sentiment_report': 'Social Sentiment',
+                'news_report': 'News Analysis',
+                'fundamentals_report': 'Fundamentals Analysis',
+                'investment_plan': 'Research Team Decision',
+                'trader_investment_plan': 'Trading Plan',
+                'final_trade_decision': 'Portfolio Management Decision'
+            };
+            
+            sectionElement.innerHTML = `
+                <h6 class="text-primary">${sectionTitles[section] || section}</h6>
+                <div class="report-content">${marked.parse(content)}</div>
+                <hr>
+            `;
+            
+            container.appendChild(sectionElement);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        function exportReport() {
+            const reports = document.getElementById('reportsContainer').innerHTML;
+            const blob = new Blob([`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>TradingAgents Analysis Report</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 40px; }
+                        h1, h2, h3 { color: #2d3748; }
+                        .report-content { line-height: 1.6; }
+                    </style>
+                </head>
+                <body>
+                    <h1>TradingAgents Analysis Report</h1>
+                    <p>Generated on: ${new Date().toLocaleString()}</p>
+                    <p>Session ID: ${sessionId}</p>
+                    <hr>
+                    ${reports}
+                </body>
+                </html>
+            `], { type: 'text/html' });
+            
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `tradingagents-report-${sessionId}.html`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        function restartAnalysis() {
+            if (confirm('Are you sure you want to start a new analysis? This will return to the configuration page.')) {
+                window.location.href = '/';
+            }
+        }
+        
+        // Check if analysis is completed and show completion message
+        socket.on('progress_update', function(data) {
+            updateProgress(data.progress, data.step);
+            
+            // Show completion notification when analysis is done
+            if (data.progress >= 100) {
+                setTimeout(() => {
+                    const completionModal = document.createElement('div');
+                    completionModal.innerHTML = `
+                        <div class="alert alert-success alert-dismissible fade show" role="alert" 
+                             style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 9999; min-width: 300px;">
+                            <h5 class="alert-heading"><i class="fas fa-check-circle"></i> Analysis Complete!</h5>
+                            <p>Your trading analysis has been completed successfully. You can now:</p>
+                            <hr>
+                            <div class="d-flex gap-2">
+                                <button class="btn btn-success btn-sm" onclick="exportReport()">
+                                    <i class="fas fa-download"></i> Export Report
+                                </button>
+                                <button class="btn btn-outline-success btn-sm" onclick="restartAnalysis()">
+                                    <i class="fas fa-redo"></i> New Analysis
+                                </button>
+                            </div>
+                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    `;
+                    document.body.appendChild(completionModal);
+                    
+                    // Auto-remove after 10 seconds
+                    setTimeout(() => {
+                        if (completionModal.parentNode) {
+                            completionModal.remove();
+                        }
+                    }, 10000);
+                }, 2000);
+            }
+        });
+    </script>
+</body>
+</html> 

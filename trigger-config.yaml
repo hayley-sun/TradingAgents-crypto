@@ -1,0 +1,8 @@
+﻿name: github-tradingagents-crypto-trigger
+description: "Auto-deploy TradingAgents Crypto on push to main"
+github:
+  owner: 0x0funky
+  name: TradingAgents-crypto
+  push:
+    branch: "^main$"
+filename: cloudbuild.yaml

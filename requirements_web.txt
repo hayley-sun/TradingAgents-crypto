@@ -1,0 +1,37 @@
+# Flask Web Framework
+Flask==2.3.3
+Flask-SocketIO==5.3.6
+python-socketio==5.8.0
+python-engineio==4.7.1
+
+# LangChain and LLM Dependencies
+langchain-openai
+langchain-experimental
+langchain_anthropic
+langchain-google-genai
+langgraph
+
+# Data Analysis and Finance
+pandas
+yfinance
+stockstats
+pytz
+
+# Vector Database
+chromadb
+
+# Web Scraping and Data Sources
+requests
+feedparser
+praw
+parsel
+tqdm
+finnhub-python
+
+# Crypto-specific data sources
+eodhd
+
+# Additional utilities
+typing-extensions
+setuptools
+rich 
