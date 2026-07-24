@@ -11,6 +11,7 @@ import re
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_providers import build_graph_config
 
 # Security utility for safe logging
 def safe_log_config(config: Dict) -> Dict:
@@ -187,16 +188,7 @@ def run_analysis_background(session_id: str, config: Dict):
         buffer = analysis_sessions[session_id]['buffer']
         buffer.add_message("System", f"Initializing analysis for {config['ticker']}...")
         # Update configuration based on user selections
-        updated_config = DEFAULT_CONFIG.copy()
-        updated_config.update({
-            'llm_provider': config['llm_provider'],
-            'backend_url': config['backend_url'],
-            'api_key': config.get('api_key', ''),
-            'shallow_thinker': config['shallow_thinker'],
-            'deep_thinker': config['deep_thinker'],
-            'research_depth': config['research_depth'],
-            'session_id': session_id  # Add session ID for unique memory collections
-        })
+        updated_config = build_graph_config(DEFAULT_CONFIG, config, session_id)
         
         if not is_production():
             print(f"[DEBUG] LLM provider: {updated_config['llm_provider']}")
@@ -362,4 +354,4 @@ if __name__ == '__main__':
     # Use port from environment variable for Cloud Run compatibility
     port = int(os.environ.get('PORT', 8080))
     
-    socketio.run(app, debug=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True) 
+    socketio.run(app, debug=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)

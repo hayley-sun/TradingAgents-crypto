@@ -14,6 +14,7 @@ from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_providers import is_openai_compatible_provider
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.agents.utils.agent_states import (
     AgentState,
@@ -58,7 +59,8 @@ class TradingAgentsGraph:
         )
 
         # Initialize LLMs
-        if self.config["llm_provider"].lower() == "openai" or self.config["llm_provider"] == "ollama" or self.config["llm_provider"] == "openrouter":
+        provider = self.config["llm_provider"].lower()
+        if is_openai_compatible_provider(provider):
             self.deep_thinking_llm = ChatOpenAI(
                 model=self.config["deep_think_llm"], 
                 base_url=self.config["backend_url"],
@@ -69,7 +71,7 @@ class TradingAgentsGraph:
                 base_url=self.config["backend_url"],
                 api_key=self.config["api_key"]
             )
-        elif self.config["llm_provider"].lower() == "anthropic":
+        elif provider == "anthropic":
             self.deep_thinking_llm = ChatAnthropic(
                 model=self.config["deep_think_llm"], 
                 base_url=self.config["backend_url"],
@@ -80,7 +82,7 @@ class TradingAgentsGraph:
                 base_url=self.config["backend_url"],
                 api_key=self.config["api_key"]
             )
-        elif self.config["llm_provider"].lower() == "google":
+        elif provider == "google":
             self.deep_thinking_llm = ChatGoogleGenerativeAI(
                 model=self.config["deep_think_llm"],
                 google_api_key=self.config["api_key"]

@@ -4,19 +4,38 @@ import pandas as pd
 from typing import Annotated, Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import time
-from .config import DATA_DIR
 import os
+
+try:
+    from .config import DATA_DIR
+except ImportError:
+    DATA_DIR = None
 
 
 class CoinGeckoAPI:
     """CoinGecko API utilities for cryptocurrency data"""
-    
-    def __init__(self, api_key: Optional[str] = None):
-        self.base_url = "https://api.coingecko.com/api/v3"
-        self.api_key = api_key or os.getenv("COINGECKO_API_KEY")
+
+    PUBLIC_BASE_URL = "https://api.coingecko.com/api/v3"
+    PRO_BASE_URL = "https://pro-api.coingecko.com/api/v3"
+    PUBLIC_MAX_RANGE_DAYS = 364
+    PLACEHOLDER_KEYS = {
+        "",
+        "your_key",
+        "your_api_key",
+        "your_coingecko_key",
+        "your_coingecko_api_key",
+        "coingecko_api_key",
+    }
+
+    def __init__(self, api_key: Optional[str] = None, api_plan: Optional[str] = None):
+        self.api_key, self.api_plan = self._resolve_api_credentials(api_key, api_plan)
+        self.base_url = self.PRO_BASE_URL if self.api_plan == "pro" else self.PUBLIC_BASE_URL
         self.session = requests.Session()
-        if self.api_key:
-            self.session.headers.update({"X-Cg-Pro-Api-Key": self.api_key})
+
+        if self.api_key and self.api_plan == "pro":
+            self.session.headers.update({"x-cg-pro-api-key": self.api_key})
+        elif self.api_key:
+            self.session.headers.update({"x-cg-demo-api-key": self.api_key})
         
         # Direct mapping for major cryptocurrencies to avoid API calls and ambiguity
         self.major_coin_ids = {
@@ -68,21 +87,64 @@ class CoinGeckoAPI:
             'ldo': 'lido-dao',
             'op': 'optimism'
         }
+
+    @classmethod
+    def _clean_api_key(cls, api_key: Optional[str]) -> Optional[str]:
+        cleaned = (api_key or "").strip().strip('"').strip("'")
+        if cleaned.lower() in cls.PLACEHOLDER_KEYS:
+            return None
+        return cleaned
+
+    @classmethod
+    def _resolve_api_credentials(cls, api_key: Optional[str], api_plan: Optional[str]):
+        plan = (api_plan or os.getenv("COINGECKO_API_PLAN") or "").strip().lower()
+
+        if api_key:
+            return cls._clean_api_key(api_key), plan if plan == "pro" else "demo"
+
+        pro_key = cls._clean_api_key(os.getenv("COINGECKO_PRO_API_KEY"))
+        if pro_key:
+            return pro_key, "pro"
+
+        demo_key = cls._clean_api_key(os.getenv("COINGECKO_DEMO_API_KEY"))
+        if demo_key:
+            return demo_key, "demo"
+
+        legacy_key = cls._clean_api_key(os.getenv("COINGECKO_API_KEY"))
+        if legacy_key:
+            return legacy_key, "pro" if plan == "pro" else "demo"
+
+        return None, "demo"
     
     def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
         """Make API request with error handling and rate limiting"""
         url = f"{self.base_url}{endpoint}"
-        try:
-            response = self.session.get(url, params=params)
-            if response.status_code == 429:
-                print("Rate limit exceeded. Please wait before making more requests.")
-                time.sleep(2)  # Wait 2 seconds before retrying
-                response = self.session.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error making request to {url}: {e}")
-            return {}
+        last_error = None
+
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, params=params, timeout=20)
+                if response.status_code == 429 and attempt < 2:
+                    print("Rate limit exceeded. Please wait before making more requests.")
+                    time.sleep(2 ** attempt)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except (
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+            except requests.exceptions.RequestException as e:
+                print(f"Error making request to {url}: {e}")
+                return {}
+
+        print(f"Error making request to {url}: {last_error}")
+        return {}
     
     def get_coin_id(self, symbol: str) -> Optional[str]:
         """Get CoinGecko coin ID from symbol, prioritizing major cryptocurrencies"""
@@ -146,9 +208,22 @@ def get_crypto_price_data(
     if not coin_id:
         return f"Error: Could not find coin ID for symbol {symbol}"
     
+    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+    requested_start_date = start_date
+    range_adjustment_note = ""
+
+    if api.api_plan != "pro" and (end_date_obj - start_date_obj).days > api.PUBLIC_MAX_RANGE_DAYS:
+        start_date_obj = end_date_obj - timedelta(days=api.PUBLIC_MAX_RANGE_DAYS)
+        start_date = start_date_obj.strftime("%Y-%m-%d")
+        range_adjustment_note = (
+            f"> Note: requested start date {requested_start_date} was adjusted to {start_date} "
+            "because CoinGecko Demo/Public API limits historical range requests.\n\n"
+        )
+
     # Convert dates to timestamps
-    start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp())
-    end_timestamp = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp())
+    start_timestamp = int(start_date_obj.timestamp())
+    end_timestamp = int(end_date_obj.timestamp())
     
     params = {
         "vs_currency": "usd",
@@ -167,6 +242,7 @@ def get_crypto_price_data(
     market_caps = data.get("market_caps", [])
     
     result_str = f"## {symbol.upper()} Price Data from {start_date} to {end_date}:\n\n"
+    result_str += range_adjustment_note
     
     for i, price_point in enumerate(prices[-30:]):  # Last 30 days
         timestamp = price_point[0]
@@ -345,4 +421,4 @@ def get_crypto_technical_indicators(
     result_str += f"- Distance from 30d High: {((current_price - high_30d) / high_30d * 100):+.1f}%\n"
     result_str += f"- Distance from 30d Low: {((current_price - low_30d) / low_30d * 100):+.1f}%\n"
     
-    return result_str 
+    return result_str
