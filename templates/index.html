@@ -543,6 +543,7 @@
                                 <option value="openai">OpenAI</option>
                                 <option value="anthropic">Anthropic</option>
                                 <option value="google">Google</option>
+                                <option value="deepseek">DeepSeek</option>
                             </select>
                             <input type="text" class="form-control" id="backend_url" name="backend_url" 
                                    placeholder="Backend URL" value="https://api.openai.com/v1" style="margin-top: 12px;">
@@ -752,7 +753,8 @@
             const urls = {
                 'openai': 'https://api.openai.com/v1',
                 'anthropic': 'https://api.anthropic.com/',
-                'google': 'https://generativelanguage.googleapis.com/v1'
+                'google': 'https://generativelanguage.googleapis.com/v1',
+                'deepseek': 'https://api.deepseek.com'
             };
             urlInput.value = urls[provider] || '';
             
@@ -802,6 +804,16 @@
                         {value: 'gemini-2.5-flash-preview-05-20', text: 'Gemini 2.5 Flash - Adaptive thinking, cost efficiency'},
                         {value: 'gemini-2.5-pro-preview-06-05', text: 'Gemini 2.5 Pro'}
                     ]
+                },
+                'deepseek': {
+                    shallow: [
+                        {value: 'deepseek-v4-flash', text: 'DeepSeek V4 Flash - Fast model for quick tasks'},
+                        {value: 'deepseek-v4-pro', text: 'DeepSeek V4 Pro - DeepSeek flagship model'}
+                    ],
+                    deep: [
+                        {value: 'deepseek-v4-flash', text: 'DeepSeek V4 Flash - Fast model for quick tasks'},
+                        {value: 'deepseek-v4-pro', text: 'DeepSeek V4 Pro - DeepSeek flagship model'}
+                    ]
                 }
             };
             
@@ -822,4 +834,4 @@
         }
     </script>
 </body>
-</html> 
+</html>

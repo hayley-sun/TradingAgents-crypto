@@ -2,9 +2,18 @@ import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 
+from tradingagents.llm_providers import supports_memory_embeddings
+
 
 class FinancialSituationMemory:
     def __init__(self, name, config):
+        self.enabled = supports_memory_embeddings(config.get("llm_provider", "openai"))
+        if not self.enabled:
+            self.client = None
+            self.chroma_client = None
+            self.situation_collection = None
+            return
+
         if config["backend_url"] == "http://localhost:11434/v1":
             self.embedding = "nomic-embed-text"
         else:
@@ -41,6 +50,8 @@ class FinancialSituationMemory:
 
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
+        if not self.enabled:
+            return
 
         situations = []
         advice = []
@@ -64,6 +75,9 @@ class FinancialSituationMemory:
 
     def get_memories(self, current_situation, n_matches=1):
         """Find matching recommendations using OpenAI embeddings"""
+        if not self.enabled:
+            return []
+
         query_embedding = self.get_embedding(current_situation)
 
         results = self.situation_collection.query(

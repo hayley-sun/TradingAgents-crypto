@@ -1,16 +1,9 @@
-import json
+import html
+import re
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime
 import time
-import random
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    retry_if_result,
-)
+import xml.etree.ElementTree as ET
 
 
 def is_rate_limited(response):
@@ -18,17 +11,37 @@ def is_rate_limited(response):
     return response.status_code == 429
 
 
-@retry(
-    retry=(retry_if_result(is_rate_limited)),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(5),
-)
-def make_request(url, headers):
+def make_request(url, headers, params=None, max_attempts=3):
     """Make a request with retry logic for rate limiting"""
-    # Random delay before each request to avoid detection
-    time.sleep(random.uniform(2, 6))
-    response = requests.get(url, headers=headers)
-    return response
+    last_error = None
+
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+            if is_rate_limited(response) and attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as error:
+            last_error = error
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+                continue
+
+    raise last_error
+
+
+def _date_for_query(date_str):
+    if "-" in date_str:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+    return datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+
+
+def _clean_html_text(text):
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def getNewsData(query, start_date, end_date):
@@ -38,12 +51,8 @@ def getNewsData(query, start_date, end_date):
     start_date: str - start date in the format yyyy-mm-dd or mm/dd/yyyy
     end_date: str - end date in the format yyyy-mm-dd or mm/dd/yyyy
     """
-    if "-" in start_date:
-        start_date = datetime.strptime(start_date, "%Y-%m-%d")
-        start_date = start_date.strftime("%m/%d/%Y")
-    if "-" in end_date:
-        end_date = datetime.strptime(end_date, "%Y-%m-%d")
-        end_date = end_date.strftime("%m/%d/%Y")
+    start_date = _date_for_query(start_date)
+    end_date = _date_for_query(end_date)
 
     headers = {
         "User-Agent": (
@@ -53,56 +62,32 @@ def getNewsData(query, start_date, end_date):
         )
     }
 
+    url = "https://news.google.com/rss/search"
+    params = {
+        "q": f"{query} after:{start_date} before:{end_date}",
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    }
+
+    try:
+        response = make_request(url, headers, params=params)
+        root = ET.fromstring(response.content)
+    except Exception as e:
+        print(f"Failed after multiple retries: {e}")
+        return []
+
     news_results = []
-    page = 0
-    while True:
-        offset = page * 10
-        url = (
-            f"https://www.google.com/search?q={query}"
-            f"&tbs=cdr:1,cd_min:{start_date},cd_max:{end_date}"
-            f"&tbm=nws&start={offset}"
+    for item in root.findall("./channel/item"):
+        source = item.find("source")
+        news_results.append(
+            {
+                "link": item.findtext("link", default=""),
+                "title": item.findtext("title", default=""),
+                "snippet": _clean_html_text(item.findtext("description", default="")),
+                "date": item.findtext("pubDate", default=""),
+                "source": source.text if source is not None and source.text else "",
+            }
         )
-
-        try:
-            response = make_request(url, headers)
-            soup = BeautifulSoup(response.content, "html.parser")
-            results_on_page = soup.select("div.SoaBEf")
-
-            if not results_on_page:
-                break  # No more results found
-
-            for el in results_on_page:
-                try:
-                    link = el.find("a")["href"]
-                    title = el.select_one("div.MBeuO").get_text()
-                    snippet = el.select_one(".GI74Re").get_text()
-                    date = el.select_one(".LfVVr").get_text()
-                    source = el.select_one(".NUnG9d span").get_text()
-                    news_results.append(
-                        {
-                            "link": link,
-                            "title": title,
-                            "snippet": snippet,
-                            "date": date,
-                            "source": source,
-                        }
-                    )
-                except Exception as e:
-                    print(f"Error processing result: {e}")
-                    # If one of the fields is not found, skip this result
-                    continue
-
-            # Update the progress bar with the current count of results scraped
-
-            # Check for the "Next" link (pagination)
-            next_link = soup.find("a", id="pnnext")
-            if not next_link:
-                break
-
-            page += 1
-
-        except Exception as e:
-            print(f"Failed after multiple retries: {e}")
-            break
 
     return news_results

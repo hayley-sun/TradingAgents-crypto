@@ -2,6 +2,8 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
 
+from tradingagents.agents.analysts.fundamentals_analyst import _is_crypto_symbol
+
 
 def create_social_media_analyst(llm, toolkit):
     def social_media_analyst_node(state):
@@ -9,7 +11,11 @@ def create_social_media_analyst(llm, toolkit):
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        if toolkit.config["online_tools"]:
+        is_crypto = _is_crypto_symbol(ticker)
+
+        if is_crypto:
+            tools = [toolkit.get_crypto_news_analysis]
+        elif toolkit.config["online_tools"]:
             tools = [toolkit.get_stock_news_openai]
         else:
             tools = [
