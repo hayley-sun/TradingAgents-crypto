@@ -2,23 +2,23 @@
 
 ## &#33539;&#22260;&#21644;&#23433;&#20840;&#36793;&#30028;
 
-This runbook deploys the TradingAgents Crypto MCP server as a local Hermes stdio subprocess. It is research and paper-trading only. Tool output must not be used to place real trades, and this deployment introduces no exchange private key, order placement, public HTTP MCP endpoint, port, or nginx change.
+&#26412;&#25163;&#20876;&#22312;&#20113;&#20027;&#26426;&#19978;&#23558; `TradingAgents Crypto` MCP &#26381;&#21153;&#22120;&#20316;&#20026;&#26412;&#22320; Hermes stdio &#23376;&#36827;&#31243;&#37096;&#32626;&#12290;&#25152;&#26377;&#24037;&#20855;&#32467;&#26524;&#20165;&#29992;&#20110;&#30740;&#31350;&#21644;&#27169;&#25311;&#20132;&#26131;&#65292;&#20005;&#31105;&#25454;&#27492;&#19979;&#36798;&#30495;&#23454;&#35746;&#21333;&#12290;&#26412;&#37096;&#32626;&#19981;&#20250;&#24341;&#20837;&#20132;&#26131;&#25152;&#31169;&#38053;&#12289;&#30495;&#23454;&#19979;&#21333;&#12289;&#20844;&#20849; HTTP MCP &#31471;&#28857;&#12289;&#26032;&#31471;&#21475;&#25110; nginx &#21464;&#26356;&#12290;
 
-The public Web UI remains at `http://124.222.79.66/`. This MCP service stays inside the host process boundary and is separate from that Web UI.
+&#20844;&#24320; Web UI &#20445;&#25345;&#20026; `http://124.222.79.66/`&#12290;MCP &#20165;&#22312;&#26412;&#26426;&#36827;&#31243;&#36793;&#30028;&#20869;&#36816;&#34892;&#65292;&#24182;&#19982; Web UI &#20998;&#31163;&#12290;
 
-Host assumptions:
+&#20027;&#26426;&#21069;&#25552;&#65306;
 
-- Host: `124.222.79.66`
-- Project: `/home/ubuntu/workspace/TradingAgents-crypto`
-- Hermes config: `/home/ubuntu/.hermes/config.yaml`
-- MCP session directory: `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`
-- Session schema version: `1`
+- &#20027;&#26426;&#65306;`124.222.79.66`
+- &#39033;&#30446;&#65306;`/home/ubuntu/workspace/TradingAgents-crypto`
+- Hermes &#37197;&#32622;&#65306;`/home/ubuntu/.hermes/config.yaml`
+- MCP &#20250;&#35805;&#30446;&#24405;&#65306;`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`
+- &#20250;&#35805; schema &#29256;&#26412;&#65306;`1`
 
-Do not commit secrets, copy live secrets into this document, or expose them through nginx, a public URL, or shell history.
+&#19981;&#24471;&#25552;&#20132;&#23494;&#38053;&#12289;&#22312;&#26412;&#25991;&#26723;&#20013;&#20889;&#20837;&#30495;&#23454;&#23494;&#38053;&#65292;&#25110;&#32463; nginx&#12289;&#20844;&#20849; URL&#12289;&#26085;&#24535;&#25110; shell &#21382;&#21490;&#26292;&#38706;&#23494;&#38053;&#12290;
 
 ## &#37096;&#32626;&#19987;&#29992;&#34394;&#25311;&#29615;&#22659;
 
-The MCP SDK requires Python 3.10 or newer. First check the host interpreter:
+`MCP SDK` &#38656;&#35201; `Python 3.10` &#25110;&#26356;&#26032;&#29256;&#26412;&#12290;&#20808;&#26816;&#26597;&#20027;&#26426;&#35299;&#37322;&#22120;&#65306;
 
 ```bash
 ssh ubuntu@124.222.79.66
@@ -26,7 +26,7 @@ python3 --version
 python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 ```
 
-Fetch the intended revision and create a dedicated MCP environment. Do not activate, install into, upgrade, or otherwise alter the existing project `.venv`; that environment continues to serve the Web UI.
+&#33719;&#21462;&#30446;&#26631;&#29256;&#26412;&#24182;&#24314;&#31435;&#19987;&#29992; MCP &#29615;&#22659;&#12290;&#19981;&#24471;&#28608;&#27963;&#12289;&#23433;&#35013;&#21040;&#12289;&#21319;&#32423;&#25110;&#20462;&#25913;&#29616;&#26377;&#39033;&#30446; `.venv`&#65307;&#35813;&#29615;&#22659;&#32487;&#32493;&#26381;&#21153; Web UI&#12290;
 
 ```bash
 cd /home/ubuntu/workspace/TradingAgents-crypto
@@ -46,22 +46,23 @@ grep -v '^chainlit$' requirements.txt > /tmp/tradingagents-requirements-hermes-m
 rm /tmp/tradingagents-requirements-hermes-mcp.txt
 ```
 
-Remove the temporary filtered requirements file only after the installs complete successfully. If an install or check fails, keep it while diagnosing the failure, then remove it once the installation succeeds.
+`set -e` &#30830;&#20445;&#20165;&#22312;&#25152;&#26377;&#23433;&#35013;&#21644;&#39564;&#35777;&#25104;&#21151;&#21518;&#25165;&#21024;&#38500;&#20020;&#26102;&#36807;&#28388;&#21518;&#30340; requirements &#25991;&#20214;&#65307;&#22833;&#36133;&#26102;&#20445;&#30041;&#35813;&#25991;&#20214;&#20197;&#20415;&#35786;&#26029;&#65292;&#25104;&#21151;&#21518;&#23558;&#20854;&#21024;&#38500;&#12290;
 
-`mcp>=1.10,<2.0` requires AnyIO 4 or newer. The optional `chainlit` dependency in `requirements.txt` is Chainlit `1.1.202`, whose `asyncer` requirement constrains AnyIO below 4. Installing MCP into the current project `.venv` therefore breaks `pip check` and FastAPI construction. Excluding the exact `chainlit` line only in `.venv-hermes-mcp` resolves this verified conflict. The existing Web `.venv` is deliberately unchanged and retains Chainlit for the Web UI.
+`mcp>=1.10,<2.0` &#38656;&#35201; AnyIO 4 &#25110;&#26356;&#26032;&#29256;&#26412;&#12290;&#21487;&#36873; `chainlit` &#20381;&#36182;&#20026; Chainlit `1.1.202`&#65292;&#20854; `asyncer` &#32422;&#26463; AnyIO &#20302;&#20110; 4&#12290;&#23558; MCP &#23433;&#35013;&#21040;&#29616;&#26377;&#39033;&#30446; `.venv` &#20250;&#30772;&#22351; `pip check` &#21644; FastAPI &#26500;&#36896;&#12290;&#20165;&#22312; `.venv-hermes-mcp` &#20013;&#25490;&#38500;&#31934;&#30830;&#30340; `chainlit` &#34892;&#21487;&#35299;&#20915;&#24050;&#39564;&#35777;&#30340;&#20914;&#31361;&#65307;Web `.venv` &#19981;&#20316;&#20219;&#20309;&#25913;&#21160;&#65292;&#32487;&#32493;&#20445;&#30041; Chainlit&#12290;
 
 ## Hermes &#37197;&#32622;
 
-Protect the private Hermes directory and config before editing:
+&#20197;&#19979;&#21629;&#20196;&#21487;&#22312;&#20840;&#26032;&#20027;&#26426;&#19978;&#21019;&#24314;&#25152;&#38656;&#30340;&#21463;&#38480;&#30446;&#24405;&#12290;Hermes &#24517;&#39035;&#20197; `ubuntu` &#29992;&#25143;&#36816;&#34892;&#65307;&#33509;&#23454;&#38469;&#26381;&#21153;&#29992;&#25143;&#19981;&#21516;&#65292;&#24517;&#39035;&#30001;&#35813;&#26381;&#21153;&#29992;&#25143;&#25317;&#26377;&#36825;&#20123;&#30446;&#24405;&#21644;&#37197;&#32622;&#25991;&#20214;&#12290;
 
 ```bash
-chmod 700 /home/ubuntu/.hermes
+install -d -m 700 /home/ubuntu/.hermes
+install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions
 touch /home/ubuntu/.hermes/config.yaml
 chmod 600 /home/ubuntu/.hermes/config.yaml
 hermes config edit
 ```
 
-In the standard top-level `mcp_servers` mapping, add this entry. Replace every placeholder with its real secret value, or remove that environment variable entirely. Never leave a placeholder as a purported credential.
+&#22312;&#26631;&#20934;&#39030;&#23618; `mcp_servers` &#26144;&#23556;&#20013;&#21152;&#20837;&#20197;&#19979;&#26465;&#30446;&#12290;&#27599;&#20010;&#21344;&#20301;&#20540;&#24517;&#39035;&#26367;&#25442;&#20026;&#30495;&#23454;&#23494;&#38053;&#65292;&#25110;&#23436;&#20840;&#21024;&#38500;&#23545;&#24212;&#29615;&#22659;&#21464;&#37327;&#65307;&#19981;&#24471;&#23558;&#21344;&#20301;&#20540;&#24403;&#20316;&#20973;&#25454;&#12290;
 
 ```yaml
 mcp_servers:
@@ -78,20 +79,20 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-For an analysis provider, set exactly the active provider key and remove the inactive provider key entries. The available alternatives are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, and `OPENROUTER_API_KEY`; DeepSeek uses `DEEPSEEK_API_KEY`. `FINNHUB_API_KEY` is a data-provider key. CoinGecko is optional and may use `COINGECKO_DEMO_API_KEY` or `COINGECKO_PRO_API_KEY` instead. Keep all values only in the mode-600 Hermes config, never in the repository.
+&#20165;&#35774;&#32622;&#24403;&#21069;&#27963;&#21160; LLM &#25552;&#20379;&#21830;&#30340;&#23494;&#38053;&#65292;&#24182;&#21024;&#38500;&#20854;&#20313; LLM &#23494;&#38053;&#39033;&#12290;DeepSeek &#20351;&#29992; `DEEPSEEK_API_KEY`&#65307;&#21487;&#36873;&#26367;&#20195;&#39033;&#20026; `OPENAI_API_KEY`&#12289;`ANTHROPIC_API_KEY`&#12289;`GOOGLE_API_KEY` &#21644; `OPENROUTER_API_KEY`&#12290;&#25968;&#25454;&#25552;&#20379;&#21830;&#20351;&#29992; `FINNHUB_API_KEY`&#12290;CoinGecko &#20026;&#21487;&#36873;&#39033;&#65292;&#21487;&#20351;&#29992; `COINGECKO_DEMO_API_KEY` &#25110; `COINGECKO_PRO_API_KEY`&#12290;&#25152;&#26377;&#20540;&#21482;&#33021;&#20445;&#23384;&#22312;&#26435;&#38480;&#20026; `600` &#30340; Hermes &#37197;&#32622;&#20013;&#65292;&#32477;&#19981;&#21487;&#20889;&#20837;&#20179;&#24211;&#12290;
 
-Do not add `cwd`, a tools include list, or other unverified fields. This is a stdio configuration, not an HTTP service.
+&#19981;&#24471;&#21152;&#20837; `cwd`&#12289;&#24037;&#20855; include &#21015;&#34920;&#25110;&#20854;&#20182;&#26410;&#32463;&#39564;&#35777;&#30340;&#23383;&#27573;&#12290;&#36825;&#26159; stdio &#37197;&#32622;&#65292;&#19981;&#26159; HTTP &#26381;&#21153;&#12290;
 
 ## &#37325;&#36733;&#21644;&#39564;&#35777;
 
-In a Hermes session, reload the configuration and inspect the registered tools:
+&#22312; Hermes &#20250;&#35805;&#20013;&#37325;&#36733;&#37197;&#32622;&#24182;&#26597;&#30475;&#24050;&#27880;&#20876;&#24037;&#20855;&#65306;
 
 ```text
 /reload-mcp
 /tools
 ```
 
-The exact expected tool names are:
+&#39044;&#26399;&#24037;&#20855;&#21517;&#31216;&#24517;&#39035;&#31934;&#30830;&#20026;&#65306;
 
 ```text
 mcp__tradingagents_crypto__health_check
@@ -99,32 +100,33 @@ mcp__tradingagents_crypto__analyze_crypto
 mcp__tradingagents_crypto__get_analysis_result
 ```
 
-Use this health prompt:
+&#20581;&#24247;&#26816;&#26597;&#25552;&#31034;&#65306;
 
 > &#35831;&#35843;&#29992; mcp__tradingagents_crypto__health_check&#65292;&#30830;&#35748; session_store_writable &#20026; true&#65292;&#24182;&#26816;&#26597;&#24403;&#21069;&#37197;&#32622;&#30340;&#23494;&#38053;&#26159;&#21542;&#21487;&#29992;&#12290;&#19981;&#35201;&#36755;&#20986;&#20219;&#20309;&#23494;&#38053;&#20540;&#12290;
 
-Start with this shallow BTC analysis prompt. It explicitly selects DeepSeek and should remain a small research request:
+&#39318;&#27425;&#20351;&#29992;&#19979;&#21015;&#26377;&#25928;&#30340;&#27973;&#23618; BTC &#20998;&#26512;&#35831;&#27714;&#12290;&#23427;&#26126;&#30830;&#36873;&#25321; DeepSeek&#65292;&#21482;&#33021;&#20316;&#20026;&#23567;&#33539;&#22260;&#30740;&#31350;&#35831;&#27714;&#65306;
 
-> &#35831;&#35843;&#29992; mcp__tradingagents_crypto__analyze_crypto &#23545; BTC &#36827;&#34892;&#27973;&#23618;&#30740;&#31350;&#20998;&#26512;&#12290;&#20351;&#29992; llm_provider=deepseek&#65292;quick_model=deepseek-v4-flash&#65292;deep_model=deepseek-v4-pro&#65292;research_depth=1&#12290;&#36825;&#26159;&#30740;&#31350;&#21644;&#27169;&#25311;&#20132;&#26131;&#65292;&#19981;&#24471;&#25552;&#20132;&#30495;&#23454;&#20132;&#26131;&#25110;&#19979;&#21333;&#12290;
+> &#35831;&#35843;&#29992; mcp__tradingagents_crypto__analyze_crypto &#23545; BTC &#36827;&#34892;&#27973;&#23618;&#30740;&#31350;&#20998;&#26512;&#12290;&#20351;&#29992; trade_date=2026-07-28&#65292;analysts=["market", "news"]&#65292;llm_provider=deepseek&#65292;quick_model=deepseek-v4-flash&#65292;deep_model=deepseek-v4-pro&#65292;research_depth=1&#12290;&#36825;&#26159;&#30740;&#31350;&#21644;&#27169;&#25311;&#20132;&#26131;&#65292;&#19981;&#24471;&#25552;&#20132;&#30495;&#23454;&#20132;&#26131;&#25110;&#19979;&#21333;&#12290;
 
-Record the returned `session_id`, then retrieve it with this Chinese prompt:
+&#35760;&#24405;&#36820;&#22238;&#30340; `session_id`&#65292;&#20877;&#29992;&#20197;&#19979;&#20013;&#25991;&#25552;&#31034;&#35835;&#21462;&#32467;&#26524;&#65306;
 
 > &#35831;&#35843;&#29992; mcp__tradingagents_crypto__get_analysis_result&#65292;&#20351;&#29992;&#20250;&#35805; ID &lt;session_id&gt; &#21462;&#22238;&#20013;&#25991;&#20998;&#26512;&#32467;&#26524;&#12290;&#35831;&#26126;&#30830;&#35828;&#26126;&#36825;&#20123;&#32467;&#26524;&#20165;&#29992;&#20110;&#30740;&#31350;&#21644;&#27169;&#25311;&#20132;&#26131;&#12290;
 
 ## &#20250;&#35805;&#23384;&#20648;&#21644;&#25925;&#38556;&#22788;&#29702;
 
-Successful and failed analysis sessions persist as version-1 JSON files below `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`. Preserve this directory during normal rollback and incident investigation.
+&#25104;&#21151;&#21644;&#22833;&#36133;&#30340;&#20998;&#26512;&#20250;&#35805;&#22343;&#20197; schema &#29256;&#26412; 1 &#30340; JSON &#25991;&#20214;&#25345;&#20037;&#21270;&#21040; `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`&#12290;&#27491;&#24120;&#22238;&#28378;&#21644;&#20107;&#20214;&#25490;&#26597;&#26399;&#38388;&#24517;&#39035;&#20445;&#30041;&#35813;&#30446;&#24405;&#12290;
 
-| Error code | Operator action |
+| &#38169;&#35823;&#20195;&#30721; | &#25805;&#20316;&#21592;&#22788;&#29702; |
 | --- | --- |
-| `INVALID_REQUEST` | Correct required analysis fields, provider, model, symbol, or date and retry. |
-| `MISSING_API_KEY` | Add only the selected provider's real key to the private Hermes config, then reload MCP. |
-| `SESSION_STORE_UNAVAILABLE` | Verify `TRADINGAGENTS_RESULTS_DIR`, ownership, free space, and that the results directory can be created. |
-| `SESSION_WRITE_FAILED` | Verify write permission and storage health for `results/hermes/sessions`, then retry. |
-| `SESSION_NOT_FOUND` | Check the opaque `session_id` returned by the analysis tool or start a new analysis. |
-| `SESSION_UNREADABLE` | Preserve the session file, inspect filesystem health and file permissions, then retry or start a new session. |
-| `ANALYSIS_FAILED` | Review the safe tool error, provider/data availability, and model request; retry later. |
+| `INVALID_REQUEST` | &#26356;&#27491;&#24517;&#22635;&#20998;&#26512;&#23383;&#27573;&#12289;&#25552;&#20379;&#21830;&#12289;&#27169;&#22411;&#12289;&#20132;&#26131;&#23545;&#25110;&#26085;&#26399;&#21518;&#37325;&#35797;&#12290; |
+| `MISSING_API_KEY` | &#20165;&#21521;&#31169;&#26377; Hermes &#37197;&#32622;&#28155;&#21152;&#24050;&#36873;&#25552;&#20379;&#21830;&#30340;&#30495;&#23454;&#23494;&#38053;&#65292;&#28982;&#21518;&#37325;&#36733; MCP&#12290; |
+| `SESSION_STORE_UNAVAILABLE` | &#26816;&#26597; `TRADINGAGENTS_RESULTS_DIR`&#12289;&#30446;&#24405;&#25152;&#26377;&#32773;&#12289;&#21487;&#29992;&#31354;&#38388;&#21450;&#32467;&#26524;&#30446;&#24405;&#26159;&#21542;&#21487;&#21019;&#24314;&#12290; |
+| `SESSION_WRITE_FAILED` | &#26816;&#26597; `results/hermes/sessions` &#30340;&#20889;&#26435;&#38480;&#21644;&#23384;&#20648;&#20581;&#24247;&#29366;&#20917;&#65292;&#28982;&#21518;&#37325;&#35797;&#12290; |
+| `INVALID_SESSION_ID` | &#20351;&#29992; `analyze_crypto` &#36820;&#22238;&#30340;&#19981;&#36879;&#26126; `hermes_<hex>` &#20250;&#35805; ID&#65307;&#19981;&#24471;&#25163;&#24037;&#29468;&#27979;&#25110;&#20462;&#25913;&#35813; ID&#12290; |
+| `SESSION_NOT_FOUND` | &#26680;&#23545;&#20998;&#26512;&#24037;&#20855;&#36820;&#22238;&#30340;&#19981;&#36879;&#26126; `session_id`&#65292;&#25110;&#21551;&#21160;&#26032;&#30340;&#20998;&#26512;&#12290; |
+| `SESSION_UNREADABLE` | &#20445;&#30041;&#20250;&#35805;&#25991;&#20214;&#65292;&#26816;&#26597;&#25991;&#20214;&#31995;&#32479;&#20581;&#24247;&#29366;&#20917;&#21644;&#25991;&#20214;&#26435;&#38480;&#65292;&#28982;&#21518;&#37325;&#35797;&#25110;&#21019;&#24314;&#26032;&#20250;&#35805;&#12290; |
+| `ANALYSIS_FAILED` | &#26597;&#30475;&#23433;&#20840;&#30340;&#24037;&#20855;&#38169;&#35823;&#12289;&#25552;&#20379;&#21830;&#25110;&#25968;&#25454;&#21487;&#29992;&#24615;&#21450;&#27169;&#22411;&#35831;&#27714;&#65292;&#31245;&#21518;&#37325;&#35797;&#12290; |
 
 ## &#22238;&#28378;
 
-To disable Hermes access, remove only the `tradingagents_crypto` entry from `/home/ubuntu/.hermes/config.yaml`, keep the file mode at `600`, then run `/reload-mcp` in Hermes. This does not alter the Web UI, open or close any network port, change nginx, delete `.venv-hermes-mcp`, or remove persisted sessions.
+&#22914;&#38656;&#31105;&#29992; Hermes &#35775;&#38382;&#65292;&#20165;&#20174; `/home/ubuntu/.hermes/config.yaml` &#21024;&#38500; `tradingagents_crypto` &#26465;&#30446;&#65292;&#20445;&#25345;&#35813;&#25991;&#20214;&#26435;&#38480;&#20026; `600`&#65292;&#28982;&#21518;&#22312; Hermes &#20013;&#25191;&#34892; `/reload-mcp`&#12290;&#36825;&#19981;&#20250;&#25913;&#21464; Web UI&#12289;&#25171;&#24320;&#25110;&#20851;&#38381;&#32593;&#32476;&#31471;&#21475;&#12289;&#20462;&#25913; nginx&#12289;&#21024;&#38500; `.venv-hermes-mcp`&#65292;&#20063;&#19981;&#20250;&#21024;&#38500;&#24050;&#25345;&#20037;&#21270;&#20250;&#35805;&#12290;
