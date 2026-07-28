@@ -63,7 +63,8 @@ git rev-parse --verify "$reviewed_phase1_ref^{commit}"
 git cat-file -e "$reviewed_phase1_commit"
 test "$(git cat-file -t "$reviewed_phase1_commit")" = "commit" || { echo "reviewed_phase1_commit must identify a commit object" >&2; exit 1; }
 git merge-base --is-ancestor "$reviewed_phase1_commit" "$reviewed_phase1_ref" || { echo "reviewed commit is not reachable from $reviewed_phase1_ref" >&2; exit 1; }
-git -c core.hooksPath=/dev/null switch --no-overwrite-ignore --detach "$reviewed_phase1_commit"
+git -c core.hooksPath=/dev/null -c submodule.recurse=false \
+  switch --no-overwrite-ignore --no-recurse-submodules --detach "$reviewed_phase1_commit"
 test "$(git rev-parse --verify HEAD)" = "$reviewed_phase1_commit" || { echo "HEAD does not match reviewed_phase1_commit" >&2; exit 1; }
 test -z "$(git symbolic-ref -q HEAD || true)" || { echo "HEAD must be detached" >&2; exit 1; }
 git log -1 --oneline
@@ -81,7 +82,7 @@ grep -v '^chainlit$' requirements.txt > "$requirements_file"
 rm -- "$requirements_file"
 ```
 
-`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。该门禁仍允许已忽略的运行时文件存在，例如持久化的 `.venv-hermes-mcp`；但 `git switch --no-overwrite-ignore` 会在新跟踪文件将覆盖已忽略本地文件时失败。检出命令以 `core.hooksPath=/dev/null` 禁用仓库配置的 post-checkout hooks，随后同时确认 `HEAD` 精确等于已评审 SHA 且不指向分支。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；大写十六进制字符可接受，流程会在任何 Git 检查或 `HEAD` 比较前将其规范化为小写。该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*`、`remote.origin.*` 两层 prune 与 pruneTags 设置、子模块递归、commit-graph 写入及自动维护，并显式使用 `--no-prune --no-tags --no-write-fetch-head --no-recurse-submodules --no-write-commit-graph --no-auto-maintenance`。在显式分离检出前，除为选定远程跟踪引用取得所需对象并刻意刷新该引用外，不会修改工作树、本地分支、本地标签、无关引用或 `.git/FETCH_HEAD`，也不会递归获取子模块、写入 commit-graph 或运行维护。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
+`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。该门禁仍允许已忽略的运行时文件存在，例如持久化的 `.venv-hermes-mcp`；但 `git switch --no-overwrite-ignore` 会在新跟踪文件将覆盖已忽略本地文件时失败。检出命令以 `core.hooksPath=/dev/null` 禁用仓库配置的 post-checkout hooks，并以 `submodule.recurse=false` 和 `--no-recurse-submodules` 禁止任何仓库配置驱动的子模块工作树更新；随后同时确认 `HEAD` 精确等于已评审 SHA 且不指向分支。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；大写十六进制字符可接受，流程会在任何 Git 检查或 `HEAD` 比较前将其规范化为小写。该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*`、`remote.origin.*` 两层 prune 与 pruneTags 设置、子模块递归、commit-graph 写入及自动维护，并显式使用 `--no-prune --no-tags --no-write-fetch-head --no-recurse-submodules --no-write-commit-graph --no-auto-maintenance`。在显式分离检出前，除为选定远程跟踪引用取得所需对象并刻意刷新该引用外，不会修改工作树、本地分支、本地标签、无关引用或 `.git/FETCH_HEAD`，也不会递归获取子模块、写入 commit-graph 或运行维护。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
 
 `mcp>=1.10,<2.0` 需要 AnyIO 4 或更新版本。可选 `chainlit` 依赖为 Chainlit `1.1.202`，其 `asyncer` 约束 AnyIO 低于 4。将 MCP 安装到现有项目 `.venv` 会破坏 `pip check` 和 FastAPI 构造。仅在 `.venv-hermes-mcp` 中排除精确的 `chainlit` 行可解决已验证的冲突；Web `.venv` 不作任何改动，继续保留 Chainlit。
 
@@ -118,6 +119,8 @@ mcp_servers:
 
 不得加入 `cwd`、工具 include 列表或其他未经验证的字段。这是 stdio 配置，不是 HTTP 服务。
 
+严禁在终端手工运行 `/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_mcp`。它是仅由 Hermes 启动的 stdio 协议子进程，手工启动不是健康检查；请仅使用下方的 `health_check` 工具验证。
+
 ## 重载和验证
 
 在 Hermes 会话中重载配置并查看已注册工具：
@@ -143,6 +146,8 @@ mcp__tradingagents_crypto__get_analysis_result
 
 > 请调用 mcp__tradingagents_crypto__analyze_crypto 对 BTC 进行浅层研究分析。使用 trade_date=2026-07-28，analysts=["market", "news"]，llm_provider=deepseek，quick_model=deepseek-v4-flash，deep_model=deepseek-v4-pro，research_depth=1。这是研究和模拟交易，不得提交真实交易或下单。
 
+Phase 1 的 `analyze_crypto` 为同步、串行操作，可能需要数分钟；Hermes 超时为 `900` 秒。不得为了解决超时而提高并发度或并行发起分析。
+
 记录返回的 `session_id`，再用以下中文提示读取结果：
 
 > 请调用 mcp__tradingagents_crypto__get_analysis_result，使用会话 ID `<session_id>` 取回中文分析结果。请明确说明这些结果仅用于研究和模拟交易。
@@ -160,7 +165,7 @@ mcp__tradingagents_crypto__get_analysis_result
 | `INVALID_SESSION_ID` | 使用 `analyze_crypto` 返回的不透明 `hermes_<hex>` 会话 ID；不得手工猜测或修改该 ID。 |
 | `SESSION_NOT_FOUND` | 核对分析工具返回的不透明 `session_id`，或启动新的分析。 |
 | `SESSION_UNREADABLE` | 保留会话文件，检查文件系统健康状况和文件权限，然后重试或创建新会话。 |
-| `ANALYSIS_FAILED` | 查看安全的工具错误、提供商或数据可用性及模型请求，稍后重试。 |
+| `ANALYSIS_FAILED` | 出现超时或此错误时，查看安全的工具错误、提供商或数据可用性，稍后重试；不得提高并发度或并行分析。若已返回持久化的 `session_id`，用 `get_analysis_result` 读取结果。 |
 
 ## 静态校验
 
