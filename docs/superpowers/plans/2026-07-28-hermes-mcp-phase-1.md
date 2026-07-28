@@ -1004,3 +1004,6 @@ Only create this commit when verification required a correction after the earlie
 ## Phase 2 And 3 Entry Conditions
 
 Create separate implementation plans for review/learning and scheduled reporting only after this plan has a successful cloud-host acceptance run. The persisted session schema, `schema_version`, opaque IDs, serialized graph execution, and paper-trading disclaimer are the fixed interfaces those later phases must build on.
+# Implementation Note (Task 4)
+
+The generated `docs/hermes_integration.md` runbook supersedes this plan's original `.venv` deployment commands. Verified dependency integration established that MCP requires a dedicated `.venv-hermes-mcp` because MCP's AnyIO 4+ requirement conflicts with optional Chainlit `1.1.202` through `asyncer`. This note updates the deployment procedure only; the historical tasks below are intentionally unchanged.

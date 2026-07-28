@@ -78,48 +78,42 @@ All commands are intended to run on the cloud host:
 ```bash
 ssh ubuntu@124.222.79.66
 cd /home/ubuntu/workspace/TradingAgents-crypto
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements_hermes.txt
+set -e
+python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
+python3 -m venv /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install --upgrade pip
+grep -v '^chainlit$' requirements.txt > /tmp/tradingagents-requirements-hermes-mcp.txt
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install -r /tmp/tradingagents-requirements-hermes-mcp.txt
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install -r requirements_hermes.txt
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip check
+rm /tmp/tradingagents-requirements-hermes-mcp.txt
 ```
 
-Hermes config should use the project virtualenv Python:
+MCP must use a dedicated `.venv-hermes-mcp`, not the existing Web `.venv`. This was verified during dependency integration: `mcp>=1.10,<2.0` requires AnyIO 4+, while optional Chainlit `1.1.202` depends on `asyncer` with AnyIO <4. Installing MCP into the existing project `.venv` breaks `pip check` and FastAPI construction. The dedicated MCP environment installs all runtime requirements except the one exact `chainlit` line, then installs `requirements_hermes.txt`; the Web `.venv` remains unchanged.
+
+Hermes config should use the dedicated MCP virtualenv Python and the standard top-level `mcp_servers` mapping:
 
 ```yaml
 mcp_servers:
   tradingagents_crypto:
-    command: "/home/ubuntu/workspace/TradingAgents-crypto/.venv/bin/python"
-    args: ["-m", "tradingagents.integrations.hermes_mcp"]
-    cwd: "/home/ubuntu/workspace/TradingAgents-crypto"
+    command: "/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python"
+    args: ['-m','tradingagents.integrations.hermes_mcp']
     env:
       PYTHONPATH: "/home/ubuntu/workspace/TradingAgents-crypto"
+      TRADINGAGENTS_RESULTS_DIR: "/home/ubuntu/workspace/TradingAgents-crypto/results"
       FINNHUB_API_KEY: "${FINNHUB_API_KEY}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
-      GOOGLE_API_KEY: "${GOOGLE_API_KEY}"
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+      COINGECKO_DEMO_API_KEY: "${COINGECKO_DEMO_API_KEY}"
     timeout: 900
     connect_timeout: 60
-    tools:
-      include:
-        - health_check
-        - analyze_crypto
-        - get_analysis_result
-        - list_analysis_sessions
-        - compare_crypto
-      resources: false
-      prompts: false
 ```
 
-The host should provide API keys through shell environment, systemd environment files, or Hermes secret handling. The project repository should not contain live secrets.
+Replace every placeholder with a real secret value or remove that variable. Configure only the active LLM provider key: `DEEPSEEK_API_KEY`, or one of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`. CoinGecko is optional. Keep secrets out of the repository and protect `/home/ubuntu/.hermes/config.yaml` with mode `600`.
 
 Verification commands:
 
 ```bash
 hermes config edit
-hermes mcp list
-hermes mcp test tradingagents_crypto
 ```
 
 Inside a Hermes session:
@@ -129,7 +123,7 @@ Inside a Hermes session:
 /tools
 ```
 
-Expected result: Hermes can call `health_check` and then run `analyze_crypto` for a small BTC analysis without opening any new public port.
+Expected result: `/tools` lists `mcp__tradingagents_crypto__health_check`, `mcp__tradingagents_crypto__analyze_crypto`, and `mcp__tradingagents_crypto__get_analysis_result`; Hermes can call `health_check` and then run `analyze_crypto` for a small BTC analysis without opening any new public port. The authoritative operational procedure is `docs/hermes_integration.md`.
 
 ## Phase 2: Review And Learning Loop
 
