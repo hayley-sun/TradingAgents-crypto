@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -12,6 +13,7 @@ from chromadb.config import Settings
 from tradingagents.integrations.schemas import AnalysisRequest
 
 from tradingagents.integrations.hermes_mcp import (
+    MCP,
     PAPER_TRADING_DISCLAIMER,
     SessionStore,
     _cleanup_session_collections,
@@ -238,6 +240,24 @@ class HermesMcpTests(unittest.TestCase):
                 if collection_name in remaining_names:
                     chroma_client.delete_collection(name=collection_name)
 
+    def test_analyze_crypto_schema_forbids_unknown_fields(self):
+        tool = MCP._tool_manager.get_tool("analyze_crypto")
+
+        self.assertIs(tool.parameters["additionalProperties"], False)
+
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="")
+    def test_analyze_crypto_rejects_unknown_mcp_fields_before_provider_access(
+        self, provider_key
+    ):
+        request_data = self.make_request().model_dump(mode="json")
+        request_data["unexpected_field"] = "unexpected"
+
+        _, result = asyncio.run(MCP.call_tool("analyze_crypto", request_data))
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
+        provider_key.assert_not_called()
+
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
     def test_execute_analysis_persists_completed_fake_graph_result(
@@ -268,6 +288,7 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(graph.config["deep_think_llm"], "deep")
         self.assertEqual(graph.config["max_debate_rounds"], 1)
         self.assertEqual(graph.config["max_risk_discuss_rounds"], 1)
+        self.assertIs(graph.config["log_graph_states"], False)
         self.assertEqual(graph.config["session_id"], result["data"]["session_id"])
         self.assertEqual(session.status, "completed")
         self.assertIsNotNone(session.completed_at)

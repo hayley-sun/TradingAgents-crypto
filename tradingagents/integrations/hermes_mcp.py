@@ -13,7 +13,8 @@ from uuid import uuid4
 import chromadb
 from chromadb.config import Settings
 from mcp.server.fastmcp import FastMCP
-from pydantic import ValidationError
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from pydantic import ConfigDict, ValidationError
 
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph import TradingAgentsGraph
@@ -319,6 +320,7 @@ def execute_analysis(
                 },
                 session_id,
             )
+            graph_config["log_graph_states"] = False
             analysis_started = True
             graph = graph_factory(
                 selected_analysts=request.analysts,
@@ -401,19 +403,50 @@ def analyze_crypto(
     llm_provider: str,
     quick_model: str,
     deep_model: str,
+    **unknown_fields: Any,
 ) -> dict[str, Any]:
     """Run a paper-trading crypto analysis through TradingAgents."""
-    return execute_analysis(
-        {
-            "symbol": symbol,
-            "trade_date": trade_date,
-            "analysts": analysts,
-            "research_depth": research_depth,
-            "llm_provider": llm_provider,
-            "quick_model": quick_model,
-            "deep_model": deep_model,
-        }
-    )
+    request_data = {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "analysts": analysts,
+        "research_depth": research_depth,
+        "llm_provider": llm_provider,
+        "quick_model": quick_model,
+        "deep_model": deep_model,
+    }
+    request_data.update(unknown_fields)
+    return execute_analysis(request_data)
+
+
+class _AnalyzeCryptoArguments(ArgModelBase):
+    """Preserve raw flat MCP fields so AnalysisRequest can reject unknown inputs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    symbol: str
+    trade_date: str
+    analysts: list[str]
+    research_depth: int
+    llm_provider: str
+    quick_model: str
+    deep_model: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+def _configure_analyze_crypto_tool() -> None:
+    tool = MCP._tool_manager.get_tool("analyze_crypto")
+    if tool is None:
+        raise RuntimeError("analyze_crypto tool registration is unavailable")
+
+    tool.fn_metadata.arg_model = _AnalyzeCryptoArguments
+    tool.parameters = _AnalyzeCryptoArguments.model_json_schema()
+    tool.parameters["additionalProperties"] = False
+
+
+_configure_analyze_crypto_tool()
 
 
 if __name__ == "__main__":
