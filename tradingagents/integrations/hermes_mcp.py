@@ -24,6 +24,7 @@ PAPER_TRADING_DISCLAIMER = (
     "Research and paper-trading output only. Do not use this output to place real trades."
 )
 MCP = FastMCP("tradingagents_crypto")
+_SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
 
 
 def success(data: Any) -> dict[str, Any]:
@@ -109,7 +110,17 @@ def _store_is_writable(store: SessionStore) -> bool:
 
 def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
     """Return non-sensitive MCP configuration and storage status."""
-    active_store = store or SessionStore.from_environment()
+    try:
+        active_store = store or SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return failure(
+            ToolError(
+                code="SESSION_STORE_UNAVAILABLE",
+                message="Session storage is currently unavailable.",
+                suggested_action="Verify the session storage configuration and try again.",
+            )
+        )
+
     store_writable = _store_is_writable(active_store)
     llm_provider_key_available = {
         provider: bool(os.getenv(environment_variable))
@@ -156,7 +167,17 @@ def get_analysis_result_impl(
             )
         )
 
-    active_store = store or SessionStore.from_environment()
+    try:
+        active_store = store or SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return failure(
+            ToolError(
+                code="SESSION_UNREADABLE",
+                message="The stored analysis session could not be read.",
+                suggested_action="Verify the session storage configuration and try again.",
+            )
+        )
+
     try:
         session = active_store.load(session_id)
     except (OSError, ValueError, json.JSONDecodeError, ValidationError):
