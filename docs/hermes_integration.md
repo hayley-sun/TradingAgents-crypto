@@ -58,7 +58,9 @@ git rev-parse --verify "$reviewed_phase1_ref^{commit}"
 git cat-file -e "$reviewed_phase1_commit"
 test "$(git cat-file -t "$reviewed_phase1_commit")" = "commit" || { echo "reviewed_phase1_commit must identify a commit object" >&2; exit 1; }
 git merge-base --is-ancestor "$reviewed_phase1_commit" "$reviewed_phase1_ref" || { echo "reviewed commit is not reachable from $reviewed_phase1_ref" >&2; exit 1; }
-git switch --detach "$reviewed_phase1_commit"
+git -c core.hooksPath=/dev/null switch --no-overwrite-ignore --detach "$reviewed_phase1_commit"
+test "$(git rev-parse --verify HEAD)" = "$reviewed_phase1_commit" || { echo "HEAD does not match reviewed_phase1_commit" >&2; exit 1; }
+test -z "$(git symbolic-ref -q HEAD || true)" || { echo "HEAD must be detached" >&2; exit 1; }
 git log -1 --oneline
 
 python3 -m venv /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp
@@ -74,7 +76,7 @@ grep -v '^chainlit$' requirements.txt > "$requirements_file"
 rm -- "$requirements_file"
 ```
 
-`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*`、`remote.origin.*` 两层 prune 与 pruneTags 设置、子模块递归、commit-graph 写入及自动维护，并显式使用 `--no-prune --no-tags --no-write-fetch-head --no-recurse-submodules --no-write-commit-graph --no-auto-maintenance`。在显式分离检出前，除为选定远程跟踪引用取得所需对象并刻意刷新该引用外，不会修改工作树、本地分支、本地标签、无关引用或 `.git/FETCH_HEAD`，也不会递归获取子模块、写入 commit-graph 或运行维护。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
+`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。该门禁仍允许已忽略的运行时文件存在，例如持久化的 `.venv-hermes-mcp`；但 `git switch --no-overwrite-ignore` 会在新跟踪文件将覆盖已忽略本地文件时失败。检出命令以 `core.hooksPath=/dev/null` 禁用仓库配置的 post-checkout hooks，随后同时确认 `HEAD` 精确等于已评审 SHA 且不指向分支。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*`、`remote.origin.*` 两层 prune 与 pruneTags 设置、子模块递归、commit-graph 写入及自动维护，并显式使用 `--no-prune --no-tags --no-write-fetch-head --no-recurse-submodules --no-write-commit-graph --no-auto-maintenance`。在显式分离检出前，除为选定远程跟踪引用取得所需对象并刻意刷新该引用外，不会修改工作树、本地分支、本地标签、无关引用或 `.git/FETCH_HEAD`，也不会递归获取子模块、写入 commit-graph 或运行维护。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
 
 `mcp>=1.10,<2.0` 需要 AnyIO 4 或更新版本。可选 `chainlit` 依赖为 Chainlit `1.1.202`，其 `asyncer` 约束 AnyIO 低于 4。将 MCP 安装到现有项目 `.venv` 会破坏 `pip check` 和 FastAPI 构造。仅在 `.venv-hermes-mcp` 中排除精确的 `chainlit` 行可解决已验证的冲突；Web `.venv` 不作任何改动，继续保留 Chainlit。
 
@@ -193,6 +195,29 @@ UniqueKeyLoader.add_constructor(
 
 configs = [yaml.load(block, Loader=UniqueKeyLoader) for block in yaml_blocks]
 
+def strip_quotes(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+def is_placeholder(value):
+    value = strip_quotes(value.strip())
+    return value.startswith("<") and value.endswith(">")
+
+assignment_pattern = re.compile(
+    r"(?im)\b(?:[A-Za-z][A-Za-z0-9_-]*(?:api[_-]?key|token|secret)|"
+    r"api[_-]?key|token|secret)\b\s*[:=]\s*(?P<value>[^\s#\x60]+)"
+)
+for match in assignment_pattern.finditer(text):
+    assert is_placeholder(match.group("value")), "raw credential assignment is not a placeholder"
+
+bearer_pattern = re.compile(r"(?i)\bbearer\s+(?P<value>[^\s#\x60]+)")
+for match in bearer_pattern.finditer(text):
+    assert is_placeholder(match.group("value")), "authorization credential is not a placeholder"
+
+for match in re.finditer(r"(?i)\bsk-[A-Za-z0-9_-]{8,}\b", text):
+    assert is_placeholder(match.group(0)), "OpenAI-style credential is not a placeholder"
+
 def validate_api_keys(value):
     if isinstance(value, dict):
         for key, nested_value in value.items():
@@ -210,15 +235,16 @@ def validate_api_keys(value):
 for config in configs:
     validate_api_keys(config)
 
-mcp_configs = [
-    config
-    for config in configs
-    if isinstance(config, dict)
-    and isinstance(config.get("mcp_servers"), dict)
-    and isinstance(config["mcp_servers"].get("tradingagents_crypto"), dict)
-]
-assert len(mcp_configs) == 1
-mcp_config = mcp_configs[0]["mcp_servers"]["tradingagents_crypto"]
+target_occurrences = []
+for config in configs:
+    if isinstance(config, dict) and isinstance(config.get("mcp_servers"), dict):
+        servers = config["mcp_servers"]
+        if "tradingagents_crypto" in servers:
+            target_occurrences.append(servers["tradingagents_crypto"])
+
+assert len(target_occurrences) == 1
+mcp_config = target_occurrences[0]
+assert isinstance(mcp_config, dict)
 assert set(mcp_config) == {"command", "args", "env", "timeout", "connect_timeout"}
 assert mcp_config["command"] == (
     "/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python"
