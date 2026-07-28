@@ -10,6 +10,8 @@ from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from tradingagents.integrations.schemas import (
     AnalysisSession,
     PaperDecisionReview,
@@ -30,6 +32,14 @@ _FINAL_ACTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ACTION_PATTERN = re.compile(r"\b(BUY|SELL|HOLD)\b", re.IGNORECASE)
+
+
+class ReviewStorageError(RuntimeError):
+    """Raised when the canonical review record cannot be read or written."""
+
+
+class LearningStorageError(RuntimeError):
+    """Raised when the derived per-symbol learning index cannot be updated."""
 
 
 def _results_dir() -> Path:
@@ -219,9 +229,15 @@ def review_completed_session(
         raise ValueError("review date is outside the allowed range")
 
     review_id = make_review_id(session.session_id, review_date)
-    existing = review_store.load(review_id)
+    try:
+        existing = review_store.load(review_id)
+    except (OSError, json.JSONDecodeError, ValidationError) as error:
+        raise ReviewStorageError("review storage is unavailable") from error
     if existing is not None:
-        learning_store.upsert(existing)
+        try:
+            learning_store.upsert(existing)
+        except (OSError, json.JSONDecodeError, ValidationError) as error:
+            raise LearningStorageError("learning storage is unavailable") from error
         return existing
 
     entry_price = _valid_price(price_lookup(session.request.symbol, trade_date))
@@ -258,6 +274,12 @@ def review_completed_session(
             verdict,
         ),
     )
-    review_store.save(review)
-    learning_store.upsert(review)
+    try:
+        review_store.save(review)
+    except OSError as error:
+        raise ReviewStorageError("review storage is unavailable") from error
+    try:
+        learning_store.upsert(review)
+    except (OSError, json.JSONDecodeError, ValidationError) as error:
+        raise LearningStorageError("learning storage is unavailable") from error
     return review
