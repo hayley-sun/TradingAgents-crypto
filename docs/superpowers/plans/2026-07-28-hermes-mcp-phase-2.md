@@ -1,6 +1,6 @@
 # Hermes MCP Phase 2 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add deterministic paper-decision reviews, per-symbol learning context, and Hermes-owned memory handoff to the existing TradingAgents Crypto MCP server.
 
@@ -31,7 +31,7 @@
 - Modify: `tradingagents/integrations/schemas.py`
 - Modify: `tests/test_hermes_schemas.py`
 
-- [ ] **Step 1: Write failing schema tests for deterministic review records and invalid input.**
+- [x] **Step 1: Write failing schema tests for deterministic review records and invalid input.**
 
 ```python
 from tradingagents.integrations.schemas import (
@@ -54,13 +54,13 @@ def test_review_models_normalize_and_reject_invalid_values(self):
         PriceReference(date="2026-07-29", usd_price=0, source="coingecko")
 ```
 
-- [ ] **Step 2: Run the schema test and verify it fails because review contracts do not exist.**
+- [x] **Step 2: Run the schema test and verify it fails because review contracts do not exist.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_hermes_schemas -v`
 
 Expected: `ImportError` for `PaperDecisionReview`, `ReviewRequest`, or `is_valid_review_id`.
 
-- [ ] **Step 3: Add strict Pydantic models and identifier helpers.**
+- [x] **Step 3: Add strict Pydantic models and identifier helpers.**
 
 ```python
 _REVIEW_ID_PATTERN = re.compile(r"^review_[0-9a-f]{16,64}$")
@@ -87,13 +87,13 @@ class PriceReference(_StrictModel):
 
 Define `PaperDecisionReview`, `SymbolLearningEntry`, and `SymbolLearningIndex` with only fixed literals for action, verdict, source, schema version, normalized symbols, positive prices, and non-path IDs. Keep `AnalysisSession` schema version exactly `Literal[1]`.
 
-- [ ] **Step 4: Re-run the schema test and the complete schema module.**
+- [x] **Step 4: Re-run the schema test and the complete schema module.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_hermes_schemas -v`
 
 Expected: all schema tests pass.
 
-- [ ] **Step 5: Commit the review contract.**
+- [x] **Step 5: Commit the review contract.**
 
 ```bash
 git add tradingagents/integrations/schemas.py tests/test_hermes_schemas.py
@@ -106,7 +106,7 @@ git commit -m "feat: add Hermes paper-review schemas"
 - Modify: `tradingagents/dataflows/coingecko_utils.py`
 - Modify: `tests/test_dataflow_requests.py`
 
-- [ ] **Step 1: Write failing mocked-HTTP tests for historical USD reference lookup.**
+- [x] **Step 1: Write failing mocked-HTTP tests for historical USD reference lookup.**
 
 ```python
 from datetime import date
@@ -125,13 +125,13 @@ def test_historical_usd_price_rejects_missing_or_non_positive_values(self):
             get_crypto_historical_usd_price("BTC", date(2026, 7, 28))
 ```
 
-- [ ] **Step 2: Run those tests and verify the import fails.**
+- [x] **Step 2: Run those tests and verify the import fails.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_dataflow_requests.DataflowRequestTest -v`
 
 Expected: import failure for `get_crypto_historical_usd_price`.
 
-- [ ] **Step 3: Implement the narrow helper without changing existing report formatting.**
+- [x] **Step 3: Implement the narrow helper without changing existing report formatting.**
 
 ```python
 def get_crypto_historical_usd_price(symbol: str, reference_date: date) -> float:
@@ -154,13 +154,13 @@ def get_crypto_historical_usd_price(symbol: str, reference_date: date) -> float:
 
 Import `date` and `math`. Do not return an error string, choose another date, use a current price, or leak HTTP exception text.
 
-- [ ] **Step 4: Run CoinGecko request tests.**
+- [x] **Step 4: Run CoinGecko request tests.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_dataflow_requests -v`
 
 Expected: all dataflow request tests pass with no live network request.
 
-- [ ] **Step 5: Commit the historical reference helper.**
+- [x] **Step 5: Commit the historical reference helper.**
 
 ```bash
 git add tradingagents/dataflows/coingecko_utils.py tests/test_dataflow_requests.py
@@ -173,7 +173,7 @@ git commit -m "feat: add CoinGecko historical USD reference"
 - Create: `tradingagents/integrations/hermes_learning.py`
 - Create: `tests/test_hermes_learning.py`
 
-- [ ] **Step 1: Write failing unit tests for parsing, scoring, persistence, symbol isolation, and idempotency.**
+- [x] **Step 1: Write failing unit tests for parsing, scoring, persistence, symbol isolation, and idempotency.**
 
 ```python
 def test_review_buy_direction_and_repeated_request_are_idempotent(self):
@@ -200,13 +200,13 @@ def test_learning_index_is_symbol_isolated_and_bounded(self):
 
 Include dedicated tests for SELL, HOLD, unparseable decisions, flat return, invalid/future/reversed dates, missing completed result, zero/missing reference prices, unreadable files, and repair of an existing canonical review whose index entry is absent.
 
-- [ ] **Step 2: Run the new test module and verify it fails because the module is absent.**
+- [x] **Step 2: Run the new test module and verify it fails because the module is absent.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_hermes_learning -v`
 
 Expected: `ModuleNotFoundError: No module named 'tradingagents.integrations.hermes_learning'`.
 
-- [ ] **Step 3: Implement stores and pure review functions.**
+- [x] **Step 3: Implement stores and pure review functions.**
 
 ```python
 def make_review_id(session_id: str, review_date: date) -> str:
@@ -224,13 +224,13 @@ def classify_direction(action: str, raw_return_pct: float) -> str:
 
 Use atomic ASCII JSON writes via `NamedTemporaryFile`, `flush`, `fsync`, and `os.replace`. `ReviewStore` owns validated review ID paths. `LearningStore` owns alphanumeric normalized-symbol paths, upserts by review ID, sorts newest first, retains 20 entries, and returns at most five lesson strings for graph configuration. The orchestration must load an existing review before price lookup, then repair its learning-index entry if necessary.
 
-- [ ] **Step 4: Run the learning module tests.**
+- [x] **Step 4: Run the learning module tests.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_hermes_learning -v`
 
 Expected: all learning tests pass; no test writes outside a temporary directory.
 
-- [ ] **Step 5: Commit review and learning persistence.**
+- [x] **Step 5: Commit review and learning persistence.**
 
 ```bash
 git add tradingagents/integrations/hermes_learning.py tests/test_hermes_learning.py
@@ -244,7 +244,7 @@ git commit -m "feat: add idempotent Hermes decision reviews"
 - Modify: `tradingagents/integrations/hermes_mcp.py`
 - Modify: `tests/test_hermes_mcp.py`
 
-- [ ] **Step 1: Write failing integration tests for static lessons and strict review MCP calls.**
+- [x] **Step 1: Write failing integration tests for static lessons and strict review MCP calls.**
 
 ```python
 def test_execute_analysis_passes_only_same_symbol_lessons_to_graph(self):
@@ -266,13 +266,13 @@ def test_review_tool_forbids_unknown_fields_and_returns_no_provider_secret(self)
 
 Add direct `review_paper_decision_impl` tests using temporary stores and a mocked price helper for successful review, failed status, invalid review date, unavailable price, and repeated request repair.
 
-- [ ] **Step 2: Run MCP tests and verify failures are due to absent learning context and review tool.**
+- [x] **Step 2: Run MCP tests and verify failures are due to absent learning context and review tool.**
 
 Run: `.venv-hermes-mcp/bin/python -m unittest tests.test_hermes_mcp -v`
 
 Expected: failures for missing `LearningStore`, `review_paper_decision_impl`, and MCP tool registration.
 
-- [ ] **Step 3: Add static review lessons to existing memory behavior.**
+- [x] **Step 3: Add static review lessons to existing memory behavior.**
 
 ```python
 class FinancialSituationMemory:
@@ -291,7 +291,7 @@ class FinancialSituationMemory:
 
 When `execute_analysis` builds graph config, use `LearningStore.from_environment().lessons_for(request.symbol, limit=5)`. On read failure log only the exception class and use `[]`; analysis behavior must remain available without historical learning.
 
-- [ ] **Step 4: Implement `review_paper_decision_impl` and strict FastMCP registration.**
+- [x] **Step 4: Implement `review_paper_decision_impl` and strict FastMCP registration.**
 
 ```python
 @MCP.tool()
@@ -311,7 +311,7 @@ class _ReviewPaperDecisionArguments(ArgModelBase):
 
 Use a module-level review lock, structured error envelopes, `redirect_stdout(sys.stderr)` around the price helper, no LLM key lookup, and no filesystem access to Hermes home. Configure the tool with `additionalProperties = False` exactly as `analyze_crypto` does.
 
-- [ ] **Step 5: Run targeted MCP and graph tests, then the whole suite.**
+- [x] **Step 5: Run targeted MCP and graph tests, then the whole suite.**
 
 Run:
 
@@ -322,7 +322,7 @@ Run:
 
 Expected: all tests pass and `FakeGraph` sees only BTC review lessons for a BTC request.
 
-- [ ] **Step 6: Commit MCP and graph integration.**
+- [x] **Step 6: Commit MCP and graph integration.**
 
 ```bash
 git add tradingagents/agents/utils/memory.py tradingagents/integrations/hermes_mcp.py tests/test_hermes_mcp.py
@@ -334,7 +334,7 @@ git commit -m "feat: expose Hermes paper-decision review tool"
 **Files:**
 - Modify: `docs/hermes_integration.md`
 
-- [ ] **Step 1: Add Phase 2 deployment and operator tests to the runbook.**
+- [x] **Step 1: Add Phase 2 deployment and operator tests to the runbook.**
 
 Replace Phase 1 review SHA/ref placeholders with Phase 2 equivalents while retaining the existing clean-tree, origin provenance, detached-checkout, virtual-environment isolation, and no-public-port safeguards. Create `results/hermes/reviews` and `results/hermes/memories` with owner-only access alongside sessions. Add the exact new expected MCP tool name:
 
@@ -352,7 +352,7 @@ Add these Hermes-session prompts:
 
 Document that CoinGecko credentials remain optional but recommended, the MCP server does not write Hermes memory files, idempotent retry repairs a missing project learning index, and `hermes memory status` must show memory tool/injection enabled.
 
-- [ ] **Step 2: Run documentation safety checks.**
+- [x] **Step 2: Run documentation safety checks.**
 
 Run:
 
@@ -363,7 +363,7 @@ rg -n '/Users|localhost:|0\\.0\\.0\\.0' docs/hermes_integration.md
 
 Expected: diff check succeeds; the `rg` command prints no local-development address or path.
 
-- [ ] **Step 3: Run release verification.**
+- [x] **Step 3: Run release verification.**
 
 Run:
 
@@ -376,7 +376,7 @@ git diff --check
 
 Expected: dependency check and all tests pass, the review tool is registered, and the diff has no whitespace errors.
 
-- [ ] **Step 4: Commit documentation and release verification.**
+- [x] **Step 4: Commit documentation and release verification.**
 
 ```bash
 git add docs/hermes_integration.md
