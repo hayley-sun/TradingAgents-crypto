@@ -24,7 +24,11 @@
 ssh ubuntu@124.222.79.66
 python3 --version
 python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
+git_version="$(git --version)"
+python3 -c 'import re, sys; raw = sys.argv[1]; match = re.search(r"([0-9]+)[.]([0-9]+)(?:[.]([0-9]+))?", raw); version = tuple(int(part or 0) for part in match.groups()) if match else (); sys.exit(0 if version >= (2, 29, 0) else f"Git 2.29+ is required; found: {raw}")' "$git_version"
 ```
+
+部署需要 Git `2.29` 或更新版本，以支持所用的 fetch 安全选项；版本字符串后的发行版后缀会被忽略。
 
 部署前，工作树必须干净。将下方两个占位值分别替换为已评审的完整 40 位十六进制 Phase 1 提交 SHA，以及包含该提交、已推送到 `origin` 的远程跟踪引用。远程引用只能使用 canonical `refs/remotes/origin/*` 形式，且必须是有效 Git 引用名；修订别名和表达式均会被拒绝。提交 SHA 本身必须标识一个 commit 对象。不得使用未评审分支、强制检出、重置或丢弃本地改动。该流程会分离检出指定提交，不会修改现有 Web `.venv`。
 
@@ -133,7 +137,7 @@ mcp__tradingagents_crypto__get_analysis_result
 
 健康检查提示：
 
-> 请调用 mcp__tradingagents_crypto__health_check，确认 session_store_writable 为 true，并检查当前配置的密钥是否可用。不要输出任何密钥值。
+> 请调用 mcp__tradingagents_crypto__health_check，确认 session_store_writable 为 true，并报告当前配置的密钥环境变量是否已设置且非空。不要输出任何密钥值；此检查不验证提供商认证或密钥是否实际可用。
 
 首次使用下列有效的浅层 BTC 分析请求。它明确选择 DeepSeek，只能作为小范围研究请求：
 
@@ -164,7 +168,7 @@ mcp__tradingagents_crypto__get_analysis_result
 
 ```bash
 set -e
-git diff --check
+git diff --check HEAD -- docs/hermes_integration.md
 local_path_pattern="$(printf '%s' '/User' 's/|local' 'host:|0\.0\.0\.0')"
 if rg -n "$local_path_pattern" docs/hermes_integration.md; then exit 1; fi
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python - <<'PY'
@@ -173,11 +177,16 @@ import re
 import yaml
 
 text = Path("docs/hermes_integration.md").read_text(encoding="utf-8")
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
 yaml_blocks = re.findall(
     r"(?ims)^\`\`\`(?:yaml|yml)[ \t]*\r?\n(.*?)^\`\`\`[ \t]*$",
     text,
 )
-assert yaml_blocks
+require(bool(yaml_blocks), "expected at least one YAML or YML code block")
 
 class UniqueKeyLoader(yaml.SafeLoader):
     pass
@@ -188,7 +197,7 @@ def construct_unique_mapping(loader, node, deep=False):
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         if key in mapping:
-            raise AssertionError(f"duplicate YAML key: {key!r}")
+            raise RuntimeError(f"duplicate YAML key: {key!r}")
         mapping[key] = loader.construct_object(value_node, deep=deep)
     return mapping
 
@@ -214,28 +223,29 @@ assignment_pattern = re.compile(
     r"password|passwd|credential|authorization)\b\s*[:=]\s*(?P<value>[^\s#\x60]+)"
 )
 for match in assignment_pattern.finditer(text):
-    assert is_placeholder(match.group("value")), "raw credential assignment is not a placeholder"
+    require(is_placeholder(match.group("value")), "raw credential assignment is not a placeholder")
 
 bearer_pattern = re.compile(r"(?i)\bbearer\s+(?P<value>[^\s#\x60]+)")
 for match in bearer_pattern.finditer(text):
-    assert is_placeholder(match.group("value")), "authorization credential is not a placeholder"
+    require(is_placeholder(match.group("value")), "authorization credential is not a placeholder")
 
 basic_pattern = re.compile(r"(?i)\bbasic\s+(?P<value>[^\s#\x60]+)")
 for match in basic_pattern.finditer(text):
-    assert is_placeholder(match.group("value")), "HTTP authorization value is not a placeholder"
+    require(is_placeholder(match.group("value")), "HTTP authorization value is not a placeholder")
 
 for match in re.finditer(r"(?i)(?P<value><sk-[A-Za-z0-9_-]{8,}>|sk-[A-Za-z0-9_-]{8,})", text):
-    assert is_placeholder(match.group("value")), "OpenAI-style credential is not a placeholder"
+    require(is_placeholder(match.group("value")), "OpenAI-style credential is not a placeholder")
 
 def validate_api_keys(value):
     if isinstance(value, dict):
         for key, nested_value in value.items():
             if isinstance(key, str) and key.endswith("_API_KEY"):
-                assert (
+                require(
                     isinstance(nested_value, str)
                     and nested_value.startswith("<")
-                    and nested_value.endswith(">")
-                ), f"{key} must use an angle-bracket placeholder"
+                    and nested_value.endswith(">"),
+                    f"{key} must use an angle-bracket placeholder",
+                )
             validate_api_keys(nested_value)
     elif isinstance(value, list):
         for item in value:
@@ -260,25 +270,28 @@ def collect_target_occurrences(value):
 for config in configs:
     collect_target_occurrences(config)
 
-assert len(target_occurrences) == 1
+require(len(target_occurrences) == 1, "expected exactly one tradingagents_crypto MCP server")
 mcp_config = target_occurrences[0]
-assert isinstance(mcp_config, dict)
-assert set(mcp_config) == {"command", "args", "env", "timeout", "connect_timeout"}
-assert mcp_config["command"] == (
-    "/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python"
+require(isinstance(mcp_config, dict), "tradingagents_crypto MCP server must be a mapping")
+require(
+    set(mcp_config) == {"command", "args", "env", "timeout", "connect_timeout"},
+    "tradingagents_crypto MCP server has unsupported or missing fields",
 )
-assert mcp_config["args"] == ["-m", "tradingagents.integrations.hermes_mcp"]
-assert mcp_config["timeout"] == 900
-assert mcp_config["connect_timeout"] == 60
+require(mcp_config["command"] == (
+    "/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python"
+), "tradingagents_crypto command path is invalid")
+require(mcp_config["args"] == ["-m", "tradingagents.integrations.hermes_mcp"], "tradingagents_crypto args are invalid")
+require(mcp_config["timeout"] == 900, "tradingagents_crypto timeout is invalid")
+require(mcp_config["connect_timeout"] == 60, "tradingagents_crypto connect_timeout is invalid")
 env = mcp_config["env"]
-assert isinstance(env, dict)
-assert env == {
+require(isinstance(env, dict), "tradingagents_crypto env must be a mapping")
+require(env == {
     "PYTHONPATH": "/home/ubuntu/workspace/TradingAgents-crypto",
     "TRADINGAGENTS_RESULTS_DIR": "/home/ubuntu/workspace/TradingAgents-crypto/results",
     "DEEPSEEK_API_KEY": "<replace-with-real-deepseek-secret-or-remove>",
     "FINNHUB_API_KEY": "<replace-with-real-finnhub-secret-or-remove>",
     "COINGECKO_DEMO_API_KEY": "<optional-replace-with-real-coingecko-secret-or-remove>",
-}
+}, "tradingagents_crypto env sample is invalid")
 PY
 ```
 
