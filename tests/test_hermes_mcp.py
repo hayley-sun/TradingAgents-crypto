@@ -114,6 +114,38 @@ class HermesMcpTests(unittest.TestCase):
 
         self.assertIs(result["data"]["coingecko_key_available"], False)
 
+    def test_health_contains_session_store_resolution_errors(self):
+        with TemporaryDirectory() as temp_dir:
+            loop = Path(temp_dir) / "loop"
+            loop.symlink_to(loop)
+            with patch.dict(
+                os.environ,
+                {"TRADINGAGENTS_RESULTS_DIR": str(loop)},
+                clear=True,
+            ):
+                result = health_check_impl()
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "SESSION_STORE_UNAVAILABLE")
+        self.assertNotIn(str(loop), json.dumps(result))
+        self.assertNotIn("Symlink loop", json.dumps(result))
+
+    def test_result_contains_session_store_resolution_errors(self):
+        with TemporaryDirectory() as temp_dir:
+            loop = Path(temp_dir) / "loop"
+            loop.symlink_to(loop)
+            with patch.dict(
+                os.environ,
+                {"TRADINGAGENTS_RESULTS_DIR": str(loop)},
+                clear=True,
+            ):
+                result = get_analysis_result_impl("hermes_0123456789abcdef")
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "SESSION_UNREADABLE")
+        self.assertNotIn(str(loop), json.dumps(result))
+        self.assertNotIn("Symlink loop", json.dumps(result))
+
     def test_missing_session_returns_structured_error(self):
         with TemporaryDirectory() as temp_dir:
             result = get_analysis_result_impl(
