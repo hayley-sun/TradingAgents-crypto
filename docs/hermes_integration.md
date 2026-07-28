@@ -165,7 +165,8 @@ Phase 1 的 `analyze_crypto` 为同步、串行操作，可能需要数分钟；
 | `INVALID_SESSION_ID` | 使用 `analyze_crypto` 返回的不透明 `hermes_<hex>` 会话 ID；不得手工猜测或修改该 ID。 |
 | `SESSION_NOT_FOUND` | 核对分析工具返回的不透明 `session_id`，或启动新的分析。 |
 | `SESSION_UNREADABLE` | 保留会话文件，检查文件系统健康状况和文件权限，然后重试或创建新会话。 |
-| `ANALYSIS_FAILED` | 出现超时或此错误时，查看安全的工具错误、提供商或数据可用性，稍后重试；不得提高并发度或并行分析。若已返回持久化的 `session_id`，用 `get_analysis_result` 读取结果。 |
+| 工具超时（`900` 秒） | 不得自动或立即重试。先检查 Hermes/MCP 进程与提供商/数据可用性，确认原分析已不再运行后，才能有意识地提交新请求。可能尚未返回 `session_id`；此时不得使用 `get_analysis_result` 猜测或恢复该请求，也不得提高并发度或并行分析。 |
+| `ANALYSIS_FAILED` | 工具已返回该错误时，查看安全的工具错误、提供商或数据可用性，稍后重试；不得提高并发度或并行分析。 |
 
 ## 静态校验
 
