@@ -1,22 +1,35 @@
 """Hermes MCP health and persisted-session tools."""
 
 import json
+import logging
 import os
 import tempfile
+import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import chromadb
+from chromadb.config import Settings
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph import TradingAgentsGraph
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
+    AnalysisResult,
     AnalysisSession,
     ToolError,
     is_valid_session_id,
     utc_now,
 )
-from tradingagents.llm_providers import API_KEY_ENV_VARS
+from tradingagents.llm_providers import (
+    API_KEY_ENV_VARS,
+    build_graph_config,
+    get_provider_api_key,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +38,8 @@ PAPER_TRADING_DISCLAIMER = (
 )
 MCP = FastMCP("tradingagents_crypto")
 _SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
+_ANALYSIS_LOCK = threading.Lock()
+LOGGER = logging.getLogger(__name__)
 
 
 def success(data: Any) -> dict[str, Any]:
@@ -206,6 +221,154 @@ def get_analysis_result_impl(
     )
 
 
+def _analysis_error(code: str, message: str, suggested_action: str) -> dict[str, Any]:
+    return failure(
+        ToolError(code=code, message=message, suggested_action=suggested_action)
+    )
+
+
+def _cleanup_session_collections(session_id: str) -> None:
+    """Delete in-memory Chroma collections owned by a completed Hermes session."""
+    try:
+        chroma_client = chromadb.Client(Settings(allow_reset=True))
+        for collection in chroma_client.list_collections():
+            collection_name = getattr(collection, "name", collection)
+            if isinstance(collection_name, str) and collection_name.endswith(f"_{session_id}"):
+                chroma_client.delete_collection(name=collection_name)
+    except Exception:
+        return
+
+
+def _failed_session(session: AnalysisSession, error: ToolError) -> AnalysisSession:
+    return AnalysisSession(
+        session_id=session.session_id,
+        status="failed",
+        created_at=session.created_at,
+        completed_at=utc_now(),
+        request=session.request,
+        error=error,
+    )
+
+
+def execute_analysis(
+    request_data: Mapping[str, Any],
+    store: SessionStore | None = None,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+) -> dict[str, Any]:
+    """Run a TradingAgents analysis and persist its sanitized Hermes result."""
+    try:
+        request = AnalysisRequest.model_validate(request_data)
+    except (ValidationError, TypeError, ValueError):
+        return _analysis_error(
+            "INVALID_REQUEST",
+            "The analysis request is invalid.",
+            "Correct the request fields and try again.",
+        )
+
+    provider_key = ""
+    if request.llm_provider != "ollama":
+        provider_key = get_provider_api_key(request.llm_provider)
+        if not provider_key:
+            return _analysis_error(
+                "MISSING_API_KEY",
+                "The selected LLM provider is not configured.",
+                "Configure an API key for the selected provider and try again.",
+            )
+
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _analysis_error(
+            "SESSION_STORE_UNAVAILABLE",
+            "Session storage is currently unavailable.",
+            "Verify the session storage configuration and try again.",
+        )
+
+    session_id = f"hermes_{uuid4().hex}"
+    try:
+        session = active_store.create(session_id, request)
+    except Exception:
+        return _analysis_error(
+            "SESSION_WRITE_FAILED",
+            "The analysis session could not be started.",
+            "Verify that session storage is writable and try again.",
+        )
+
+    analysis_started = False
+    try:
+        with _ANALYSIS_LOCK:
+            graph_config = build_graph_config(
+                DEFAULT_CONFIG,
+                {
+                    "llm_provider": request.llm_provider,
+                    "api_key": provider_key,
+                    "quick_think_llm": request.quick_model,
+                    "deep_think_llm": request.deep_model,
+                    "research_depth": request.research_depth,
+                },
+                session_id,
+            )
+            analysis_started = True
+            graph = graph_factory(
+                selected_analysts=request.analysts,
+                debug=False,
+                config=graph_config,
+            )
+            final_state, processed_signal = graph.propagate(
+                request.symbol, request.trade_date.isoformat()
+            )
+
+        result = AnalysisResult(
+            reports={
+                "market": final_state["market_report"],
+                "sentiment": final_state["sentiment_report"],
+                "news": final_state["news_report"],
+                "fundamentals": final_state["fundamentals_report"],
+            },
+            investment_plan=final_state["investment_plan"],
+            trader_investment_plan=final_state["trader_investment_plan"],
+            final_trade_decision=final_state["final_trade_decision"],
+            processed_signal=processed_signal,
+        )
+        completed_session = AnalysisSession(
+            session_id=session.session_id,
+            status="completed",
+            created_at=session.created_at,
+            completed_at=utc_now(),
+            request=request,
+            result=result,
+        )
+        active_store.save(completed_session)
+        return success(
+            {
+                "session_id": session_id,
+                "status": "completed",
+                "processed_signal": result.processed_signal,
+                "final_trade_decision": result.final_trade_decision,
+                "disclaimer": PAPER_TRADING_DISCLAIMER,
+            }
+        )
+    except Exception as error:
+        analysis_error = ToolError(
+            code="ANALYSIS_FAILED",
+            message="The analysis could not be completed.",
+            suggested_action="Try the analysis again later.",
+        )
+        LOGGER.error(
+            "hermes_analysis_failed session_id=%s exception_class=%s",
+            session_id,
+            type(error).__name__,
+        )
+        try:
+            active_store.save(_failed_session(session, analysis_error))
+        except Exception:
+            pass
+        return failure(analysis_error)
+    finally:
+        if analysis_started:
+            _cleanup_session_collections(session_id)
+
+
 @MCP.tool()
 def health_check() -> dict[str, Any]:
     """Report non-sensitive Hermes MCP configuration and storage status."""
@@ -216,6 +379,30 @@ def health_check() -> dict[str, Any]:
 def get_analysis_result(session_id: str) -> dict[str, Any]:
     """Return a persisted Hermes analysis session by opaque session ID."""
     return get_analysis_result_impl(session_id)
+
+
+@MCP.tool()
+def analyze_crypto(
+    symbol: str,
+    trade_date: str,
+    analysts: list[str],
+    research_depth: int,
+    llm_provider: str,
+    quick_model: str,
+    deep_model: str,
+) -> dict[str, Any]:
+    """Run a paper-trading crypto analysis through TradingAgents."""
+    return execute_analysis(
+        {
+            "symbol": symbol,
+            "trade_date": trade_date,
+            "analysts": analysts,
+            "research_depth": research_depth,
+            "llm_provider": llm_provider,
+            "quick_model": quick_model,
+            "deep_model": deep_model,
+        }
+    )
 
 
 if __name__ == "__main__":

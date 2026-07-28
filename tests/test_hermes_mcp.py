@@ -11,9 +11,40 @@ from tradingagents.integrations.schemas import AnalysisRequest
 from tradingagents.integrations.hermes_mcp import (
     PAPER_TRADING_DISCLAIMER,
     SessionStore,
+    execute_analysis,
     get_analysis_result_impl,
     health_check_impl,
 )
+
+
+class FakeGraph:
+    instances = []
+    final_state = {
+        "market_report": "market report",
+        "sentiment_report": "sentiment report",
+        "news_report": "news report",
+        "fundamentals_report": "fundamentals report",
+        "investment_plan": "investment plan",
+        "trader_investment_plan": "trader investment plan",
+        "final_trade_decision": "final trade decision",
+    }
+
+    def __init__(self, selected_analysts, debug, config):
+        self.selected_analysts = selected_analysts
+        self.debug = debug
+        self.config = config
+        self.propagate_calls = []
+        self.__class__.instances.append(self)
+
+    def propagate(self, symbol, trade_date):
+        self.propagate_calls.append((symbol, trade_date))
+        return self.final_state, "HOLD"
+
+
+class FailingGraph(FakeGraph):
+    def propagate(self, symbol, trade_date):
+        self.propagate_calls.append((symbol, trade_date))
+        raise RuntimeError("provider secret at /private/failure")
 
 
 class HermesMcpTests(unittest.TestCase):
@@ -167,6 +198,108 @@ class HermesMcpTests(unittest.TestCase):
 
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"]["code"], "SESSION_UNREADABLE")
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_execute_analysis_persists_completed_fake_graph_result(
+        self, provider_key, cleanup
+    ):
+        FakeGraph.instances = []
+        request = self.make_request()
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = execute_analysis(
+                request.model_dump(mode="json"), store=store, graph_factory=FakeGraph
+            )
+            session = store.load(result["data"]["session_id"])
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["status"], "completed")
+        self.assertEqual(result["data"]["processed_signal"], "HOLD")
+        self.assertEqual(result["data"]["final_trade_decision"], "final trade decision")
+        self.assertEqual(result["data"]["disclaimer"], PAPER_TRADING_DISCLAIMER)
+        self.assertEqual(len(FakeGraph.instances), 1)
+        graph = FakeGraph.instances[0]
+        self.assertEqual(graph.selected_analysts, ["market"])
+        self.assertIs(graph.debug, False)
+        self.assertEqual(graph.propagate_calls, [("BTCUSDT", "2026-07-28")])
+        self.assertEqual(graph.config["llm_provider"], "openai")
+        self.assertEqual(graph.config["quick_think_llm"], "quick")
+        self.assertEqual(graph.config["deep_think_llm"], "deep")
+        self.assertEqual(graph.config["max_debate_rounds"], 1)
+        self.assertEqual(graph.config["max_risk_discuss_rounds"], 1)
+        self.assertEqual(graph.config["session_id"], result["data"]["session_id"])
+        self.assertEqual(session.status, "completed")
+        self.assertIsNotNone(session.completed_at)
+        self.assertEqual(
+            session.result.reports,
+            {
+                "market": "market report",
+                "sentiment": "sentiment report",
+                "news": "news report",
+                "fundamentals": "fundamentals report",
+            },
+        )
+        self.assertEqual(session.result.investment_plan, "investment plan")
+        self.assertEqual(session.result.trader_investment_plan, "trader investment plan")
+        self.assertEqual(session.result.final_trade_decision, "final trade decision")
+        self.assertEqual(session.result.processed_signal, "HOLD")
+        cleanup.assert_called_once_with(result["data"]["session_id"])
+        provider_key.assert_called_once_with("openai")
+
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="")
+    def test_execute_analysis_rejects_provider_without_api_key(self, provider_key):
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = execute_analysis(self.make_request().model_dump(mode="json"), store=store)
+
+            self.assertFalse(store.root.exists())
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "MISSING_API_KEY")
+        provider_key.assert_called_once_with("openai")
+
+    def test_execute_analysis_rejects_invalid_request_without_session(self):
+        request_data = self.make_request().model_dump(mode="json")
+        request_data["research_depth"] = 2
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = execute_analysis(request_data, store=store)
+
+            self.assertFalse(store.root.exists())
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_execute_analysis_redacts_graph_failure_and_persists_failed_session(
+        self, provider_key, cleanup
+    ):
+        FailingGraph.instances = []
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = execute_analysis(
+                self.make_request().model_dump(mode="json"),
+                store=store,
+                graph_factory=FailingGraph,
+            )
+            session = store.load(next(store.root.glob("*.json")).stem)
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "ANALYSIS_FAILED")
+        self.assertEqual(session.status, "failed")
+        self.assertIsNotNone(session.completed_at)
+        self.assertEqual(session.error.code, "ANALYSIS_FAILED")
+        self.assertNotIn("provider secret", json.dumps(result))
+        self.assertNotIn("/private/failure", json.dumps(result))
+        self.assertNotIn("provider secret", json.dumps(session.model_dump(mode="json")))
+        self.assertNotIn("/private/failure", json.dumps(session.model_dump(mode="json")))
+        cleanup.assert_called_once_with(session.session_id)
+        provider_key.assert_called_once_with("openai")
 
 
 if __name__ == "__main__":
