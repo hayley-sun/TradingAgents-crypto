@@ -53,14 +53,9 @@ class AnalysisRequest(_StrictModel):
     @field_validator("analysts", mode="before")
     @classmethod
     def normalize_analysts(cls, value: list[str]) -> list[str]:
-        if not isinstance(value, list):
+        if not isinstance(value, list) or not all(isinstance(analyst, str) for analyst in value):
             return value
-        normalized = []
-        for analyst in value:
-            if not isinstance(analyst, str):
-                normalized.append(analyst)
-                continue
-            normalized.append(analyst.strip().lower())
+        normalized = [analyst.strip().lower() for analyst in value]
         if len(normalized) != len(set(normalized)):
             raise ValueError("analysts must not contain duplicates")
         unsupported = set(normalized) - set(SUPPORTED_ANALYSTS)

@@ -51,6 +51,18 @@ class HermesSchemaTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValidationError):
                 AnalysisRequest(**{**values, field: invalid_value})
 
+    def test_non_string_analyst_is_rejected_with_validation_error(self):
+        with self.assertRaises(ValidationError):
+            AnalysisRequest(
+                symbol="BTC",
+                trade_date="2026-07-28",
+                analysts=[{}],
+                research_depth=1,
+                llm_provider="openai",
+                quick_model="quick",
+                deep_model="deep",
+            )
+
     def test_session_ids_reject_empty_and_path_traversal(self):
         for session_id in ("", "../hermes_0123456789abcdef", "hermes_", "hermes_ABCDEF0123456789"):
             self.assertFalse(is_valid_session_id(session_id))
