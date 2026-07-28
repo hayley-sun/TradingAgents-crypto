@@ -26,7 +26,7 @@ python3 --version
 python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 ```
 
-部署前，工作树必须干净。将下方占位值替换为已评审、已推送到 `origin` 的 Phase 1 提交 SHA；不得使用未评审分支、强制检出、重置或丢弃本地改动。该流程会分离检出指定提交，不会修改现有 Web `.venv`。
+部署前，工作树必须干净。将下方两个占位值分别替换为已评审的 Phase 1 提交 SHA 和包含该提交、已推送到 `origin` 的远程跟踪引用；不得使用未评审分支、强制检出、重置或丢弃本地改动。该流程会分离检出指定提交，不会修改现有 Web `.venv`。
 
 ```bash
 cd /home/ubuntu/workspace/TradingAgents-crypto
@@ -34,8 +34,11 @@ set -e
 git status --short
 test -z "$(git status --short)" || { echo "working tree must be clean" >&2; exit 1; }
 reviewed_phase1_commit="<replace-with-reviewed-phase-1-commit-already-pushed-to-origin>"
+reviewed_phase1_ref="origin/feature/hermes-mcp-phase-1"
 git fetch origin --tags
+git rev-parse --verify "$reviewed_phase1_ref^{commit}"
 git show --verify --quiet "$reviewed_phase1_commit^{commit}"
+git merge-base --is-ancestor "$reviewed_phase1_commit" "$reviewed_phase1_ref" || { echo "reviewed commit is not reachable from $reviewed_phase1_ref" >&2; exit 1; }
 git switch --detach "$reviewed_phase1_commit"
 git log -1 --oneline
 
@@ -52,7 +55,7 @@ grep -v '^chainlit$' requirements.txt > "$requirements_file"
 rm -- "$requirements_file"
 ```
 
-`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。确认 `git status --short` 无输出后才可继续。操作员必须将 `reviewed_phase1_commit` 占位值替换为已评审并已推送到 `origin` 的提交。
+`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。确认 `git status --short` 无输出后才可继续。操作员必须将 `reviewed_phase1_commit` 替换为已评审提交 SHA，并将 `reviewed_phase1_ref` 替换为包含该提交的已推送 `origin` 远程跟踪引用。拉取后会验证该引用可解析为提交，并验证该提交可从该引用到达；未推送或不可达的提交会立即失败，不会执行检出。
 
 `mcp>=1.10,<2.0` 需要 AnyIO 4 或更新版本。可选 `chainlit` 依赖为 Chainlit `1.1.202`，其 `asyncer` 约束 AnyIO 低于 4。将 MCP 安装到现有项目 `.venv` 会破坏 `pip check` 和 FastAPI 构造。仅在 `.venv-hermes-mcp` 中排除精确的 `chainlit` 行可解决已验证的冲突；Web `.venv` 不作任何改动，继续保留 Chainlit。
 
