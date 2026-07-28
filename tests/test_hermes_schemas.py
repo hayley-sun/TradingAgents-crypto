@@ -17,35 +17,35 @@ class HermesSchemaTests(unittest.TestCase):
     def test_deepseek_request_normalizes_values(self):
         request = AnalysisRequest(
             symbol="  btcusdt ",
-            date="2026-07-28",
+            trade_date="2026-07-28",
             analysts=[" MARKET ", "Social"],
             research_depth=3,
-            provider=" DeepSeek ",
+            llm_provider=" DeepSeek ",
             quick_model="  quick-model ",
             deep_model=" deep-model ",
         )
 
         self.assertEqual(request.symbol, "BTCUSDT")
-        self.assertEqual(request.date, date(2026, 7, 28))
+        self.assertEqual(request.trade_date, date(2026, 7, 28))
         self.assertEqual(request.analysts, ["market", "social"])
-        self.assertEqual(request.provider, "deepseek")
+        self.assertEqual(request.llm_provider, "deepseek")
         self.assertEqual(request.quick_model, "quick-model")
         self.assertEqual(request.deep_model, "deep-model")
 
     def test_invalid_analyst_provider_and_depth_are_rejected(self):
         values = {
             "symbol": "BTC",
-            "date": "2026-07-28",
+            "trade_date": "2026-07-28",
             "analysts": ["market"],
             "research_depth": 1,
-            "provider": "openai",
+            "llm_provider": "openai",
             "quick_model": "quick",
             "deep_model": "deep",
         }
 
         for field, invalid_value in (
             ("analysts", ["unknown"]),
-            ("provider", "unknown"),
+            ("llm_provider", "unknown"),
             ("research_depth", 2),
         ):
             with self.subTest(field=field), self.assertRaises(ValidationError):
@@ -69,10 +69,10 @@ class HermesSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AnalysisRequest(
                 symbol="BTC",
-                date="2026-07-28",
+                trade_date="2026-07-28",
                 analysts=["market"],
                 research_depth=1,
-                provider="openai",
+                llm_provider="openai",
                 quick_model="quick",
                 deep_model="deep",
                 extra="forbidden",
@@ -81,10 +81,10 @@ class HermesSchemaTests(unittest.TestCase):
     def test_session_and_result_models(self):
         request = AnalysisRequest(
             symbol="BTC",
-            date="2026-07-28",
+            trade_date="2026-07-28",
             analysts=["market"],
             research_depth=1,
-            provider="ollama",
+            llm_provider="ollama",
             quick_model="quick",
             deep_model="deep",
         )
@@ -92,7 +92,7 @@ class HermesSchemaTests(unittest.TestCase):
             reports={"market": "report"},
             investment_plan="plan",
             trader_investment_plan="trader plan",
-            final_decision="buy",
+            final_trade_decision="buy",
             processed_signal="bullish",
         )
         session = AnalysisSession(
