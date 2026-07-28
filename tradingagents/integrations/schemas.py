@@ -36,10 +36,10 @@ class _StrictModel(BaseModel):
 
 class AnalysisRequest(_StrictModel):
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
-    date: date
+    trade_date: date
     analysts: list[str] = Field(min_length=1, max_length=4)
     research_depth: Literal[1, 3, 5]
-    provider: str
+    llm_provider: str
     quick_model: str = Field(max_length=200)
     deep_model: str = Field(max_length=200)
 
@@ -68,7 +68,7 @@ class AnalysisRequest(_StrictModel):
             raise ValueError("unsupported analyst")
         return normalized
 
-    @field_validator("provider", mode="before")
+    @field_validator("llm_provider", mode="before")
     @classmethod
     def normalize_provider(cls, value: str) -> str:
         if not isinstance(value, str):
@@ -93,7 +93,7 @@ class AnalysisResult(_StrictModel):
     reports: dict[str, str]
     investment_plan: str
     trader_investment_plan: str
-    final_decision: str
+    final_trade_decision: str
     processed_signal: str
 
 
