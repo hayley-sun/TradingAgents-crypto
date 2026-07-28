@@ -79,15 +79,27 @@ All commands are intended to run on the cloud host:
 ssh ubuntu@124.222.79.66
 cd /home/ubuntu/workspace/TradingAgents-crypto
 set -e
+git status --short
+test -z "$(git status --short)" || { echo "working tree must be clean" >&2; exit 1; }
+reviewed_phase1_commit="<replace-with-reviewed-phase-1-commit-already-pushed-to-origin>"
+git fetch origin --tags
+git show --verify --quiet "$reviewed_phase1_commit^{commit}"
+git switch --detach "$reviewed_phase1_commit"
+git log -1 --oneline
 python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 python3 -m venv /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install --upgrade pip
-grep -v '^chainlit$' requirements.txt > /tmp/tradingagents-requirements-hermes-mcp.txt
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install -r /tmp/tradingagents-requirements-hermes-mcp.txt
+requirements_file="$(mktemp /tmp/tradingagents-requirements-hermes-mcp.XXXXXX)"
+grep -v '^chainlit$' requirements.txt > "$requirements_file"
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install -r "$requirements_file"
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip install -r requirements_hermes.txt
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m pip check
-rm /tmp/tradingagents-requirements-hermes-mcp.txt
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m unittest discover -s tests
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -c "from tradingagents.integrations.hermes_mcp import MCP; assert MCP.name == 'tradingagents_crypto'"
+rm -- "$requirements_file"
 ```
+
+The operator must replace `reviewed_phase1_commit` with a reviewed Phase 1 commit already pushed to `origin`. The clean-worktree check prevents deploying over local changes; the flow fetches, verifies, and detached-checks out only that reviewed commit, without a forced checkout, reset, or discarded work. With `set -e`, a failed installation or check preserves the unique `mktemp` requirements file for diagnosis; `rm -- "$requirements_file"` runs only after all checks succeed.
 
 MCP must use a dedicated `.venv-hermes-mcp`, not the existing Web `.venv`. This was verified during dependency integration: `mcp>=1.10,<2.0` requires AnyIO 4+, while optional Chainlit `1.1.202` depends on `asyncer` with AnyIO <4. Installing MCP into the existing project `.venv` breaks `pip check` and FastAPI construction. The dedicated MCP environment installs all runtime requirements except the one exact `chainlit` line, then installs `requirements_hermes.txt`; the Web `.venv` remains unchanged.
 
