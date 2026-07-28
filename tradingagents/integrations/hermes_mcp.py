@@ -9,7 +9,6 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 
-from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisSession,
@@ -112,30 +111,33 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
     """Return non-sensitive MCP configuration and storage status."""
     active_store = store or SessionStore.from_environment()
     store_writable = _store_is_writable(active_store)
-    provider_api_keys = {
+    llm_provider_key_available = {
         provider: bool(os.getenv(environment_variable))
         for provider, environment_variable in API_KEY_ENV_VARS.items()
         if environment_variable
     }
-    has_keyed_provider = any(provider_api_keys.values())
-    coingecko_api_key_configured = any(
+    configured_llm_providers = sorted(
+        provider
+        for provider, key_available in llm_provider_key_available.items()
+        if key_available
+    )
+    coingecko_key_available = any(
         bool(os.getenv(environment_variable))
         for environment_variable in (
-            "COINGECKO_API_KEY",
             "COINGECKO_DEMO_API_KEY",
             "COINGECKO_PRO_API_KEY",
         )
     )
     return success(
         {
-            "status": "ready" if store_writable and has_keyed_provider else "degraded",
-            "project_root": str(PROJECT_ROOT),
-            "session_directory": str(active_store.root),
-            "configured_providers": list(API_KEY_ENV_VARS),
-            "default_llm_provider": DEFAULT_CONFIG["llm_provider"],
-            "provider_api_keys": provider_api_keys,
-            "finnhub_api_key_configured": bool(os.getenv("FINNHUB_API_KEY")),
-            "coingecko_api_key_configured": coingecko_api_key_configured,
+            "status": "ready" if store_writable and configured_llm_providers else "degraded",
+            "project_dir": str(PROJECT_ROOT),
+            "session_store": str(active_store.root),
+            "session_store_writable": store_writable,
+            "llm_provider_key_available": llm_provider_key_available,
+            "configured_llm_providers": configured_llm_providers,
+            "finnhub_key_available": bool(os.getenv("FINNHUB_API_KEY")),
+            "coingecko_key_available": coingecko_key_available,
             "disclaimer": PAPER_TRADING_DISCLAIMER,
         }
     )
