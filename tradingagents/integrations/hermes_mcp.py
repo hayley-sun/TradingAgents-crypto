@@ -40,6 +40,13 @@ MCP = FastMCP("tradingagents_crypto")
 _SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
 _ANALYSIS_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
+SESSION_MEMORY_COLLECTION_BASE_NAMES = (
+    "bull_memory",
+    "bear_memory",
+    "trader_memory",
+    "invest_judge_memory",
+    "risk_manager_memory",
+)
 
 
 def success(data: Any) -> dict[str, Any]:
@@ -231,9 +238,13 @@ def _cleanup_session_collections(session_id: str) -> None:
     """Delete in-memory Chroma collections owned by a completed Hermes session."""
     try:
         chroma_client = chromadb.Client(Settings(allow_reset=True))
+        owned_collection_names = {
+            f"{base_name}_{session_id}"
+            for base_name in SESSION_MEMORY_COLLECTION_BASE_NAMES
+        }
         for collection in chroma_client.list_collections():
             collection_name = getattr(collection, "name", collection)
-            if isinstance(collection_name, str) and collection_name.endswith(f"_{session_id}"):
+            if collection_name in owned_collection_names:
                 chroma_client.delete_collection(name=collection_name)
     except Exception:
         return

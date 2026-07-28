@@ -6,11 +6,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import chromadb
+from chromadb.config import Settings
+
 from tradingagents.integrations.schemas import AnalysisRequest
 
 from tradingagents.integrations.hermes_mcp import (
     PAPER_TRADING_DISCLAIMER,
     SessionStore,
+    _cleanup_session_collections,
     execute_analysis,
     get_analysis_result_impl,
     health_check_impl,
@@ -198,6 +202,41 @@ class HermesMcpTests(unittest.TestCase):
 
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"]["code"], "SESSION_UNREADABLE")
+
+    def test_cleanup_removes_only_owned_session_collections(self):
+        session_id = "hermes_0123456789abcdef"
+        owned_collection = f"bull_memory_{session_id}"
+        foreign_collection = f"foreign_{session_id}"
+        chroma_client = chromadb.Client(Settings(allow_reset=True))
+
+        try:
+            existing_names = {
+                getattr(collection, "name", collection)
+                for collection in chroma_client.list_collections()
+            }
+            for collection_name in (owned_collection, foreign_collection):
+                if collection_name in existing_names:
+                    chroma_client.delete_collection(name=collection_name)
+
+            chroma_client.create_collection(name=owned_collection)
+            chroma_client.create_collection(name=foreign_collection)
+
+            _cleanup_session_collections(session_id)
+
+            remaining_names = {
+                getattr(collection, "name", collection)
+                for collection in chroma_client.list_collections()
+            }
+            self.assertNotIn(owned_collection, remaining_names)
+            self.assertIn(foreign_collection, remaining_names)
+        finally:
+            remaining_names = {
+                getattr(collection, "name", collection)
+                for collection in chroma_client.list_collections()
+            }
+            for collection_name in (owned_collection, foreign_collection):
+                if collection_name in remaining_names:
+                    chroma_client.delete_collection(name=collection_name)
 
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
