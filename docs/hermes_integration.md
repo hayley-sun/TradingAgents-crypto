@@ -138,6 +138,7 @@ mcp__tradingagents_crypto__get_analysis_result
 本手册为面向操作员的 UTF-8 中文文档，不执行 ASCII 源码检查。提交前在项目根目录运行以下校验：
 
 ```bash
+set -e
 git diff --check
 local_path_pattern="$(printf '%s' '/User' 's/|local' 'host:|0\.0\.0\.0')"
 if rg -n "$local_path_pattern" docs/hermes_integration.md; then exit 1; fi
