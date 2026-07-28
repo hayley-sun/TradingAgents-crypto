@@ -49,7 +49,7 @@ remote_branch="${reviewed_phase1_ref#refs/remotes/origin/}"
 git ls-remote --exit-code --heads origin "refs/heads/$remote_branch" >/dev/null || { echo "reviewed_phase1_ref is not present on origin" >&2; exit 1; }
 git -c fetch.prune=false -c fetch.pruneTags=false \
   -c remote.origin.prune=false -c remote.origin.pruneTags=false \
-  fetch --no-prune --no-tags origin "+refs/heads/$remote_branch:$reviewed_phase1_ref"
+  fetch --no-prune --no-tags --no-write-fetch-head origin "+refs/heads/$remote_branch:$reviewed_phase1_ref"
 git rev-parse --verify "$reviewed_phase1_ref^{commit}"
 git cat-file -e "$reviewed_phase1_commit"
 test "$(git cat-file -t "$reviewed_phase1_commit")" = "commit" || { echo "reviewed_phase1_commit must identify a commit object" >&2; exit 1; }
@@ -70,7 +70,7 @@ grep -v '^chainlit$' requirements.txt > "$requirements_file"
 rm -- "$requirements_file"
 ```
 
-`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*` 和 `remote.origin.*` 两层 prune 与 pruneTags 设置，并显式使用 `--no-prune --no-tags`；因此仅强制刷新选定跟踪引用，不会检出分支或修改工作树、本地分支、本地标签或无关引用。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
+`set -e` 确保仅在所有安装和验证成功后才执行 `rm -- "$requirements_file"`；任一步骤失败都会保留每次运行独有的临时文件以便诊断。仅当 `git status --porcelain=v1 --untracked-files=all` 产生空结果时才可继续，该检查不受隐藏未跟踪文件的用户配置影响。操作员必须将 `reviewed_phase1_commit` 替换为完整 40 位十六进制已评审提交 SHA，而不是分支、标签或其他修订别名；该 SHA 本身必须标识 commit 对象。并将 `reviewed_phase1_ref` 替换为包含该提交的 canonical `refs/remotes/origin/*` 远程跟踪引用；只接受有效 Git 引用名，修订别名和表达式会被拒绝。流程会从该引用导出分支名，先确认该分支当前存在于 `origin`，再以明确 refspec 将该远程分支拉取到选定跟踪引用。该命令同时禁用 `fetch.*` 和 `remote.origin.*` 两层 prune 与 pruneTags 设置，并显式使用 `--no-prune --no-tags --no-write-fetch-head`；在显式分离检出前，除刻意刷新的选定远程跟踪引用外，不会修改工作树、本地分支、本地标签、无关引用或 `.git/FETCH_HEAD`。前导 `+` 仅用于允许该远程跟踪引用被当前 `origin` 头部非快进覆盖。这不依赖 `remote.origin.fetch`。随后会验证远程引用、精确 SHA 对象类型及该提交从该引用的可达性。格式不符、本地伪造或滞后的跟踪引用不会通过，因为选定引用会由当前 `origin` 头部刷新；未推送或无法从已刷新引用到达的提交对象也会失败，不会执行检出。
 
 `mcp>=1.10,<2.0` 需要 AnyIO 4 或更新版本。可选 `chainlit` 依赖为 Chainlit `1.1.202`，其 `asyncer` 约束 AnyIO 低于 4。将 MCP 安装到现有项目 `.venv` 会破坏 `pip check` 和 FastAPI 构造。仅在 `.venv-hermes-mcp` 中排除精确的 `chainlit` 行可解决已验证的冲突；Web `.venv` 不作任何改动，继续保留 Chainlit。
 
@@ -166,16 +166,56 @@ import re
 import yaml
 
 text = Path("docs/hermes_integration.md").read_text(encoding="utf-8")
-yaml_block = re.search(r"\`\`\`yaml\n(.*?)\n\`\`\`", text, re.S).group(1)
-config = yaml.safe_load(yaml_block)
-assert isinstance(config, dict)
-env = config["mcp_servers"]["tradingagents_crypto"]["env"]
+yaml_blocks = re.findall(r"\`\`\`yaml\n(.*?)\n\`\`\`", text, re.S)
+assert yaml_blocks
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+def construct_unique_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise AssertionError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping,
+)
+
+configs = [yaml.load(block, Loader=UniqueKeyLoader) for block in yaml_blocks]
+
+def validate_api_keys(value):
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            if isinstance(key, str) and key.endswith("_API_KEY"):
+                assert (
+                    isinstance(nested_value, str)
+                    and nested_value.startswith("<")
+                    and nested_value.endswith(">")
+                ), f"{key} must use an angle-bracket placeholder"
+            validate_api_keys(nested_value)
+    elif isinstance(value, list):
+        for item in value:
+            validate_api_keys(item)
+
+for config in configs:
+    validate_api_keys(config)
+
+mcp_configs = [
+    config
+    for config in configs
+    if isinstance(config, dict)
+    and isinstance(config.get("mcp_servers"), dict)
+    and isinstance(config["mcp_servers"].get("tradingagents_crypto"), dict)
+]
+assert mcp_configs
+env = mcp_configs[0]["mcp_servers"]["tradingagents_crypto"]["env"]
 assert isinstance(env, dict)
-for name, value in env.items():
-    if name.endswith("_API_KEY"):
-        assert isinstance(value, str) and value.startswith("<") and value.endswith(">"), (
-            f"{name} must use an angle-bracket placeholder"
-        )
 PY
 ```
 
