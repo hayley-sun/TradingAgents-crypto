@@ -34,7 +34,8 @@ set -e
 git status --short
 test -z "$(git status --short)" || { echo "working tree must be clean" >&2; exit 1; }
 reviewed_phase1_commit="<replace-with-reviewed-phase-1-commit-already-pushed-to-origin>"
-reviewed_phase1_ref="origin/feature/hermes-mcp-phase-1"
+# Recommended ref: origin/feature/hermes-mcp-phase-1
+reviewed_phase1_ref="<replace-with-reviewed-origin-tracking-ref>"
 git fetch origin --tags
 git rev-parse --verify "$reviewed_phase1_ref^{commit}"
 git show --verify --quiet "$reviewed_phase1_commit^{commit}"
