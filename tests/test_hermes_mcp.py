@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -51,6 +53,12 @@ class FailingGraph(FakeGraph):
     def propagate(self, symbol, trade_date):
         self.propagate_calls.append((symbol, trade_date))
         raise RuntimeError("provider secret at /private/failure")
+
+
+class PrintingGraph(FakeGraph):
+    def propagate(self, symbol, trade_date):
+        print("graph output must not reach MCP stdout")
+        return super().propagate(symbol, trade_date)
 
 
 class HermesMcpTests(unittest.TestCase):
@@ -131,7 +139,7 @@ class HermesMcpTests(unittest.TestCase):
                 "openrouter": False,
             },
         )
-        self.assertEqual(data["configured_llm_providers"], ["openai"])
+        self.assertEqual(data["configured_llm_providers"], ["ollama", "openai"])
         self.assertIs(data["finnhub_key_available"], True)
         self.assertIs(data["coingecko_key_available"], True)
         self.assertEqual(data["disclaimer"], PAPER_TRADING_DISCLAIMER)
@@ -150,6 +158,18 @@ class HermesMcpTests(unittest.TestCase):
             result = health_check_impl()
 
         self.assertIs(result["data"]["coingecko_key_available"], False)
+
+    def test_health_treats_ollama_as_a_configured_local_provider(self):
+        with TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"TRADINGAGENTS_RESULTS_DIR": temp_dir},
+            clear=True,
+        ):
+            result = health_check_impl()
+
+        self.assertEqual(result["data"]["status"], "ready")
+        self.assertEqual(result["data"]["configured_llm_providers"], ["ollama"])
+        self.assertNotIn("ollama", result["data"]["llm_provider_key_available"])
 
     def test_health_contains_session_store_resolution_errors(self):
         with TemporaryDirectory() as temp_dir:
@@ -257,6 +277,33 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
         provider_key.assert_not_called()
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_analyze_crypto_redirects_graph_stdout_to_stderr(self, provider_key, cleanup):
+        original_defaults = execute_analysis.__defaults__
+        execute_analysis.__defaults__ = (None, PrintingGraph)
+        stdout = StringIO()
+        stderr = StringIO()
+
+        try:
+            with TemporaryDirectory() as temp_dir, patch.dict(
+                os.environ,
+                {"TRADINGAGENTS_RESULTS_DIR": temp_dir},
+                clear=True,
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                _, result = asyncio.run(
+                    MCP.call_tool("analyze_crypto", self.make_request().model_dump(mode="json"))
+                )
+        finally:
+            execute_analysis.__defaults__ = original_defaults
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["processed_signal"], "HOLD")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("graph output must not reach MCP stdout", stderr.getvalue())
+        provider_key.assert_called_once_with("openai")
+        cleanup.assert_called_once()
 
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")

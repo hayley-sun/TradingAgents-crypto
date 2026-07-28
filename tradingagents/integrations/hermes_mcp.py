@@ -3,9 +3,11 @@
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -48,6 +50,7 @@ SESSION_MEMORY_COLLECTION_BASE_NAMES = (
     "invest_judge_memory",
     "risk_manager_memory",
 )
+LOCAL_LLM_PROVIDERS = ("ollama",)
 
 
 def success(data: Any) -> dict[str, Any]:
@@ -151,9 +154,12 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
         if environment_variable
     }
     configured_llm_providers = sorted(
-        provider
-        for provider, key_available in llm_provider_key_available.items()
-        if key_available
+        set(LOCAL_LLM_PROVIDERS)
+        | {
+            provider
+            for provider, key_available in llm_provider_key_available.items()
+            if key_available
+        }
     )
     coingecko_key_available = any(
         bool(os.getenv(environment_variable))
@@ -309,27 +315,28 @@ def execute_analysis(
     analysis_started = False
     try:
         with _ANALYSIS_LOCK:
-            graph_config = build_graph_config(
-                DEFAULT_CONFIG,
-                {
-                    "llm_provider": request.llm_provider,
-                    "api_key": provider_key,
-                    "quick_think_llm": request.quick_model,
-                    "deep_think_llm": request.deep_model,
-                    "research_depth": request.research_depth,
-                },
-                session_id,
-            )
-            graph_config["log_graph_states"] = False
-            analysis_started = True
-            graph = graph_factory(
-                selected_analysts=request.analysts,
-                debug=False,
-                config=graph_config,
-            )
-            final_state, processed_signal = graph.propagate(
-                request.symbol, request.trade_date.isoformat()
-            )
+            with redirect_stdout(sys.stderr):
+                graph_config = build_graph_config(
+                    DEFAULT_CONFIG,
+                    {
+                        "llm_provider": request.llm_provider,
+                        "api_key": provider_key,
+                        "quick_think_llm": request.quick_model,
+                        "deep_think_llm": request.deep_model,
+                        "research_depth": request.research_depth,
+                    },
+                    session_id,
+                )
+                graph_config["log_graph_states"] = False
+                analysis_started = True
+                graph = graph_factory(
+                    selected_analysts=request.analysts,
+                    debug=False,
+                    config=graph_config,
+                )
+                final_state, processed_signal = graph.propagate(
+                    request.symbol, request.trade_date.isoformat()
+                )
 
         result = AnalysisResult(
             reports={
