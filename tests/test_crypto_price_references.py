@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from unittest.mock import Mock, patch
 
 from tradingagents.dataflows.crypto_price_references import (
@@ -91,7 +91,7 @@ class CryptoPriceReferenceTests(unittest.TestCase):
                     "Data": [
                         {
                             "time": int(
-                                datetime(2026, 7, 28, tzinfo=UTC).timestamp()
+                                datetime(2026, 7, 28, tzinfo=timezone.utc).timestamp()
                             ),
                             "close": "101.25",
                         }
@@ -124,7 +124,7 @@ class CryptoPriceReferenceTests(unittest.TestCase):
                     "Data": [
                         {
                             "time": int(
-                                datetime(2026, 7, 27, tzinfo=UTC).timestamp()
+                                datetime(2026, 7, 27, tzinfo=timezone.utc).timestamp()
                             ),
                             "close": 0,
                         }
@@ -141,7 +141,7 @@ class CryptoPriceReferenceTests(unittest.TestCase):
     def test_coinbase_uses_exact_utc_day_close(self):
         session = Mock()
         session.get.return_value = FakeResponse(
-            [[int(datetime(2026, 7, 28, tzinfo=UTC).timestamp()), 99, 102, 98, 101.5, 12]]
+            [[int(datetime(2026, 7, 28, tzinfo=timezone.utc).timestamp()), 99, 102, 98, 101.5, 12]]
         )
 
         values = CoinbaseHistoricalUsdProvider(session).references("btc", [ENTRY_DATE])
@@ -160,7 +160,7 @@ class CryptoPriceReferenceTests(unittest.TestCase):
     def test_coinbase_rejects_wrong_day_or_non_positive_close(self):
         session = Mock()
         session.get.return_value = FakeResponse(
-            [[int(datetime(2026, 7, 27, tzinfo=UTC).timestamp()), 99, 102, 98, 0, 12]]
+            [[int(datetime(2026, 7, 27, tzinfo=timezone.utc).timestamp()), 99, 102, 98, 0, 12]]
         )
 
         with self.assertRaises(HistoricalPriceUnavailable):

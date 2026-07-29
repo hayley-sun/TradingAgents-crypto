@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -14,7 +14,7 @@ LIVE_ID = "hermes_0123456789abcdef"
 UNTRACKED_ID = "hermes_0123456789abcdec"
 DEAD_PID = 4101
 LIVE_PID = 4102
-NOW = datetime(2026, 7, 29, tzinfo=UTC)
+NOW = datetime(2026, 7, 29, tzinfo=timezone.utc)
 
 
 def request() -> AnalysisRequest:
