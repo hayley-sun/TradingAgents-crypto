@@ -161,7 +161,7 @@ mcp__tradingagents_crypto__review_paper_decision
 
 > 请调用 mcp__tradingagents_crypto__review_paper_decision，参数为 session_id="<session_id>"，review_date="<YYYY-MM-DD>"。这是研究和模拟交易，不得真实下单。
 
-响应中的 `hermes_memory_entry` 由 Hermes 主进程写入其自身记忆。MCP 子进程不会读取或修改 `/home/ubuntu/.hermes/MEMORY.md`、`USER.md`、Hermes 会话数据库或外部 memory provider。先确认内置 memory 工具已启用：
+响应中的 `hermes_memory_entry` 由 Hermes 主进程写入其自身记忆。MCP 子进程不会读取或修改 Hermes 管理的内置 memory 文件（例如 `/home/ubuntu/.hermes/memories/MEMORY.md`）、用户资料、Hermes 会话数据库或外部 memory provider。先确认内置 memory 工具已启用：
 
 ```bash
 hermes memory status
