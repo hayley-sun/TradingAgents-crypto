@@ -7,6 +7,11 @@ from tradingagents.llm_providers import supports_memory_embeddings
 
 class FinancialSituationMemory:
     def __init__(self, name, config):
+        self.review_lessons = [
+            lesson.strip()
+            for lesson in config.get("hermes_review_lessons", [])
+            if isinstance(lesson, str) and lesson.strip()
+        ]
         self.enabled = supports_memory_embeddings(config.get("llm_provider", "openai"))
         if not self.enabled:
             self.client = None
@@ -75,6 +80,15 @@ class FinancialSituationMemory:
 
     def get_memories(self, current_situation, n_matches=1):
         """Find matching recommendations using OpenAI embeddings"""
+        if self.review_lessons:
+            return [
+                {
+                    "matched_situation": "",
+                    "recommendation": lesson,
+                    "similarity_score": 1.0,
+                }
+                for lesson in self.review_lessons
+            ]
         if not self.enabled:
             return []
 

@@ -61,15 +61,14 @@ Add a Python MCP server inside the project:
 - `requirements_hermes.txt`
 - `docs/hermes_integration.md`
 
-Initial MCP tools:
+Implemented MCP tools:
 
 - `health_check()`: verifies imports, config visibility, and basic runtime readiness.
-- `analyze_crypto(symbol, trade_date, analysts, research_depth, llm_provider, quick_model, deep_model)`: runs TradingAgents analysis and stores a session result.
+- `analyze_crypto(symbol, trade_date, analysts, research_depth, llm_provider, quick_model, deep_model)`: creates a detached paper-trading analysis job and returns its opaque session id immediately.
 - `get_analysis_result(session_id)`: returns a stored result by session id.
-- `list_analysis_sessions(limit)`: lists recent analysis sessions.
-- `compare_crypto(symbols, trade_date)`: runs or loads analyses for multiple symbols and returns a compact comparison.
+- `review_paper_decision(session_id, review_date)`: deterministically scores one completed paper decision and returns a compact Hermes memory candidate.
 
-The first implementation milestone may ship only `health_check`, `analyze_crypto`, and `get_analysis_result` if that is enough to validate Hermes tool calling.
+`analyze_crypto` never runs the graph in the stdio MCP process. The detached worker serializes graph execution with a cross-process file lock, writes per-session logs, and persists `queued`, `running`, `completed`, or `failed` state. `get_analysis_result` is the only status/result lookup API.
 
 ### Cloud Host Configuration
 
@@ -81,10 +80,10 @@ cd /home/ubuntu/workspace/TradingAgents-crypto
 set -e
 git status --short
 test -z "$(git status --short)" || { echo "working tree must be clean" >&2; exit 1; }
-reviewed_phase1_commit="<replace-with-reviewed-phase-1-commit-already-pushed-to-origin>"
+reviewed_integration_commit="<replace-with-reviewed-integration-commit-already-pushed-to-origin>"
 git fetch origin --tags
-git show --verify --quiet "$reviewed_phase1_commit^{commit}"
-git switch --detach "$reviewed_phase1_commit"
+git show --verify --quiet "$reviewed_integration_commit^{commit}"
+git switch --detach "$reviewed_integration_commit"
 git log -1 --oneline
 python3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 python3 -m venv /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp
@@ -99,9 +98,9 @@ grep -v '^chainlit$' requirements.txt > "$requirements_file"
 rm -- "$requirements_file"
 ```
 
-The operator must replace `reviewed_phase1_commit` with a reviewed Phase 1 commit already pushed to `origin`. The clean-worktree check prevents deploying over local changes; the flow fetches, verifies, and detached-checks out only that reviewed commit, without a forced checkout, reset, or discarded work. With `set -e`, a failed installation or check preserves the unique `mktemp` requirements file for diagnosis; `rm -- "$requirements_file"` runs only after all checks succeed.
+The operator must replace `reviewed_integration_commit` with a reviewed integration commit already pushed to `origin`. The canonical command and branch-ref verification procedure is `docs/hermes_integration.md`; it preserves local changes, uses a detached checkout, and does not force-reset the host worktree.
 
-MCP must use a dedicated `.venv-hermes-mcp`, not the existing Web `.venv`. This was verified during dependency integration: `mcp>=1.10,<2.0` requires AnyIO 4+, while optional Chainlit `1.1.202` depends on `asyncer` with AnyIO <4. Installing MCP into the existing project `.venv` breaks `pip check` and FastAPI construction. The dedicated MCP environment installs all runtime requirements except the one exact `chainlit` line, then installs `requirements_hermes.txt`; the Web `.venv` remains unchanged.
+MCP must use a dedicated `.venv-hermes-mcp`, not the existing Web `.venv`. This was verified during dependency integration: `mcp==1.28.1` requires AnyIO 4+, while optional Chainlit `1.1.202` depends on `asyncer` with AnyIO <4. Installing MCP into the existing project `.venv` breaks `pip check` and FastAPI construction. The dedicated MCP environment installs all runtime requirements except the one exact `chainlit` line, then installs `requirements_hermes.txt`; the Web `.venv` remains unchanged.
 
 Hermes config should use the dedicated MCP virtualenv Python and the standard top-level `mcp_servers` mapping:
 
@@ -135,36 +134,15 @@ Inside a Hermes session:
 /tools
 ```
 
-Expected result: `/tools` lists `mcp__tradingagents_crypto__health_check`, `mcp__tradingagents_crypto__analyze_crypto`, and `mcp__tradingagents_crypto__get_analysis_result`; Hermes can call `health_check` and then run `analyze_crypto` for a small BTC analysis without opening any new public port. The authoritative operational procedure is `docs/hermes_integration.md`.
+Expected result: `/tools` lists `mcp__tradingagents_crypto__health_check`, `mcp__tradingagents_crypto__analyze_crypto`, `mcp__tradingagents_crypto__get_analysis_result`, and `mcp__tradingagents_crypto__review_paper_decision`; Hermes can submit a small BTC analysis, poll its session, and review a completed paper decision without opening any new public port. The authoritative operational procedure is `docs/hermes_integration.md`.
 
 ## Phase 2: Review And Learning Loop
 
-Add a paper-trading journal that records:
+Phase 2 persists an immutable, deterministic review for one completed session under `results/hermes/reviews`. It compares the original decision with CoinGecko historical USD reference prices for the session trade date and review date, and classifies the action as `correct`, `incorrect`, `flat`, or `not_scored`.
 
-- analysis session id
-- symbol
-- trade date
-- selected analysts
-- LLM provider and models
-- final decision
-- processed BUY/HOLD/SELL signal
-- market, news, sentiment, fundamentals reports
-- price snapshot at decision time
-- future performance at configured horizons
+The same operation atomically maintains a bounded, symbol-isolated index under `results/hermes/memories/<SYMBOL>.json`. The index keeps the newest 20 lessons; future same-symbol analyses receive at most five compact lessons through the existing graph-memory interface. Read failures only suppress learning context and do not prevent a new analysis.
 
-Add review tools:
-
-- `record_decision_outcome(session_id, horizon_days)`
-- `evaluate_recent_decisions(days)`
-- `generate_learning_summary(symbol, days)`
-
-The review loop should use existing project pieces where possible:
-
-- `TradingAgentsGraph.reflect_and_remember()`
-- `tradingagents/graph/reflection.py`
-- `tradingagents/agents/utils/memory.py`
-
-Hermes should store short durable lessons in memory or skills, not full analysis reports. Full reports stay in the project journal/results directory.
+`review_paper_decision` makes no LLM call and never places orders. It is idempotent for a `(session_id, review_date)` pair; a retry repairs a missing learning-index entry without fetching prices again. The MCP server does not write Hermes-owned memory files. Hermes receives `hermes_memory_entry` and must explicitly use its own memory tool if the operator accepts the lesson.
 
 Recommended Hermes memory policy:
 
@@ -173,7 +151,7 @@ Recommended Hermes memory policy:
 - Do not store secrets.
 - Prefer skill updates for repeatable procedures, such as "crypto risk review checklist".
 
-Expected result: Hermes can ask the project to evaluate recent paper decisions, summarize failure patterns, and reuse those lessons in future analysis prompts or operator guidance.
+Expected result: Hermes can request one completed session review, observe the persisted result and learning entry, then explicitly store a concise operator-approved memory lesson. Future same-symbol analyses can use project-local learning context without embedding or reusing raw reports.
 
 ## Phase 3: Scheduled Reports And Alerts
 
@@ -220,7 +198,7 @@ Common cases:
 - analysis run timeout
 - malformed stored session
 
-Long-running analysis should use generous timeouts and should avoid blocking unrelated Hermes tools. If the first version is synchronous, the documentation must make the runtime cost clear.
+Long-running analysis runs only in its detached worker and must never block stdio keepalives. The MCP call timeout remains a safety limit for short operations, not a mechanism for waiting on an analysis graph.
 
 ## Data Storage
 
@@ -229,8 +207,9 @@ Use project-local storage for integration artifacts:
 ```text
 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/
   sessions/
-  journals/
+  logs/
   reviews/
+  memories/
 ```
 
 Session JSON should include a schema version so future migrations are explicit.
@@ -257,9 +236,9 @@ Phase 1 tests:
 
 Phase 2 tests:
 
-- journal write/read round trip
+- immutable review/index write and idempotent repair
 - outcome calculation with fixed price fixtures
-- review summary generation with mocked LLM
+- review MCP validation and graph lesson injection without embeddings
 
 Phase 3 tests:
 
@@ -273,14 +252,14 @@ Phase 1 is complete when:
 
 - Hermes lists `tradingagents_crypto` tools.
 - `health_check` succeeds on the cloud host.
-- Hermes can call `analyze_crypto("BTC", "2026-07-28", ...)` and retrieve the result.
+- Hermes can submit `analyze_crypto("BTC", "2026-07-28", ...)`, receive a session id promptly, and retrieve the completed result by polling.
 - No public MCP port is exposed.
 
 Phase 2 is complete when:
 
-- decisions are stored in a journal.
-- outcomes can be computed for at least one horizon.
-- Hermes can generate a compact learning summary from recent paper decisions.
+- a completed session can produce an idempotent review for a later historical date.
+- the review and its per-symbol learning entry are persisted under the project results root.
+- Hermes receives a compact memory candidate and future same-symbol analyses load at most five project-local lessons.
 
 Phase 3 is complete when:
 

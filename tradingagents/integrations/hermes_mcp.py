@@ -3,24 +3,39 @@
 import json
 import logging
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping
+from contextlib import contextmanager, redirect_stdout
+from datetime import date
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import chromadb
+import fcntl
 from chromadb.config import Settings
 from mcp.server.fastmcp import FastMCP
-from pydantic import ValidationError
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from pydantic import ConfigDict, ValidationError
 
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.dataflows.coingecko_utils import get_crypto_historical_usd_price
 from tradingagents.graph import TradingAgentsGraph
+from tradingagents.integrations.hermes_learning import (
+    LearningStorageError,
+    LearningStore,
+    ReviewStorageError,
+    ReviewStore,
+    review_completed_session,
+)
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    ReviewRequest,
     ToolError,
     is_valid_session_id,
     utc_now,
@@ -38,7 +53,7 @@ PAPER_TRADING_DISCLAIMER = (
 )
 MCP = FastMCP("tradingagents_crypto")
 _SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
-_ANALYSIS_LOCK = threading.Lock()
+_REVIEW_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
 SESSION_MEMORY_COLLECTION_BASE_NAMES = (
     "bull_memory",
@@ -47,6 +62,7 @@ SESSION_MEMORY_COLLECTION_BASE_NAMES = (
     "invest_judge_memory",
     "risk_manager_memory",
 )
+LOCAL_LLM_PROVIDERS = ("ollama",)
 
 
 def success(data: Any) -> dict[str, Any]:
@@ -79,10 +95,12 @@ class SessionStore:
             raise ValueError("invalid session id")
         return self.root / f"{session_id}.json"
 
-    def create(self, session_id: str, request: AnalysisRequest) -> AnalysisSession:
+    def create(
+        self, session_id: str, request: AnalysisRequest, status: str = "running"
+    ) -> AnalysisSession:
         session = AnalysisSession(
             session_id=session_id,
-            status="running",
+            status=status,
             created_at=utc_now(),
             request=request,
         )
@@ -150,9 +168,12 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
         if environment_variable
     }
     configured_llm_providers = sorted(
-        provider
-        for provider, key_available in llm_provider_key_available.items()
-        if key_available
+        set(LOCAL_LLM_PROVIDERS)
+        | {
+            provider
+            for provider, key_available in llm_provider_key_available.items()
+            if key_available
+        }
     )
     coingecko_key_available = any(
         bool(os.getenv(environment_variable))
@@ -173,6 +194,27 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
             "coingecko_key_available": coingecko_key_available,
             "disclaimer": PAPER_TRADING_DISCLAIMER,
         }
+    )
+
+
+def _worker_is_alive(worker_pid: int) -> bool:
+    try:
+        os.kill(worker_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _worker_exited_session(session: AnalysisSession) -> AnalysisSession:
+    return _failed_session(
+        session,
+        ToolError(
+            code="WORKER_EXITED",
+            message="The analysis worker exited before completing the session.",
+            suggested_action="Start a new analysis session.",
+        ),
     )
 
 
@@ -220,6 +262,23 @@ def get_analysis_result_impl(
             )
         )
 
+    if (
+        session.status in {"queued", "running"}
+        and session.worker_pid is not None
+        and not _worker_is_alive(session.worker_pid)
+    ):
+        session = _worker_exited_session(session)
+        try:
+            active_store.save(session)
+        except OSError:
+            return failure(
+                ToolError(
+                    code="SESSION_WRITE_FAILED",
+                    message="The analysis session could not be updated.",
+                    suggested_action="Verify that session storage is writable and try again.",
+                )
+            )
+
     return success(
         {
             "session": session.model_dump(mode="json"),
@@ -232,6 +291,24 @@ def _analysis_error(code: str, message: str, suggested_action: str) -> dict[str,
     return failure(
         ToolError(code=code, message=message, suggested_action=suggested_action)
     )
+
+
+def _review_error(code: str, message: str, suggested_action: str) -> dict[str, Any]:
+    return failure(
+        ToolError(code=code, message=message, suggested_action=suggested_action)
+    )
+
+
+def _load_review_lessons(symbol: str) -> list[str]:
+    try:
+        return LearningStore.from_environment().lessons_for(symbol, limit=5)
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        LOGGER.warning(
+            "hermes_learning_load_failed symbol=%s exception_class=%s",
+            symbol,
+            type(error).__name__,
+        )
+        return []
 
 
 def _cleanup_session_collections(session_id: str) -> None:
@@ -255,18 +332,55 @@ def _failed_session(session: AnalysisSession, error: ToolError) -> AnalysisSessi
         session_id=session.session_id,
         status="failed",
         created_at=session.created_at,
+        started_at=session.started_at,
         completed_at=utc_now(),
+        worker_pid=session.worker_pid,
         request=session.request,
         error=error,
     )
 
 
-def execute_analysis(
+def _worker_start_failed_session(session: AnalysisSession) -> AnalysisSession:
+    return _failed_session(
+        session,
+        ToolError(
+            code="WORKER_START_FAILED",
+            message="The analysis worker could not be started.",
+            suggested_action="Verify the MCP Python environment and try the analysis again.",
+        ),
+    )
+
+
+def launch_analysis_worker(session_id: str, store: SessionStore) -> int:
+    """Start a worker that survives an MCP stdio reconnect."""
+    log_directory = store.root.parent / "logs"
+    log_directory.mkdir(parents=True, exist_ok=True)
+    log_path = log_directory / f"{session_id}.log"
+
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tradingagents.integrations.hermes_analysis_worker",
+                session_id,
+            ],
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return process.pid
+
+
+def start_analysis(
     request_data: Mapping[str, Any],
     store: SessionStore | None = None,
-    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+    worker_launcher=launch_analysis_worker,
 ) -> dict[str, Any]:
-    """Run a TradingAgents analysis and persist its sanitized Hermes result."""
+    """Queue an analysis without blocking the MCP stdio process."""
     try:
         request = AnalysisRequest.model_validate(request_data)
     except (ValidationError, TypeError, ValueError):
@@ -276,28 +390,25 @@ def execute_analysis(
             "Correct the request fields and try again.",
         )
 
-    provider_key = ""
-    if request.llm_provider != "ollama":
-        provider_key = get_provider_api_key(request.llm_provider)
-        if not provider_key:
-            return _analysis_error(
-                "MISSING_API_KEY",
-                "The selected LLM provider is not configured.",
-                "Configure an API key for the selected provider and try again.",
-            )
+    if request.llm_provider != "ollama" and not get_provider_api_key(request.llm_provider):
+        return _analysis_error(
+            "MISSING_API_KEY",
+            "The selected LLM provider is not configured.",
+            "Configure an API key for the selected provider and try again.",
+        )
 
     try:
         active_store = store if store is not None else SessionStore.from_environment()
     except _SESSION_STORE_CONSTRUCTION_ERRORS:
         return _analysis_error(
             "SESSION_STORE_UNAVAILABLE",
-            "Session storage is currently unavailable.",
+            "The analysis session could not be started.",
             "Verify the session storage configuration and try again.",
         )
 
     session_id = f"hermes_{uuid4().hex}"
     try:
-        session = active_store.create(session_id, request)
+        session = active_store.create(session_id, request, status="queued")
     except Exception:
         return _analysis_error(
             "SESSION_WRITE_FAILED",
@@ -305,30 +416,94 @@ def execute_analysis(
             "Verify that session storage is writable and try again.",
         )
 
+    try:
+        worker_pid = worker_launcher(session_id, active_store)
+    except OSError:
+        try:
+            active_store.save(_worker_start_failed_session(session))
+        except Exception:
+            pass
+        return _analysis_error(
+            "WORKER_START_FAILED",
+            "The analysis worker could not be started.",
+            "Verify the MCP Python environment and try the analysis again.",
+        )
+
+    persisted_session = active_store.load(session_id)
+    if persisted_session is not None and persisted_session.status == "queued":
+        persisted_session = persisted_session.model_copy(update={"worker_pid": worker_pid})
+        active_store.save(persisted_session)
+
+    return success(
+        {
+            "session_id": session_id,
+            "status": persisted_session.status if persisted_session else "queued",
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
+
+
+@contextmanager
+def _analysis_file_lock(store: SessionStore):
+    lock_path = store.root.parent / ".analysis.lock"
+    store.ensure()
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _missing_provider_error() -> ToolError:
+    return ToolError(
+        code="MISSING_API_KEY",
+        message="The selected LLM provider is not configured.",
+        suggested_action="Configure an API key for the selected provider and try again.",
+    )
+
+
+def _run_analysis_session(
+    session: AnalysisSession,
+    store: SessionStore,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+    provider_key: str | None = None,
+) -> dict[str, Any]:
+    request = session.request
+    if request.llm_provider != "ollama" and provider_key is None:
+        provider_key = get_provider_api_key(request.llm_provider)
+    if request.llm_provider != "ollama" and not provider_key:
+        error = _missing_provider_error()
+        try:
+            store.save(_failed_session(session, error))
+        except OSError:
+            pass
+        return failure(error)
+
     analysis_started = False
     try:
-        with _ANALYSIS_LOCK:
-            graph_config = build_graph_config(
-                DEFAULT_CONFIG,
-                {
-                    "llm_provider": request.llm_provider,
-                    "api_key": provider_key,
-                    "quick_think_llm": request.quick_model,
-                    "deep_think_llm": request.deep_model,
-                    "research_depth": request.research_depth,
-                },
-                session_id,
-            )
-            analysis_started = True
-            graph = graph_factory(
-                selected_analysts=request.analysts,
-                debug=False,
-                config=graph_config,
-            )
-            final_state, processed_signal = graph.propagate(
-                request.symbol, request.trade_date.isoformat()
-            )
-
+        graph_config = build_graph_config(
+            DEFAULT_CONFIG,
+            {
+                "llm_provider": request.llm_provider,
+                "api_key": provider_key or "",
+                "quick_think_llm": request.quick_model,
+                "deep_think_llm": request.deep_model,
+                "research_depth": request.research_depth,
+            },
+            session.session_id,
+        )
+        graph_config["log_graph_states"] = False
+        graph_config["hermes_review_lessons"] = _load_review_lessons(request.symbol)
+        analysis_started = True
+        graph = graph_factory(
+            selected_analysts=request.analysts,
+            debug=False,
+            config=graph_config,
+        )
+        final_state, processed_signal = graph.propagate(
+            request.symbol, request.trade_date.isoformat()
+        )
         result = AnalysisResult(
             reports={
                 "market": final_state["market_report"],
@@ -341,18 +516,18 @@ def execute_analysis(
             final_trade_decision=final_state["final_trade_decision"],
             processed_signal=processed_signal,
         )
-        completed_session = AnalysisSession(
-            session_id=session.session_id,
-            status="completed",
-            created_at=session.created_at,
-            completed_at=utc_now(),
-            request=request,
-            result=result,
+        completed_session = session.model_copy(
+            update={
+                "status": "completed",
+                "completed_at": utc_now(),
+                "result": result,
+                "error": None,
+            }
         )
-        active_store.save(completed_session)
+        store.save(completed_session)
         return success(
             {
-                "session_id": session_id,
+                "session_id": session.session_id,
                 "status": "completed",
                 "processed_signal": result.processed_signal,
                 "final_trade_decision": result.final_trade_decision,
@@ -367,17 +542,222 @@ def execute_analysis(
         )
         LOGGER.error(
             "hermes_analysis_failed session_id=%s exception_class=%s",
-            session_id,
+            session.session_id,
             type(error).__name__,
         )
         try:
-            active_store.save(_failed_session(session, analysis_error))
-        except Exception:
+            store.save(_failed_session(session, analysis_error))
+        except OSError:
             pass
         return failure(analysis_error)
     finally:
         if analysis_started:
-            _cleanup_session_collections(session_id)
+            _cleanup_session_collections(session.session_id)
+
+
+def run_queued_analysis(
+    session_id: str,
+    store: SessionStore | None = None,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+) -> dict[str, Any]:
+    """Run a queued session in a detached worker process."""
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+        with _analysis_file_lock(active_store):
+            session = active_store.load(session_id)
+            if session is None:
+                return _analysis_error(
+                    "SESSION_NOT_FOUND",
+                    "No analysis session exists for this session ID.",
+                    "Check the session ID or start a new analysis session.",
+                )
+            if session.status != "queued":
+                return _analysis_error(
+                    "SESSION_NOT_QUEUED",
+                    "The analysis session is not waiting to run.",
+                    "Use get_analysis_result to inspect the existing session.",
+                )
+            running_session = session.model_copy(
+                update={
+                    "status": "running",
+                    "started_at": utc_now(),
+                    "worker_pid": os.getpid(),
+                }
+            )
+            active_store.save(running_session)
+            return _run_analysis_session(running_session, active_store, graph_factory)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError):
+        return _analysis_error(
+            "SESSION_UNREADABLE",
+            "The stored analysis session could not be read.",
+            "Verify the session storage configuration and try again.",
+        )
+
+
+def execute_analysis(
+    request_data: Mapping[str, Any],
+    store: SessionStore | None = None,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+) -> dict[str, Any]:
+    """Run a TradingAgents analysis synchronously for internal callers."""
+    try:
+        request = AnalysisRequest.model_validate(request_data)
+    except (ValidationError, TypeError, ValueError):
+        return _analysis_error(
+            "INVALID_REQUEST",
+            "The analysis request is invalid.",
+            "Correct the request fields and try again.",
+        )
+
+    provider_key = ""
+    if request.llm_provider != "ollama":
+        provider_key = get_provider_api_key(request.llm_provider)
+        if not provider_key:
+            return failure(_missing_provider_error())
+
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _analysis_error(
+            "SESSION_STORE_UNAVAILABLE",
+            "Session storage is currently unavailable.",
+            "Verify the session storage configuration and try again.",
+        )
+
+    session_id = f"hermes_{uuid4().hex}"
+    try:
+        session = active_store.create(session_id, request)
+        session = session.model_copy(
+            update={"started_at": utc_now(), "worker_pid": os.getpid()}
+        )
+        active_store.save(session)
+        with _analysis_file_lock(active_store):
+            return _run_analysis_session(session, active_store, graph_factory, provider_key)
+    except OSError:
+        return _analysis_error(
+            "SESSION_WRITE_FAILED",
+            "The analysis session could not be started.",
+            "Verify that session storage is writable and try again.",
+        )
+
+
+def review_paper_decision_impl(
+    request_data: Mapping[str, Any],
+    store: SessionStore | None = None,
+    review_store: ReviewStore | None = None,
+    learning_store: LearningStore | None = None,
+    price_lookup: Any = None,
+    current_date: date | None = None,
+) -> dict[str, Any]:
+    """Review one completed paper-trading decision without an LLM call."""
+    try:
+        request = ReviewRequest.model_validate(request_data)
+    except (ValidationError, TypeError, ValueError):
+        return _review_error(
+            "INVALID_REVIEW_REQUEST",
+            "The paper-decision review request is invalid.",
+            "Use a completed Hermes session ID and a later ISO review date.",
+        )
+
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _review_error(
+            "SESSION_UNREADABLE",
+            "The stored analysis session could not be read.",
+            "Verify the session storage configuration and try again.",
+        )
+
+    try:
+        session = active_store.load(request.session_id)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError):
+        return _review_error(
+            "SESSION_UNREADABLE",
+            "The stored analysis session could not be read.",
+            "Retry later or start a new analysis session.",
+        )
+
+    if session is None:
+        return _review_error(
+            "SESSION_NOT_FOUND",
+            "No analysis session exists for this session ID.",
+            "Check the session ID or start a new analysis.",
+        )
+    if session.status != "completed" or session.result is None:
+        return _review_error(
+            "SESSION_NOT_COMPLETED",
+            "Only completed analysis sessions can be reviewed.",
+            "Wait for a completed paper-trading analysis before reviewing it.",
+        )
+
+    today = current_date or utc_now().date()
+    if request.review_date <= session.request.trade_date or request.review_date > today:
+        return _review_error(
+            "INVALID_REVIEW_REQUEST",
+            "The review date must be after the trade date and not in the future.",
+            "Choose a completed UTC calendar date after the original trade date.",
+        )
+
+    try:
+        active_review_store = (
+            review_store if review_store is not None else ReviewStore.from_environment()
+        )
+        active_learning_store = (
+            learning_store
+            if learning_store is not None
+            else LearningStore.from_environment()
+        )
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _review_error(
+            "REVIEW_STORE_UNAVAILABLE",
+            "Paper-decision review storage is currently unavailable.",
+            "Verify the Hermes results directory and try again.",
+        )
+
+    lookup = price_lookup or get_crypto_historical_usd_price
+    try:
+        with _REVIEW_LOCK:
+            with redirect_stdout(sys.stderr):
+                review = review_completed_session(
+                    session,
+                    request.review_date,
+                    lookup,
+                    active_review_store,
+                    active_learning_store,
+                    current_date=today,
+                )
+    except LearningStorageError:
+        return _review_error(
+            "LEARNING_WRITE_FAILED",
+            "The paper-decision review was saved but learning could not be updated.",
+            "Verify learning storage, then repeat the same review request to repair it.",
+        )
+    except ReviewStorageError:
+        return _review_error(
+            "REVIEW_WRITE_FAILED",
+            "The paper-decision review could not be persisted.",
+            "Verify review storage and try again.",
+        )
+    except (OSError, json.JSONDecodeError, ValidationError):
+        return _review_error(
+            "REVIEW_WRITE_FAILED",
+            "The paper-decision review could not be persisted.",
+            "Verify review and learning storage, then repeat the same request.",
+        )
+    except ValueError:
+        return _review_error(
+            "PRICE_DATA_UNAVAILABLE",
+            "CoinGecko USD reference price data is unavailable for this review.",
+            "Verify the symbol and review date, then try again later.",
+        )
+
+    return success(
+        {
+            "review": review.model_dump(mode="json"),
+            "hermes_memory_entry": review.hermes_memory_entry,
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
 
 
 @MCP.tool()
@@ -401,19 +781,85 @@ def analyze_crypto(
     llm_provider: str,
     quick_model: str,
     deep_model: str,
+    **unknown_fields: Any,
 ) -> dict[str, Any]:
-    """Run a paper-trading crypto analysis through TradingAgents."""
-    return execute_analysis(
-        {
-            "symbol": symbol,
-            "trade_date": trade_date,
-            "analysts": analysts,
-            "research_depth": research_depth,
-            "llm_provider": llm_provider,
-            "quick_model": quick_model,
-            "deep_model": deep_model,
-        }
-    )
+    """Queue a paper-trading crypto analysis through TradingAgents."""
+    request_data = {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "analysts": analysts,
+        "research_depth": research_depth,
+        "llm_provider": llm_provider,
+        "quick_model": quick_model,
+        "deep_model": deep_model,
+    }
+    request_data.update(unknown_fields)
+    return start_analysis(request_data)
+
+
+@MCP.tool()
+def review_paper_decision(
+    session_id: str,
+    review_date: str,
+    **unknown_fields: Any,
+) -> dict[str, Any]:
+    """Review a completed paper-trading decision using historical USD references."""
+    request_data = {"session_id": session_id, "review_date": review_date}
+    request_data.update(unknown_fields)
+    return review_paper_decision_impl(request_data)
+
+
+class _AnalyzeCryptoArguments(ArgModelBase):
+    """Preserve raw flat MCP fields so AnalysisRequest can reject unknown inputs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    symbol: str
+    trade_date: str
+    analysts: list[str]
+    research_depth: int
+    llm_provider: str
+    quick_model: str
+    deep_model: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class _ReviewPaperDecisionArguments(ArgModelBase):
+    """Preserve raw review fields so ReviewRequest can reject unknown inputs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    session_id: str
+    review_date: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+def _configure_analyze_crypto_tool() -> None:
+    tool = MCP._tool_manager.get_tool("analyze_crypto")
+    if tool is None:
+        raise RuntimeError("analyze_crypto tool registration is unavailable")
+
+    tool.fn_metadata.arg_model = _AnalyzeCryptoArguments
+    tool.parameters = _AnalyzeCryptoArguments.model_json_schema()
+    tool.parameters["additionalProperties"] = False
+
+
+def _configure_review_paper_decision_tool() -> None:
+    tool = MCP._tool_manager.get_tool("review_paper_decision")
+    if tool is None:
+        raise RuntimeError("review_paper_decision tool registration is unavailable")
+
+    tool.fn_metadata.arg_model = _ReviewPaperDecisionArguments
+    tool.parameters = _ReviewPaperDecisionArguments.model_json_schema()
+    tool.parameters["additionalProperties"] = False
+
+
+_configure_analyze_crypto_tool()
+_configure_review_paper_decision_tool()
 
 
 if __name__ == "__main__":

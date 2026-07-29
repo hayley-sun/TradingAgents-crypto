@@ -1,8 +1,9 @@
 import requests
 import json
+import math
 import pandas as pd
 from typing import Annotated, Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import time
 import os
 
@@ -184,6 +185,30 @@ class CoinGeckoAPI:
         except Exception as e:
             print(f"Error getting coin ID for {symbol}: {e}")
             return None
+
+
+def get_crypto_historical_usd_price(symbol: str, reference_date: date) -> float:
+    """Return CoinGecko's USD reference price for one historical calendar date."""
+    api = CoinGeckoAPI()
+    coin_id = api.get_coin_id(symbol)
+    if not coin_id:
+        raise ValueError("coin ID is unavailable")
+
+    data = api._make_request(
+        f"/coins/{coin_id}/history",
+        {
+            "date": reference_date.strftime("%d-%m-%Y"),
+            "localization": "false",
+        },
+    )
+    try:
+        price = float(data["market_data"]["current_price"]["usd"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("USD reference price is unavailable") from error
+
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("USD reference price is unavailable")
+    return price
 
 
 def get_crypto_price_data(
