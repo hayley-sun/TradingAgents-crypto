@@ -130,12 +130,15 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertNotIn(directory, failure_stdout.getvalue())
         self.assertNotIn(MEMORY_ENTRY, failure_stdout.getvalue())
 
-    def test_skill_requires_explicit_mcp_memory_tool_and_verifier(self):
+    def test_skill_uses_hermes_memory_deduplication_and_verifier(self):
         text = SKILL_PATH.read_text(encoding="utf-8")
 
         self.assertIn("explicitly invokes", text)
         self.assertIn("mcp__tradingagents_crypto__review_paper_decision", text)
         self.assertIn("memory tool", text)
+        self.assertIn("action=add", text)
+        self.assertIn("already exists", text)
+        self.assertNotIn("search the current long-term memory", text)
         self.assertIn("hermes_review_verifier", text)
         self.assertIn("never a real order", text)
 
@@ -159,6 +162,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("CRYPTOCOMPARE_API_KEY", text)
         self.assertIn("CoinGecko -> CryptoCompare -> Coinbase", text)
         self.assertIn("tradingagents-paper-review", text)
+        self.assertIn("memory(action=add", text)
         self.assertIn("tradingagents-hermes-maintenance.timer", text)
         self.assertIn("hermes_review_verifier", text)
 

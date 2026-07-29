@@ -170,7 +170,7 @@ install -m 600 deploy/hermes/skills/tradingagents-paper-review/SKILL.md /home/ub
 /tradingagents-paper-review session_id=<session_id> review_date=<YYYY-MM-DD>
 ```
 
-该 skill 会调用 review MCP 工具、先用 Hermes memory tool 检查精确条目是否已存在、仅在零条目时写入一次，然后执行只读校验器。它绝不允许通过终端直接编辑 `/home/ubuntu/.hermes/memories/MEMORY.md`。若需要在 Hermes 外部验收某一条 review，可在云主机上运行：
+该 skill 会调用 review MCP 工具，然后只调用一次 Hermes memory tool 的 `memory(action=add, target=memory, content=<hermes_memory_entry>)`。内置 memory tool 负责精确条目的去重和并发写入保护：`Entry added` 与 `Entry already exists` 都进入只读校验器；任何其它结果都停止，不得重试 add。它绝不允许通过终端直接编辑 `/home/ubuntu/.hermes/memories/MEMORY.md`。若需要在 Hermes 外部验收某一条 review，可在云主机上运行：
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_review_verifier \
@@ -179,7 +179,7 @@ install -m 600 deploy/hermes/skills/tradingagents-paper-review/SKILL.md /home/ub
   --hermes-memory-path /home/ubuntu/.hermes/memories/MEMORY.md
 ```
 
-成功输出仅包含 `ok`、review ID、项目 review/index 状态和 `hermes_memory_occurrences: 1`。失败返回退出码 `1` 且不打印记忆正文、文件路径或密钥；先保留文件并人工调查，不要通过 shell 改写 memory。
+成功输出仅包含 `ok`、review ID、项目 review/index 状态和 `hermes_memory_occurrences: 1`。失败返回退出码 `1` 且不打印记忆正文、文件路径或密钥；先保留文件并人工调查。修复时只能经 Hermes memory tool 的目标 `replace` 或 `remove` 操作，再次运行校验器；不要通过 shell 改写 memory。
 
 ## 定时维护
 

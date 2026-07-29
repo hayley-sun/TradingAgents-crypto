@@ -13,13 +13,14 @@ Do not run it merely because `review_paper_decision` was called directly.
    only, never a real order.
 2. Call `mcp__tradingagents_crypto__review_paper_decision` with the session ID
    and review date. Stop and report the safe MCP error if the call fails.
-3. Keep the returned `review.review_id` and exact `hermes_memory_entry`.
-   Use the Hermes built-in memory tool to search the current long-term memory
-   for that exact entry before writing anything.
-4. If the exact entry occurs zero times, use the Hermes memory tool to write it
-   exactly once. If it occurs once, do not write it again. If it occurs more
-   than once, do not write anything; report the duplicate state for operator
-   remediation.
+3. Keep the returned `review.review_id` and exact `hermes_memory_entry`. Call
+   the Hermes built-in memory tool exactly once with `action=add`, target
+   `memory`, and the exact entry as content. Do not search, parse, or count raw
+   `MEMORY.md` text before this call; the memory tool owns exact-entry
+   deduplication and concurrent-write handling.
+4. Continue only when the memory tool reports either `Entry added` or `Entry
+   already exists`. For any other memory-tool result, stop and report the safe
+   result. Do not retry `action=add` in the same workflow.
 5. Run the read-only verifier with the review ID:
 
    ```bash
@@ -27,8 +28,10 @@ Do not run it merely because `review_paper_decision` was called directly.
    ```
 
 6. Report success only when the verifier returns JSON with `ok: true` and
-   `hermes_memory_occurrences: 1`. On a verifier failure, report the safe
-   result and do not repair files manually.
+   `hermes_memory_occurrences: 1`. On a verifier failure, do not call
+   `action=add` again and do not repair files manually. Use only the Hermes
+   memory tool's targeted `replace` or `remove` operations for an approved
+   memory repair, then rerun the verifier.
 
 Never use terminal commands or file-writing tools to edit Hermes `MEMORY.md`.
 Never expose credentials, place orders, connect exchange credentials, or turn a
