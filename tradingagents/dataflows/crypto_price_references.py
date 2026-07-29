@@ -4,7 +4,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, Protocol
 
 import requests
@@ -54,7 +54,7 @@ def _clean_api_key(value: str | None) -> str | None:
 
 
 def _utc_day_end(day: date) -> int:
-    return int(datetime.combine(day, time.max, tzinfo=UTC).timestamp())
+    return int(datetime.combine(day, time.max, tzinfo=timezone.utc).timestamp())
 
 
 def _valid_price(value: object) -> float:
@@ -113,7 +113,7 @@ class CryptoCompareHistoricalUsdProvider:
                 candle = next(
                     item
                     for item in candles
-                    if datetime.fromtimestamp(item["time"], UTC).date() == day
+                    if datetime.fromtimestamp(item["time"], timezone.utc).date() == day
                 )
                 values.append(
                     HistoricalUsdReference(day, _valid_price(candle["close"]), "cryptocompare")
@@ -142,7 +142,7 @@ class CoinbaseHistoricalUsdProvider:
     ) -> list[HistoricalUsdReference]:
         values = []
         for day in dates:
-            start = datetime.combine(day, time.min, tzinfo=UTC)
+            start = datetime.combine(day, time.min, tzinfo=timezone.utc)
             end = start + timedelta(days=1)
             try:
                 response = self.session.get(
@@ -158,7 +158,7 @@ class CoinbaseHistoricalUsdProvider:
                 candle = next(
                     item
                     for item in response.json()
-                    if datetime.fromtimestamp(item[0], UTC).date() == day
+                    if datetime.fromtimestamp(item[0], timezone.utc).date() == day
                 )
                 values.append(
                     HistoricalUsdReference(day, _valid_price(candle[4]), "coinbase")

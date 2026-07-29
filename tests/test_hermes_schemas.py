@@ -1,5 +1,6 @@
 import unittest
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 from pydantic import ValidationError
 
@@ -20,6 +21,17 @@ from tradingagents.integrations.schemas import (
 
 
 class HermesSchemaTests(unittest.TestCase):
+    def test_hermes_modules_remain_compatible_with_python_310_datetime(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for relative_path in (
+            "tradingagents/dataflows/crypto_price_references.py",
+            "tradingagents/integrations/hermes_maintenance.py",
+        ):
+            with self.subTest(relative_path=relative_path):
+                text = (project_root / relative_path).read_text(encoding="ascii")
+                self.assertNotIn("from datetime import UTC", text)
+                self.assertNotIn("datetime.UTC", text)
+
     def test_deepseek_request_normalizes_values(self):
         request = AnalysisRequest(
             symbol="  btcusdt ",

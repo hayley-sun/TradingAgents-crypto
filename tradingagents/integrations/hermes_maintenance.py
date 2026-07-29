@@ -5,7 +5,7 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -58,7 +58,7 @@ def run_maintenance(
     if log_retention_days < 1:
         raise ValueError("log retention days must be positive")
 
-    current_time = now or datetime.now(UTC)
+    current_time = now or datetime.now(timezone.utc)
     if current_time.tzinfo is None:
         raise ValueError("maintenance time must include a timezone")
     cutoff = current_time - timedelta(days=log_retention_days)
