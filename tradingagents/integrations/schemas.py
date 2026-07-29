@@ -101,9 +101,11 @@ class ToolError(_StrictModel):
 class AnalysisSession(_StrictModel):
     schema_version: Literal[1] = 1
     session_id: str
-    status: Literal["running", "completed", "failed"] = "running"
+    status: Literal["queued", "running", "completed", "failed"] = "running"
     created_at: datetime
+    started_at: datetime | None = None
     completed_at: datetime | None = None
+    worker_pid: int | None = Field(default=None, ge=1)
     request: AnalysisRequest
     result: AnalysisResult | None = None
     error: ToolError | None = None

@@ -118,6 +118,28 @@ class HermesSchemaTests(unittest.TestCase):
         self.assertEqual(session.status, "running")
         self.assertIsNone(session.completed_at)
 
+    def test_queued_session_tracks_worker_metadata(self):
+        request = AnalysisRequest(
+            symbol="BTC",
+            trade_date="2026-07-28",
+            analysts=["market"],
+            research_depth=1,
+            llm_provider="ollama",
+            quick_model="quick",
+            deep_model="deep",
+        )
+
+        session = AnalysisSession(
+            session_id="hermes_0123456789abcdef",
+            request=request,
+            created_at=datetime.now(timezone.utc),
+            status="queued",
+        )
+
+        self.assertEqual(session.status, "queued")
+        self.assertIsNone(session.started_at)
+        self.assertIsNone(session.worker_pid)
+
     def test_tool_error_has_string_fields(self):
         error = ToolError(code="bad_request", message="Invalid request", suggested_action="Retry")
         self.assertEqual(error.code, "bad_request")
