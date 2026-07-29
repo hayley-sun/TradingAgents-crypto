@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, redirect_stdout
 from datetime import date
 from pathlib import Path
@@ -22,7 +22,9 @@ from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict, ValidationError
 
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.dataflows.coingecko_utils import get_crypto_historical_usd_price
+from tradingagents.dataflows.crypto_price_references import (
+    resolve_historical_usd_references,
+)
 from tradingagents.graph import TradingAgentsGraph
 from tradingagents.integrations.hermes_learning import (
     LearningStorageError,
@@ -35,6 +37,7 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    PriceReference,
     ReviewRequest,
     ToolError,
     is_valid_session_id,
@@ -182,6 +185,7 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
             "COINGECKO_PRO_API_KEY",
         )
     )
+    cryptocompare_key_available = bool(os.getenv("CRYPTOCOMPARE_API_KEY"))
     return success(
         {
             "status": "ready" if store_writable and configured_llm_providers else "degraded",
@@ -192,6 +196,7 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
             "configured_llm_providers": configured_llm_providers,
             "finnhub_key_available": bool(os.getenv("FINNHUB_API_KEY")),
             "coingecko_key_available": coingecko_key_available,
+            "cryptocompare_key_available": cryptocompare_key_available,
             "disclaimer": PAPER_TRADING_DISCLAIMER,
         }
     )
@@ -216,6 +221,26 @@ def _worker_exited_session(session: AnalysisSession) -> AnalysisSession:
             suggested_action="Start a new analysis session.",
         ),
     )
+
+
+def reconcile_session_worker(
+    session: AnalysisSession,
+    store: SessionStore,
+    worker_is_alive: Callable[[int], bool] | None = None,
+    persist: bool = True,
+) -> tuple[AnalysisSession, bool]:
+    """Mark only tracked active sessions with a dead worker as failed."""
+    if session.status not in {"queued", "running"} or session.worker_pid is None:
+        return session, False
+
+    liveness_check = worker_is_alive or _worker_is_alive
+    if liveness_check(session.worker_pid):
+        return session, False
+
+    reconciled_session = _worker_exited_session(session)
+    if persist:
+        store.save(reconciled_session)
+    return reconciled_session, True
 
 
 def get_analysis_result_impl(
@@ -262,22 +287,16 @@ def get_analysis_result_impl(
             )
         )
 
-    if (
-        session.status in {"queued", "running"}
-        and session.worker_pid is not None
-        and not _worker_is_alive(session.worker_pid)
-    ):
-        session = _worker_exited_session(session)
-        try:
-            active_store.save(session)
-        except OSError:
-            return failure(
-                ToolError(
-                    code="SESSION_WRITE_FAILED",
-                    message="The analysis session could not be updated.",
-                    suggested_action="Verify that session storage is writable and try again.",
-                )
+    try:
+        session, _ = reconcile_session_worker(session, active_store)
+    except OSError:
+        return failure(
+            ToolError(
+                code="SESSION_WRITE_FAILED",
+                message="The analysis session could not be updated.",
+                suggested_action="Verify that session storage is writable and try again.",
             )
+        )
 
     return success(
         {
@@ -297,6 +316,26 @@ def _review_error(code: str, message: str, suggested_action: str) -> dict[str, A
     return failure(
         ToolError(code=code, message=message, suggested_action=suggested_action)
     )
+
+
+def _resolve_review_price_references(
+    symbol: str, trade_date: date, review_date: date
+) -> tuple[PriceReference, PriceReference]:
+    references = resolve_historical_usd_references(
+        symbol, [trade_date, review_date]
+    )
+    try:
+        entry_price, review_price = tuple(
+            PriceReference(
+                date=reference.date,
+                usd_price=reference.usd_price,
+                source=reference.source,
+            )
+            for reference in references
+        )
+    except (TypeError, ValueError, ValidationError) as error:
+        raise ValueError("historical USD references are unavailable") from error
+    return entry_price, review_price
 
 
 def _load_review_lessons(symbol: str) -> list[str]:
@@ -646,7 +685,7 @@ def review_paper_decision_impl(
     store: SessionStore | None = None,
     review_store: ReviewStore | None = None,
     learning_store: LearningStore | None = None,
-    price_lookup: Any = None,
+    price_reference_resolver: Any = None,
     current_date: date | None = None,
 ) -> dict[str, Any]:
     """Review one completed paper-trading decision without an LLM call."""
@@ -714,14 +753,14 @@ def review_paper_decision_impl(
             "Verify the Hermes results directory and try again.",
         )
 
-    lookup = price_lookup or get_crypto_historical_usd_price
+    resolver = price_reference_resolver or _resolve_review_price_references
     try:
         with _REVIEW_LOCK:
             with redirect_stdout(sys.stderr):
                 review = review_completed_session(
                     session,
                     request.review_date,
-                    lookup,
+                    resolver,
                     active_review_store,
                     active_learning_store,
                     current_date=today,
@@ -747,7 +786,7 @@ def review_paper_decision_impl(
     except ValueError:
         return _review_error(
             "PRICE_DATA_UNAVAILABLE",
-            "CoinGecko USD reference price data is unavailable for this review.",
+            "Historical USD reference price data is unavailable for this review.",
             "Verify the symbol and review date, then try again later.",
         )
 

@@ -46,6 +46,20 @@ def completed_session(action, final_trade_decision=None, symbol="BTC"):
     )
 
 
+def paired_price_references(
+    entry_price=100.0, review_price=110.0, source="coingecko", calls=None
+):
+    def resolve(_symbol, trade_date, review_date):
+        if calls is not None:
+            calls.append((trade_date, review_date))
+        return (
+            PriceReference(date=trade_date, usd_price=entry_price, source=source),
+            PriceReference(date=review_date, usd_price=review_price, source=source),
+        )
+
+    return resolve
+
+
 def _concurrent_learning_upsert(root, review_payload, ready_queue, start_event):
     from tradingagents.integrations import hermes_learning
 
@@ -121,10 +135,7 @@ class HermesLearningTests(unittest.TestCase):
 
     def test_buy_review_is_idempotent_and_writes_a_paper_trading_lesson(self):
         calls = []
-
-        def price_lookup(_symbol, reference_date):
-            calls.append(reference_date)
-            return {date(2026, 7, 28): 100.0, date(2026, 7, 29): 110.0}[reference_date]
+        price_resolver = paired_price_references(calls=calls)
 
         with TemporaryDirectory() as directory:
             review_store = ReviewStore(Path(directory) / "reviews")
@@ -133,7 +144,7 @@ class HermesLearningTests(unittest.TestCase):
             review = review_completed_session(
                 session,
                 date(2026, 7, 29),
-                price_lookup,
+                price_resolver,
                 review_store,
                 learning_store,
                 current_date=date(2026, 7, 29),
@@ -141,7 +152,7 @@ class HermesLearningTests(unittest.TestCase):
             repeated = review_completed_session(
                 session,
                 date(2026, 7, 29),
-                price_lookup,
+                price_resolver,
                 review_store,
                 learning_store,
                 current_date=date(2026, 7, 29),
@@ -154,8 +165,9 @@ class HermesLearningTests(unittest.TestCase):
         self.assertEqual(review.verdict, "correct")
         self.assertEqual(review.raw_return_pct, 10.0)
         self.assertEqual(repeated.review_id, review.review_id)
-        self.assertEqual(calls, [date(2026, 7, 28), date(2026, 7, 29)])
+        self.assertEqual(calls, [(date(2026, 7, 28), date(2026, 7, 29))])
         self.assertIn("paper-trading", review.hermes_memory_entry.lower())
+        self.assertNotIn("coingecko", review.hermes_memory_entry.lower())
 
     def test_sell_hold_and_unparseable_actions_have_deterministic_verdicts(self):
         cases = (
@@ -169,7 +181,7 @@ class HermesLearningTests(unittest.TestCase):
                 review = review_completed_session(
                     completed_session(action, final_decision),
                     date(2026, 7, 29),
-                    lambda _symbol, value: 100.0 if value == date(2026, 7, 28) else review_price,
+                    paired_price_references(review_price=review_price),
                     ReviewStore(Path(directory) / "reviews"),
                     LearningStore(Path(directory) / "memories"),
                     current_date=date(2026, 7, 29),
@@ -188,7 +200,7 @@ class HermesLearningTests(unittest.TestCase):
                     review_completed_session(
                         session,
                         review_date,
-                        lambda *_args: 100.0,
+                        paired_price_references(),
                         review_store,
                         learning_store,
                         current_date=date(2026, 7, 29),
@@ -199,7 +211,7 @@ class HermesLearningTests(unittest.TestCase):
                 review_completed_session(
                     failed,
                     date(2026, 7, 29),
-                    lambda *_args: 100.0,
+                    paired_price_references(),
                     review_store,
                     learning_store,
                     current_date=date(2026, 7, 29),
@@ -209,6 +221,9 @@ class HermesLearningTests(unittest.TestCase):
             self.assertFalse(learning_store.root.exists())
 
     def test_price_failure_leaves_no_review_or_learning_entry(self):
+        def unavailable(*_args):
+            raise ValueError("unavailable")
+
         with TemporaryDirectory() as directory:
             review_store = ReviewStore(Path(directory) / "reviews")
             learning_store = LearningStore(Path(directory) / "memories")
@@ -216,7 +231,7 @@ class HermesLearningTests(unittest.TestCase):
                 review_completed_session(
                     completed_session("BUY"),
                     date(2026, 7, 29),
-                    lambda *_args: 0.0,
+                    unavailable,
                     review_store,
                     learning_store,
                     current_date=date(2026, 7, 29),
@@ -233,7 +248,7 @@ class HermesLearningTests(unittest.TestCase):
             review = review_completed_session(
                 session,
                 date(2026, 7, 29),
-                lambda _symbol, value: 100.0 if value == date(2026, 7, 28) else 110.0,
+                paired_price_references(),
                 review_store,
                 learning_store,
                 current_date=date(2026, 7, 29),
@@ -243,7 +258,9 @@ class HermesLearningTests(unittest.TestCase):
             repaired = review_completed_session(
                 session,
                 date(2026, 7, 29),
-                lambda *_args: self.fail("price lookup must not run for an existing review"),
+                lambda *_args: self.fail(
+                    "price resolver must not run for an existing review"
+                ),
                 review_store,
                 learning_store,
                 current_date=date(2026, 7, 29),
@@ -251,6 +268,22 @@ class HermesLearningTests(unittest.TestCase):
 
             self.assertEqual(repaired.review_id, review.review_id)
             self.assertEqual(learning_store.lessons_for("BTC"), [review.hermes_memory_entry])
+
+    def test_review_persists_one_fallback_source_for_both_prices(self):
+        with TemporaryDirectory() as directory:
+            review = review_completed_session(
+                completed_session("BUY"),
+                date(2026, 7, 29),
+                paired_price_references(source="cryptocompare"),
+                ReviewStore(Path(directory) / "reviews"),
+                LearningStore(Path(directory) / "memories"),
+                current_date=date(2026, 7, 29),
+            )
+
+        self.assertEqual(
+            (review.entry_price.source, review.review_price.source),
+            ("cryptocompare", "cryptocompare"),
+        )
 
 
 if __name__ == "__main__":

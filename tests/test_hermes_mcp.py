@@ -11,8 +11,9 @@ import chromadb
 from chromadb.config import Settings
 
 from tradingagents.agents.utils.memory import FinancialSituationMemory
+from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
-from tradingagents.integrations.schemas import AnalysisRequest, AnalysisResult
+from tradingagents.integrations.schemas import AnalysisRequest, AnalysisResult, PriceReference
 
 from tradingagents.integrations.hermes_mcp import (
     MCP,
@@ -58,6 +59,16 @@ class FailingGraph(FakeGraph):
         raise RuntimeError("provider secret at /private/failure")
 
 
+def paired_price_references(entry_price=100.0, review_price=90.0, source="coingecko"):
+    def resolve(_symbol, trade_date, review_date):
+        return (
+            PriceReference(date=trade_date, usd_price=entry_price, source=source),
+            PriceReference(date=review_date, usd_price=review_price, source=source),
+        )
+
+    return resolve
+
+
 class HermesMcpTests(unittest.TestCase):
     def make_request(self):
         return AnalysisRequest(
@@ -101,6 +112,7 @@ class HermesMcpTests(unittest.TestCase):
                 "OPENAI_API_KEY": secret,
                 "FINNHUB_API_KEY": secret,
                 "COINGECKO_DEMO_API_KEY": secret,
+                "CRYPTOCOMPARE_API_KEY": secret,
             },
             clear=True,
         ):
@@ -119,6 +131,7 @@ class HermesMcpTests(unittest.TestCase):
                 "configured_llm_providers",
                 "finnhub_key_available",
                 "coingecko_key_available",
+                "cryptocompare_key_available",
                 "disclaimer",
             },
         )
@@ -139,6 +152,7 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(data["configured_llm_providers"], ["ollama", "openai"])
         self.assertIs(data["finnhub_key_available"], True)
         self.assertIs(data["coingecko_key_available"], True)
+        self.assertIs(data["cryptocompare_key_available"], True)
         self.assertEqual(data["disclaimer"], PAPER_TRADING_DISCLAIMER)
         self.assertNotIn(secret, json.dumps(result))
 
@@ -514,9 +528,7 @@ class HermesMcpTests(unittest.TestCase):
                 store=store,
                 review_store=ReviewStore(root / "reviews"),
                 learning_store=LearningStore(root / "memories"),
-                price_lookup=lambda _symbol, value_date: (
-                    100.0 if value_date == date(2026, 7, 28) else 90.0
-                ),
+                price_reference_resolver=paired_price_references(),
                 current_date=date(2026, 7, 29),
             )
 
@@ -524,6 +536,52 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(result["data"]["review"]["action"], "SELL")
         self.assertEqual(result["data"]["review"]["verdict"], "correct")
         self.assertIn("Paper-trading research lesson", result["data"]["hermes_memory_entry"])
+
+    def test_review_uses_default_same_source_resolver(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            store = SessionStore(root / "sessions")
+            session_id = "hermes_0123456789abcdef"
+            session = store.create(session_id, self.make_request(), status="queued")
+            store.save(
+                session.model_copy(
+                    update={
+                        "status": "completed",
+                        "result": AnalysisResult(
+                            reports={},
+                            investment_plan="plan",
+                            trader_investment_plan="trader plan",
+                            final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                            processed_signal="BUY",
+                        ),
+                    }
+                )
+            )
+            references = [
+                HistoricalUsdReference(date(2026, 7, 28), 100.0, "coinbase"),
+                HistoricalUsdReference(date(2026, 7, 29), 110.0, "coinbase"),
+            ]
+            with patch(
+                "tradingagents.integrations.hermes_mcp.resolve_historical_usd_references",
+                return_value=references,
+            ) as resolver:
+                result = review_paper_decision_impl(
+                    {"session_id": session_id, "review_date": "2026-07-29"},
+                    store=store,
+                    review_store=ReviewStore(root / "reviews"),
+                    learning_store=LearningStore(root / "memories"),
+                    current_date=date(2026, 7, 29),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            (
+                result["data"]["review"]["entry_price"]["source"],
+                result["data"]["review"]["review_price"]["source"],
+            ),
+            ("coinbase", "coinbase"),
+        )
+        resolver.assert_called_once_with("BTCUSDT", [date(2026, 7, 28), date(2026, 7, 29)])
 
     def test_review_rejects_tomorrow_in_utc_even_when_local_date_has_advanced(self):
         class LateLocalDate(date):
@@ -560,7 +618,7 @@ class HermesMcpTests(unittest.TestCase):
                 store=store,
                 review_store=ReviewStore(root / "reviews"),
                 learning_store=LearningStore(root / "memories"),
-                price_lookup=lambda _symbol, _value_date: 100.0,
+                price_reference_resolver=paired_price_references(),
             )
 
         self.assertFalse(result["ok"])

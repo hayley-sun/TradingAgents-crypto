@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import math
 import os
 import re
 import tempfile
@@ -203,13 +202,6 @@ def classify_direction(action: str, raw_return_pct: float) -> str:
     return "correct" if is_correct else "incorrect"
 
 
-def _valid_price(value: float) -> float:
-    price = float(value)
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("USD reference price is unavailable")
-    return price
-
-
 def _memory_entry(
     symbol: str,
     trade_date: date,
@@ -220,16 +212,40 @@ def _memory_entry(
 ) -> str:
     return (
         f"Paper-trading research lesson for {symbol}: the {trade_date.isoformat()} "
-        f"analysis proposed {action}; CoinGecko USD reference movement through "
+        f"analysis proposed {action}; USD reference movement through "
         f"{review_date.isoformat()} was {raw_return_pct:+.2f}%, so the directional "
         f"verdict was {verdict}. This is research and paper trading only, never a real order."
     )
 
 
+def _paired_price_references(
+    resolver: Callable[[str, date, date], tuple[PriceReference, PriceReference]],
+    symbol: str,
+    trade_date: date,
+    review_date: date,
+) -> tuple[PriceReference, PriceReference]:
+    try:
+        entry_price, review_price = resolver(symbol, trade_date, review_date)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise ValueError("USD reference prices are unavailable") from error
+
+    if (
+        not isinstance(entry_price, PriceReference)
+        or not isinstance(review_price, PriceReference)
+        or entry_price.date != trade_date
+        or review_price.date != review_date
+        or entry_price.source != review_price.source
+    ):
+        raise ValueError("USD reference prices are unavailable")
+    return entry_price, review_price
+
+
 def review_completed_session(
     session: AnalysisSession,
     review_date: date,
-    price_lookup: Callable[[str, date], float],
+    price_reference_resolver: Callable[
+        [str, date, date], tuple[PriceReference, PriceReference]
+    ],
     review_store: ReviewStore,
     learning_store: LearningStore,
     current_date: date | None = None,
@@ -255,9 +271,16 @@ def review_completed_session(
             raise LearningStorageError("learning storage is unavailable") from error
         return existing
 
-    entry_price = _valid_price(price_lookup(session.request.symbol, trade_date))
-    observed_price = _valid_price(price_lookup(session.request.symbol, review_date))
-    raw_return_pct = round(((observed_price - entry_price) / entry_price) * 100, 8)
+    entry_price, observed_price = _paired_price_references(
+        price_reference_resolver,
+        session.request.symbol,
+        trade_date,
+        review_date,
+    )
+    raw_return_pct = round(
+        ((observed_price.usd_price - entry_price.usd_price) / entry_price.usd_price) * 100,
+        8,
+    )
     action = extract_paper_action(session)
     verdict = classify_direction(action, raw_return_pct)
     review = PaperDecisionReview(
@@ -267,16 +290,8 @@ def review_completed_session(
         trade_date=trade_date,
         review_date=review_date,
         action=action,
-        entry_price=PriceReference(
-            date=trade_date,
-            usd_price=entry_price,
-            source="coingecko",
-        ),
-        review_price=PriceReference(
-            date=review_date,
-            usd_price=observed_price,
-            source="coingecko",
-        ),
+        entry_price=entry_price,
+        review_price=observed_price,
         raw_return_pct=raw_return_pct,
         verdict=verdict,
         created_at=utc_now(),
