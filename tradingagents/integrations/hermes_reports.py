@@ -17,11 +17,18 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    DailyReportArchive,
+    DailyReportArchiveItem,
     DailyReportBatch,
     DailyReportBatchItem,
     DailyReportRequest,
     ToolError,
     utc_now,
+)
+
+
+PAPER_TRADING_DISCLAIMER = (
+    "Research and paper-trading output only. Do not use this output to place real trades."
 )
 
 
@@ -31,6 +38,14 @@ class ReportBatchStorageError(RuntimeError):
 
 class ReportBatchConflict(ValueError):
     """Raised when one trade date is requested with different settings."""
+
+
+class ReportBatchActive(ValueError):
+    """Raised when an archive is requested before all batch items are terminal."""
+
+
+class ReportArchiveConflict(ValueError):
+    """Raised when an immutable archive is retried with different content."""
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,19 @@ class ReportBatchSummary:
     batch: DailyReportBatch
     state: str
     items: tuple[ReportBatchItemSummary, ...]
+
+
+@dataclass(frozen=True)
+class PriorReportSnapshot:
+    trade_date: date
+    items: tuple[DailyReportArchiveItem, ...]
+
+
+@dataclass(frozen=True)
+class ReportArchiveResult:
+    path: Path
+    sha256: str
+    state: str
 
 
 def _atomic_json_write(destination: Path, value: dict) -> None:
@@ -66,6 +94,31 @@ def _atomic_json_write(destination: Path, value: dict) -> None:
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_text_write(destination: Path, value: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            os.chmod(temporary_path, 0o600)
+            temporary_file.write(value)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, destination)
+        os.chmod(destination, 0o600)
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -104,11 +157,23 @@ def _missing_session_error() -> ToolError:
     )
 
 
+def _failed_session_error() -> ToolError:
+    return ToolError(
+        code="ANALYSIS_FAILED",
+        message="A daily report analysis did not complete successfully.",
+        suggested_action="Inspect the safe analysis status and create a later daily report batch.",
+    )
+
+
 class ReportBatchStore:
     """Filesystem-backed, idempotent daily report batches."""
 
     def __init__(self, root: Path):
         self.root = Path(root).expanduser().resolve()
+
+    @property
+    def reports_root(self) -> Path:
+        return self.root.parent / "reports"
 
     def path_for(self, trade_date: date) -> Path:
         if not isinstance(trade_date, date):
@@ -251,7 +316,11 @@ class ReportBatchStore:
                     session_id=item.session_id,
                     status=session.status,
                     result=session.result,
-                    error=session.error,
+                    error=session.error
+                    if session.error is not None
+                    else _failed_session_error()
+                    if session.status == "failed"
+                    else None,
                 )
             )
 
@@ -269,3 +338,137 @@ class ReportBatchStore:
             return session_loader(session_id), False
         except (OSError, ValueError, json.JSONDecodeError, ValidationError):
             return None, True
+
+    def archive(
+        self,
+        batch: DailyReportBatch,
+        session_loader: Callable[[str], AnalysisSession | None],
+        narrative: str,
+    ) -> ReportArchiveResult:
+        if not isinstance(narrative, str) or not narrative.strip() or len(narrative) > 20000:
+            raise ValueError("invalid report narrative")
+        with self._exclusive_lock():
+            persisted = self.load(batch.request.trade_date)
+            if persisted is None or persisted.batch_id != batch.batch_id:
+                raise ReportBatchStorageError("daily report batch unavailable")
+            summary = self.summarize(persisted, session_loader)
+            if summary.state == "active":
+                raise ReportBatchActive("daily report batch is still active")
+
+            archived_at = persisted.archive.archived_at if persisted.archive else utc_now()
+            previous = self.previous_snapshot(persisted.request.trade_date)
+            document = _render_report(summary, narrative.strip(), previous, archived_at)
+            digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
+            destination = self.reports_root / f"{persisted.request.trade_date.isoformat()}.md"
+            if persisted.archive is not None:
+                if persisted.archive.sha256 != digest:
+                    raise ReportArchiveConflict("daily report archive content conflicts")
+                if not destination.is_file():
+                    raise ReportBatchStorageError("daily report archive unavailable")
+                return ReportArchiveResult(
+                    path=destination,
+                    sha256=persisted.archive.sha256,
+                    state=persisted.archive.state,
+                )
+
+            try:
+                _atomic_text_write(destination, document)
+            except OSError as error:
+                raise ReportBatchStorageError("daily report archive unavailable") from error
+            archive = DailyReportArchive(
+                filename=destination.name,
+                sha256=digest,
+                state=summary.state,
+                archived_at=archived_at,
+                items=_archive_items(summary),
+            )
+            self.save(persisted.model_copy(update={"archive": archive}))
+            return ReportArchiveResult(path=destination, sha256=digest, state=summary.state)
+
+    def previous_snapshot(self, trade_date: date) -> PriorReportSnapshot | None:
+        candidates = []
+        try:
+            paths = self.root.glob("*.json") if self.root.exists() else ()
+            for path in paths:
+                try:
+                    batch_date = date.fromisoformat(path.stem)
+                except ValueError:
+                    continue
+                if batch_date >= trade_date:
+                    continue
+                batch = self.load(batch_date)
+                if batch is not None and batch.archive is not None:
+                    candidates.append(batch)
+        except OSError as error:
+            raise ReportBatchStorageError("daily report batch unavailable") from error
+        if not candidates:
+            return None
+        latest = max(candidates, key=lambda candidate: candidate.request.trade_date)
+        return PriorReportSnapshot(
+            trade_date=latest.request.trade_date,
+            items=tuple(latest.archive.items),
+        )
+
+
+def _archive_items(summary: ReportBatchSummary) -> list[DailyReportArchiveItem]:
+    return [
+        DailyReportArchiveItem(
+            symbol=item.symbol,
+            status=item.status,
+            processed_signal=item.result.processed_signal if item.result else None,
+            final_trade_decision=item.result.final_trade_decision if item.result else None,
+            error_code=item.error.code if item.error else None,
+        )
+        for item in summary.items
+    ]
+
+
+def _render_report(
+    summary: ReportBatchSummary,
+    narrative: str,
+    previous: PriorReportSnapshot | None,
+    archived_at,
+) -> str:
+    request = summary.batch.request
+    lines = [
+        "# TradingAgents Daily Crypto Research",
+        "",
+        "## Report Date",
+        "",
+        f"- Trade date: {request.trade_date.isoformat()}",
+        f"- Archived at: {archived_at.isoformat()}",
+        f"- Batch state: {summary.state}",
+        "",
+        "## Batch Configuration",
+        "",
+        f"- Symbols: {', '.join(request.symbols)}",
+        f"- Analysts: {', '.join(request.analysts)}",
+        f"- Research depth: {request.research_depth}",
+        f"- LLM provider: {request.llm_provider}",
+        "",
+        "## Per-Symbol Results",
+        "",
+    ]
+    for item in summary.items:
+        lines.extend((f"### {item.symbol}", f"- Status: {item.status}"))
+        if item.result is not None:
+            lines.extend(
+                (
+                    f"- Processed signal: {item.result.processed_signal}",
+                    f"- Final decision: {item.result.final_trade_decision}",
+                )
+            )
+        if item.error is not None:
+            lines.append(f"- Error code: {item.error.code}")
+        lines.append("")
+    lines.extend(("## Narrative", "", narrative, "", "## Previous Report Comparison", ""))
+    if previous is None:
+        lines.append("- No previous archived report is available.")
+    else:
+        lines.append(f"- Previous trade date: {previous.trade_date.isoformat()}")
+        for item in previous.items:
+            lines.append(
+                f"- {item.symbol}: {item.status}; signal={item.processed_signal or 'unavailable'}"
+            )
+    lines.extend(("", "## Research Boundary", "", PAPER_TRADING_DISCLAIMER, ""))
+    return "\n".join(lines)

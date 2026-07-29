@@ -191,6 +191,24 @@ class DailyReportArchive(_StrictModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     state: Literal["ready", "degraded"]
     archived_at: datetime
+    items: list["DailyReportArchiveItem"] = Field(min_length=1, max_length=5)
+
+
+class DailyReportArchiveItem(_StrictModel):
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    status: Literal[
+        "completed", "failed", "submission_failed", "missing", "unreadable"
+    ]
+    processed_signal: str | None = Field(default=None, max_length=10000)
+    final_trade_decision: str | None = Field(default=None, max_length=10000)
+    error_code: str | None = Field(default=None, max_length=100)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
 
 
 class DailyReportBatch(_StrictModel):
