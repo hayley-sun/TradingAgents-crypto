@@ -117,13 +117,20 @@ mcp__tradingagents_crypto__get_analysis_result
 
 > 请调用 mcp__tradingagents_crypto__analyze_crypto 对 BTC 进行浅层研究分析。使用 trade_date=2026-07-28，analysts=["market", "news"]，llm_provider=deepseek，quick_model=deepseek-v4-flash，deep_model=deepseek-v4-pro，research_depth=1。这是研究和模拟交易，不得提交真实交易或下单。
 
-记录返回的 `session_id`，再用以下中文提示读取结果：
+`analyze_crypto` 只接受请求并启动后台分析。它会立即返回 `session_id` 和当前
+状态（通常为 `queued`，worker 已开始时可为 `running`），不会在首次调用中返回
+交易决策。记录该 `session_id`，然后使用以下中文提示读取状态和结果：
 
 > 请调用 mcp__tradingagents_crypto__get_analysis_result，使用会话 ID `<session_id>` 取回中文分析结果。请明确说明这些结果仅用于研究和模拟交易。
 
+当返回状态为 `queued` 或 `running` 时，等待一段时间后使用同一 `session_id`
+再次调用 `get_analysis_result`。状态为 `completed` 时才读取分析、信号和决策；
+状态为 `failed` 时读取安全的错误代码并在修复原因后创建新的分析请求。不要对
+同一个请求重复调用 `analyze_crypto`，否则会创建额外的模型任务。
+
 ## 会话存储和故障处理
 
-成功和失败的分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。正常回滚和事件排查期间必须保留该目录。
+所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`。正常回滚和事件排查期间必须保留这些目录。
 
 | 错误代码 | 操作员处理 |
 | --- | --- |
@@ -134,6 +141,8 @@ mcp__tradingagents_crypto__get_analysis_result
 | `INVALID_SESSION_ID` | 使用 `analyze_crypto` 返回的不透明 `hermes_<hex>` 会话 ID；不得手工猜测或修改该 ID。 |
 | `SESSION_NOT_FOUND` | 核对分析工具返回的不透明 `session_id`，或启动新的分析。 |
 | `SESSION_UNREADABLE` | 保留会话文件，检查文件系统健康状况和文件权限，然后重试或创建新会话。 |
+| `WORKER_START_FAILED` | 检查 MCP Python 环境、`results/hermes` 的写权限和可执行文件路径，然后创建新的分析请求。 |
+| `WORKER_EXITED` | 后台 worker 在完成前退出；保留会话日志，检查数据或模型提供商后创建新的分析请求。 |
 | `ANALYSIS_FAILED` | 查看安全的工具错误、提供商或数据可用性及模型请求，稍后重试。 |
 
 ## 静态校验

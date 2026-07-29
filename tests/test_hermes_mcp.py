@@ -18,6 +18,8 @@ from tradingagents.integrations.hermes_mcp import (
     execute_analysis,
     get_analysis_result_impl,
     health_check_impl,
+    run_queued_analysis,
+    start_analysis,
 )
 
 
@@ -311,6 +313,92 @@ class HermesMcpTests(unittest.TestCase):
 
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
+
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_start_analysis_queues_session_and_launches_worker(self, provider_key):
+        launcher_calls = []
+
+        def launch_worker(session_id, store):
+            launcher_calls.append((session_id, store))
+            return 4242
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = start_analysis(
+                self.make_request().model_dump(mode="json"),
+                store=store,
+                worker_launcher=launch_worker,
+            )
+            session = store.load(result["data"]["session_id"])
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["status"], "queued")
+        self.assertEqual(session.status, "queued")
+        self.assertEqual(session.worker_pid, 4242)
+        self.assertEqual(launcher_calls, [(session.session_id, store)])
+        provider_key.assert_called_once_with("openai")
+
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_start_analysis_persists_worker_launch_failure(self, provider_key):
+        def fail_to_launch(session_id, store):
+            raise OSError("launch failed")
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            result = start_analysis(
+                self.make_request().model_dump(mode="json"),
+                store=store,
+                worker_launcher=fail_to_launch,
+            )
+            session = store.load(next(store.root.glob("*.json")).stem)
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "WORKER_START_FAILED")
+        self.assertEqual(session.status, "failed")
+        self.assertEqual(session.error.code, "WORKER_START_FAILED")
+        self.assertIsNotNone(session.completed_at)
+        provider_key.assert_called_once_with("openai")
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_queued_worker_persists_completed_graph_result(self, provider_key, cleanup):
+        FakeGraph.instances = []
+
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            session_id = "hermes_0123456789abcdef"
+            store.create(session_id, self.make_request(), status="queued")
+
+            result = run_queued_analysis(session_id, store=store, graph_factory=FakeGraph)
+            session = store.load(session_id)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["status"], "completed")
+        self.assertEqual(session.status, "completed")
+        self.assertIsNotNone(session.started_at)
+        self.assertEqual(session.worker_pid, os.getpid())
+        self.assertEqual(session.result.processed_signal, "HOLD")
+        cleanup.assert_called_once_with(session_id)
+        provider_key.assert_called_once_with("openai")
+
+    def test_result_lookup_marks_dead_worker_as_failed(self):
+        with TemporaryDirectory() as temp_dir:
+            store = SessionStore(Path(temp_dir) / "sessions")
+            session_id = "hermes_0123456789abcdef"
+            session = store.create(session_id, self.make_request())
+            store.save(session.model_copy(update={"worker_pid": 4242}))
+
+            with patch(
+                "tradingagents.integrations.hermes_mcp._worker_is_alive",
+                return_value=False,
+            ):
+                result = get_analysis_result_impl(session_id, store=store)
+            persisted_session = store.load(session_id)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["session"]["status"], "failed")
+        self.assertEqual(persisted_session.status, "failed")
+        self.assertEqual(persisted_session.error.code, "WORKER_EXITED")
 
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")

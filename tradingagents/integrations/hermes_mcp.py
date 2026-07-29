@@ -3,14 +3,17 @@
 import json
 import logging
 import os
+import subprocess
+import sys
 import tempfile
-import threading
+from contextlib import contextmanager
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import chromadb
+import fcntl
 from chromadb.config import Settings
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
@@ -38,7 +41,6 @@ PAPER_TRADING_DISCLAIMER = (
 )
 MCP = FastMCP("tradingagents_crypto")
 _SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
-_ANALYSIS_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
 SESSION_MEMORY_COLLECTION_BASE_NAMES = (
     "bull_memory",
@@ -79,10 +81,12 @@ class SessionStore:
             raise ValueError("invalid session id")
         return self.root / f"{session_id}.json"
 
-    def create(self, session_id: str, request: AnalysisRequest) -> AnalysisSession:
+    def create(
+        self, session_id: str, request: AnalysisRequest, status: str = "running"
+    ) -> AnalysisSession:
         session = AnalysisSession(
             session_id=session_id,
-            status="running",
+            status=status,
             created_at=utc_now(),
             request=request,
         )
@@ -176,6 +180,27 @@ def health_check_impl(store: SessionStore | None = None) -> dict[str, Any]:
     )
 
 
+def _worker_is_alive(worker_pid: int) -> bool:
+    try:
+        os.kill(worker_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _worker_exited_session(session: AnalysisSession) -> AnalysisSession:
+    return _failed_session(
+        session,
+        ToolError(
+            code="WORKER_EXITED",
+            message="The analysis worker exited before completing the session.",
+            suggested_action="Start a new analysis session.",
+        ),
+    )
+
+
 def get_analysis_result_impl(
     session_id: str, store: SessionStore | None = None
 ) -> dict[str, Any]:
@@ -220,6 +245,23 @@ def get_analysis_result_impl(
             )
         )
 
+    if (
+        session.status in {"queued", "running"}
+        and session.worker_pid is not None
+        and not _worker_is_alive(session.worker_pid)
+    ):
+        session = _worker_exited_session(session)
+        try:
+            active_store.save(session)
+        except OSError:
+            return failure(
+                ToolError(
+                    code="SESSION_WRITE_FAILED",
+                    message="The analysis session could not be updated.",
+                    suggested_action="Verify that session storage is writable and try again.",
+                )
+            )
+
     return success(
         {
             "session": session.model_dump(mode="json"),
@@ -255,18 +297,55 @@ def _failed_session(session: AnalysisSession, error: ToolError) -> AnalysisSessi
         session_id=session.session_id,
         status="failed",
         created_at=session.created_at,
+        started_at=session.started_at,
         completed_at=utc_now(),
+        worker_pid=session.worker_pid,
         request=session.request,
         error=error,
     )
 
 
-def execute_analysis(
+def _worker_start_failed_session(session: AnalysisSession) -> AnalysisSession:
+    return _failed_session(
+        session,
+        ToolError(
+            code="WORKER_START_FAILED",
+            message="The analysis worker could not be started.",
+            suggested_action="Verify the MCP Python environment and try the analysis again.",
+        ),
+    )
+
+
+def launch_analysis_worker(session_id: str, store: SessionStore) -> int:
+    """Start a worker that survives an MCP stdio reconnect."""
+    log_directory = store.root.parent / "logs"
+    log_directory.mkdir(parents=True, exist_ok=True)
+    log_path = log_directory / f"{session_id}.log"
+
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tradingagents.integrations.hermes_analysis_worker",
+                session_id,
+            ],
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return process.pid
+
+
+def start_analysis(
     request_data: Mapping[str, Any],
     store: SessionStore | None = None,
-    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+    worker_launcher=launch_analysis_worker,
 ) -> dict[str, Any]:
-    """Run a TradingAgents analysis and persist its sanitized Hermes result."""
+    """Queue an analysis without blocking the MCP stdio process."""
     try:
         request = AnalysisRequest.model_validate(request_data)
     except (ValidationError, TypeError, ValueError):
@@ -276,28 +355,25 @@ def execute_analysis(
             "Correct the request fields and try again.",
         )
 
-    provider_key = ""
-    if request.llm_provider != "ollama":
-        provider_key = get_provider_api_key(request.llm_provider)
-        if not provider_key:
-            return _analysis_error(
-                "MISSING_API_KEY",
-                "The selected LLM provider is not configured.",
-                "Configure an API key for the selected provider and try again.",
-            )
+    if request.llm_provider != "ollama" and not get_provider_api_key(request.llm_provider):
+        return _analysis_error(
+            "MISSING_API_KEY",
+            "The selected LLM provider is not configured.",
+            "Configure an API key for the selected provider and try again.",
+        )
 
     try:
         active_store = store if store is not None else SessionStore.from_environment()
     except _SESSION_STORE_CONSTRUCTION_ERRORS:
         return _analysis_error(
             "SESSION_STORE_UNAVAILABLE",
-            "Session storage is currently unavailable.",
+            "The analysis session could not be started.",
             "Verify the session storage configuration and try again.",
         )
 
     session_id = f"hermes_{uuid4().hex}"
     try:
-        session = active_store.create(session_id, request)
+        session = active_store.create(session_id, request, status="queued")
     except Exception:
         return _analysis_error(
             "SESSION_WRITE_FAILED",
@@ -305,30 +381,92 @@ def execute_analysis(
             "Verify that session storage is writable and try again.",
         )
 
+    try:
+        worker_pid = worker_launcher(session_id, active_store)
+    except OSError:
+        try:
+            active_store.save(_worker_start_failed_session(session))
+        except Exception:
+            pass
+        return _analysis_error(
+            "WORKER_START_FAILED",
+            "The analysis worker could not be started.",
+            "Verify the MCP Python environment and try the analysis again.",
+        )
+
+    persisted_session = active_store.load(session_id)
+    if persisted_session is not None and persisted_session.status == "queued":
+        persisted_session = persisted_session.model_copy(update={"worker_pid": worker_pid})
+        active_store.save(persisted_session)
+
+    return success(
+        {
+            "session_id": session_id,
+            "status": persisted_session.status if persisted_session else "queued",
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
+
+
+@contextmanager
+def _analysis_file_lock(store: SessionStore):
+    lock_path = store.root.parent / ".analysis.lock"
+    store.ensure()
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _missing_provider_error() -> ToolError:
+    return ToolError(
+        code="MISSING_API_KEY",
+        message="The selected LLM provider is not configured.",
+        suggested_action="Configure an API key for the selected provider and try again.",
+    )
+
+
+def _run_analysis_session(
+    session: AnalysisSession,
+    store: SessionStore,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+    provider_key: str | None = None,
+) -> dict[str, Any]:
+    request = session.request
+    if request.llm_provider != "ollama" and provider_key is None:
+        provider_key = get_provider_api_key(request.llm_provider)
+    if request.llm_provider != "ollama" and not provider_key:
+        error = _missing_provider_error()
+        try:
+            store.save(_failed_session(session, error))
+        except OSError:
+            pass
+        return failure(error)
+
     analysis_started = False
     try:
-        with _ANALYSIS_LOCK:
-            graph_config = build_graph_config(
-                DEFAULT_CONFIG,
-                {
-                    "llm_provider": request.llm_provider,
-                    "api_key": provider_key,
-                    "quick_think_llm": request.quick_model,
-                    "deep_think_llm": request.deep_model,
-                    "research_depth": request.research_depth,
-                },
-                session_id,
-            )
-            analysis_started = True
-            graph = graph_factory(
-                selected_analysts=request.analysts,
-                debug=False,
-                config=graph_config,
-            )
-            final_state, processed_signal = graph.propagate(
-                request.symbol, request.trade_date.isoformat()
-            )
-
+        graph_config = build_graph_config(
+            DEFAULT_CONFIG,
+            {
+                "llm_provider": request.llm_provider,
+                "api_key": provider_key or "",
+                "quick_think_llm": request.quick_model,
+                "deep_think_llm": request.deep_model,
+                "research_depth": request.research_depth,
+            },
+            session.session_id,
+        )
+        analysis_started = True
+        graph = graph_factory(
+            selected_analysts=request.analysts,
+            debug=False,
+            config=graph_config,
+        )
+        final_state, processed_signal = graph.propagate(
+            request.symbol, request.trade_date.isoformat()
+        )
         result = AnalysisResult(
             reports={
                 "market": final_state["market_report"],
@@ -341,18 +479,18 @@ def execute_analysis(
             final_trade_decision=final_state["final_trade_decision"],
             processed_signal=processed_signal,
         )
-        completed_session = AnalysisSession(
-            session_id=session.session_id,
-            status="completed",
-            created_at=session.created_at,
-            completed_at=utc_now(),
-            request=request,
-            result=result,
+        completed_session = session.model_copy(
+            update={
+                "status": "completed",
+                "completed_at": utc_now(),
+                "result": result,
+                "error": None,
+            }
         )
-        active_store.save(completed_session)
+        store.save(completed_session)
         return success(
             {
-                "session_id": session_id,
+                "session_id": session.session_id,
                 "status": "completed",
                 "processed_signal": result.processed_signal,
                 "final_trade_decision": result.final_trade_decision,
@@ -367,17 +505,103 @@ def execute_analysis(
         )
         LOGGER.error(
             "hermes_analysis_failed session_id=%s exception_class=%s",
-            session_id,
+            session.session_id,
             type(error).__name__,
         )
         try:
-            active_store.save(_failed_session(session, analysis_error))
-        except Exception:
+            store.save(_failed_session(session, analysis_error))
+        except OSError:
             pass
         return failure(analysis_error)
     finally:
         if analysis_started:
-            _cleanup_session_collections(session_id)
+            _cleanup_session_collections(session.session_id)
+
+
+def run_queued_analysis(
+    session_id: str,
+    store: SessionStore | None = None,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+) -> dict[str, Any]:
+    """Run a queued session in a detached worker process."""
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+        with _analysis_file_lock(active_store):
+            session = active_store.load(session_id)
+            if session is None:
+                return _analysis_error(
+                    "SESSION_NOT_FOUND",
+                    "No analysis session exists for this session ID.",
+                    "Check the session ID or start a new analysis session.",
+                )
+            if session.status != "queued":
+                return _analysis_error(
+                    "SESSION_NOT_QUEUED",
+                    "The analysis session is not waiting to run.",
+                    "Use get_analysis_result to inspect the existing session.",
+                )
+            running_session = session.model_copy(
+                update={
+                    "status": "running",
+                    "started_at": utc_now(),
+                    "worker_pid": os.getpid(),
+                }
+            )
+            active_store.save(running_session)
+            return _run_analysis_session(running_session, active_store, graph_factory)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError):
+        return _analysis_error(
+            "SESSION_UNREADABLE",
+            "The stored analysis session could not be read.",
+            "Verify the session storage configuration and try again.",
+        )
+
+
+def execute_analysis(
+    request_data: Mapping[str, Any],
+    store: SessionStore | None = None,
+    graph_factory: type[TradingAgentsGraph] = TradingAgentsGraph,
+) -> dict[str, Any]:
+    """Run a TradingAgents analysis synchronously for internal callers."""
+    try:
+        request = AnalysisRequest.model_validate(request_data)
+    except (ValidationError, TypeError, ValueError):
+        return _analysis_error(
+            "INVALID_REQUEST",
+            "The analysis request is invalid.",
+            "Correct the request fields and try again.",
+        )
+
+    provider_key = ""
+    if request.llm_provider != "ollama":
+        provider_key = get_provider_api_key(request.llm_provider)
+        if not provider_key:
+            return failure(_missing_provider_error())
+
+    try:
+        active_store = store if store is not None else SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _analysis_error(
+            "SESSION_STORE_UNAVAILABLE",
+            "Session storage is currently unavailable.",
+            "Verify the session storage configuration and try again.",
+        )
+
+    session_id = f"hermes_{uuid4().hex}"
+    try:
+        session = active_store.create(session_id, request)
+        session = session.model_copy(
+            update={"started_at": utc_now(), "worker_pid": os.getpid()}
+        )
+        active_store.save(session)
+        with _analysis_file_lock(active_store):
+            return _run_analysis_session(session, active_store, graph_factory, provider_key)
+    except OSError:
+        return _analysis_error(
+            "SESSION_WRITE_FAILED",
+            "The analysis session could not be started.",
+            "Verify that session storage is writable and try again.",
+        )
 
 
 @MCP.tool()
@@ -402,8 +626,8 @@ def analyze_crypto(
     quick_model: str,
     deep_model: str,
 ) -> dict[str, Any]:
-    """Run a paper-trading crypto analysis through TradingAgents."""
-    return execute_analysis(
+    """Queue a paper-trading crypto analysis through TradingAgents."""
+    return start_analysis(
         {
             "symbol": symbol,
             "trade_date": trade_date,
