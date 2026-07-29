@@ -357,7 +357,7 @@ class ReportBatchStore:
 
             archived_at = persisted.archive.archived_at if persisted.archive else utc_now()
             previous = self.previous_snapshot(persisted.request.trade_date)
-            document = _render_report(summary, narrative.strip(), previous, archived_at)
+            document = _render_report(summary, narrative.strip(), previous)
             digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
             destination = self.reports_root / f"{persisted.request.trade_date.isoformat()}.md"
             if persisted.archive is not None:
@@ -371,10 +371,18 @@ class ReportBatchStore:
                     state=persisted.archive.state,
                 )
 
-            try:
-                _atomic_text_write(destination, document)
-            except OSError as error:
-                raise ReportBatchStorageError("daily report archive unavailable") from error
+            if destination.exists():
+                try:
+                    existing_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                except OSError as error:
+                    raise ReportBatchStorageError("daily report archive unavailable") from error
+                if existing_digest != digest:
+                    raise ReportArchiveConflict("daily report archive content conflicts")
+            else:
+                try:
+                    _atomic_text_write(destination, document)
+                except OSError as error:
+                    raise ReportBatchStorageError("daily report archive unavailable") from error
             archive = DailyReportArchive(
                 filename=destination.name,
                 sha256=digest,
@@ -427,7 +435,6 @@ def _render_report(
     summary: ReportBatchSummary,
     narrative: str,
     previous: PriorReportSnapshot | None,
-    archived_at,
 ) -> str:
     request = summary.batch.request
     lines = [
@@ -436,7 +443,6 @@ def _render_report(
         "## Report Date",
         "",
         f"- Trade date: {request.trade_date.isoformat()}",
-        f"- Archived at: {archived_at.isoformat()}",
         f"- Batch state: {summary.state}",
         "",
         "## Batch Configuration",

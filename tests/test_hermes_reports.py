@@ -3,12 +3,14 @@ from datetime import date
 from pathlib import Path
 from stat import S_IMODE
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from tradingagents.integrations.hermes_reports import (
     PAPER_TRADING_DISCLAIMER,
     ReportArchiveConflict,
     ReportBatchActive,
     ReportBatchConflict,
+    ReportBatchStorageError,
     ReportBatchStore,
 )
 from tradingagents.integrations.schemas import (
@@ -237,6 +239,29 @@ class HermesReportsTests(unittest.TestCase):
         self.assertEqual(snapshot.trade_date, date(2026, 7, 28))
         self.assertEqual(snapshot.items[0].processed_signal, "BTC signal")
 
+    def test_archive_rejects_different_retry_after_metadata_write_failure(self):
+        with TemporaryDirectory() as directory:
+            store = make_store(directory)
+            batch = store.create_or_load(make_request(symbols=["BTC"]), FakeStarter())
+            sessions = {SESSION_IDS["BTC"]: make_session("BTC")}
+
+            with patch.object(
+                store,
+                "save",
+                side_effect=ReportBatchStorageError("batch write failed"),
+            ), self.assertRaises(ReportBatchStorageError):
+                store.archive(batch, sessions.get, "Original narrative")
+
+            report_path = Path(directory) / "reports" / "2026-07-29.md"
+            original = report_path.read_text(encoding="utf-8")
+            with self.assertRaises(ReportArchiveConflict):
+                store.archive(batch, sessions.get, "Different narrative")
+
+            self.assertEqual(report_path.read_text(encoding="utf-8"), original)
+            recovered = store.archive(batch, sessions.get, "Original narrative")
+            persisted = store.load(date(2026, 7, 29))
+
+        self.assertEqual(recovered.sha256, persisted.archive.sha256)
 
 if __name__ == "__main__":
     unittest.main()
