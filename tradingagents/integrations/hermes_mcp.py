@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager, redirect_stdout
 from datetime import date
 from pathlib import Path
@@ -223,6 +223,26 @@ def _worker_exited_session(session: AnalysisSession) -> AnalysisSession:
     )
 
 
+def reconcile_session_worker(
+    session: AnalysisSession,
+    store: SessionStore,
+    worker_is_alive: Callable[[int], bool] | None = None,
+    persist: bool = True,
+) -> tuple[AnalysisSession, bool]:
+    """Mark only tracked active sessions with a dead worker as failed."""
+    if session.status not in {"queued", "running"} or session.worker_pid is None:
+        return session, False
+
+    liveness_check = worker_is_alive or _worker_is_alive
+    if liveness_check(session.worker_pid):
+        return session, False
+
+    reconciled_session = _worker_exited_session(session)
+    if persist:
+        store.save(reconciled_session)
+    return reconciled_session, True
+
+
 def get_analysis_result_impl(
     session_id: str, store: SessionStore | None = None
 ) -> dict[str, Any]:
@@ -267,22 +287,16 @@ def get_analysis_result_impl(
             )
         )
 
-    if (
-        session.status in {"queued", "running"}
-        and session.worker_pid is not None
-        and not _worker_is_alive(session.worker_pid)
-    ):
-        session = _worker_exited_session(session)
-        try:
-            active_store.save(session)
-        except OSError:
-            return failure(
-                ToolError(
-                    code="SESSION_WRITE_FAILED",
-                    message="The analysis session could not be updated.",
-                    suggested_action="Verify that session storage is writable and try again.",
-                )
+    try:
+        session, _ = reconcile_session_worker(session, active_store)
+    except OSError:
+        return failure(
+            ToolError(
+                code="SESSION_WRITE_FAILED",
+                message="The analysis session could not be updated.",
+                suggested_action="Verify that session storage is writable and try again.",
             )
+        )
 
     return success(
         {
