@@ -8,6 +8,8 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    DailyReportBatchItem,
+    DailyReportRequest,
     PaperDecisionReview,
     PriceReference,
     ReviewRequest,
@@ -220,6 +222,57 @@ class HermesSchemaTests(unittest.TestCase):
     def test_tool_error_has_string_fields(self):
         error = ToolError(code="bad_request", message="Invalid request", suggested_action="Retry")
         self.assertEqual(error.code, "bad_request")
+
+    def test_daily_report_request_normalizes_unique_symbols(self):
+        request = DailyReportRequest(
+            trade_date="2026-07-29",
+            symbols=[" btc ", "ETH", "sol"],
+            analysts=[" MARKET ", "news", "fundamentals"],
+            research_depth=1,
+            llm_provider=" DeepSeek ",
+            quick_model=" deepseek-v4-flash ",
+            deep_model=" deepseek-v4-pro ",
+        )
+
+        self.assertEqual(request.trade_date, date(2026, 7, 29))
+        self.assertEqual(request.symbols, ["BTC", "ETH", "SOL"])
+        self.assertEqual(request.analysts, ["market", "news", "fundamentals"])
+        self.assertEqual(request.llm_provider, "deepseek")
+
+    def test_daily_report_request_rejects_duplicate_symbols_and_extra_fields(self):
+        values = {
+            "trade_date": "2026-07-29",
+            "symbols": ["BTC", "btc"],
+            "analysts": ["market"],
+            "research_depth": 1,
+            "llm_provider": "deepseek",
+            "quick_model": "quick",
+            "deep_model": "deep",
+        }
+
+        with self.assertRaises(ValidationError):
+            DailyReportRequest(**values)
+        with self.assertRaises(ValidationError):
+            DailyReportRequest(**{**values, "symbols": ["BTC"], "extra": True})
+
+    def test_daily_report_batch_item_requires_exactly_one_outcome(self):
+        with self.assertRaises(ValidationError):
+            DailyReportBatchItem(symbol="BTC")
+        with self.assertRaises(ValidationError):
+            DailyReportBatchItem(
+                symbol="BTC",
+                session_id="hermes_0123456789abcdef",
+                submission_error=ToolError(
+                    code="WORKER_START_FAILED",
+                    message="The analysis worker could not be started.",
+                    suggested_action="Retry later.",
+                ),
+            )
+
+        item = DailyReportBatchItem(
+            symbol=" btc ", session_id="hermes_0123456789abcdef"
+        )
+        self.assertEqual(item.symbol, "BTC")
 
 
 if __name__ == "__main__":

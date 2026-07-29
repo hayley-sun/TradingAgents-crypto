@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 SUPPORTED_ANALYSTS = ("market", "social", "news", "fundamentals")
@@ -20,6 +20,8 @@ SUPPORTED_PROVIDERS = (
 
 _SESSION_ID_PATTERN = re.compile(r"^hermes_[0-9a-f]{16,64}$")
 _REVIEW_ID_PATTERN = re.compile(r"^review_[0-9a-f]{16,64}$")
+_REPORT_BATCH_ID_PATTERN = re.compile(r"^report_[0-9a-f]{16,64}$")
+_SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9]{2,20}$")
 
 
 def is_valid_session_id(session_id: str) -> bool:
@@ -30,6 +32,11 @@ def is_valid_session_id(session_id: str) -> bool:
 def is_valid_review_id(review_id: str) -> bool:
     """Return whether a value is an opaque Hermes review identifier."""
     return isinstance(review_id, str) and bool(_REVIEW_ID_PATTERN.fullmatch(review_id))
+
+
+def is_valid_report_batch_id(batch_id: str) -> bool:
+    """Return whether a value is a valid opaque daily report batch ID."""
+    return isinstance(batch_id, str) and bool(_REPORT_BATCH_ID_PATTERN.fullmatch(batch_id))
 
 
 def utc_now() -> datetime:
@@ -91,6 +98,54 @@ class AnalysisRequest(_StrictModel):
         return normalized
 
 
+class DailyReportRequest(_StrictModel):
+    trade_date: date
+    symbols: list[str] = Field(min_length=1, max_length=5)
+    analysts: list[str] = Field(min_length=1, max_length=4)
+    research_depth: Literal[1, 3, 5]
+    llm_provider: str
+    quick_model: str = Field(max_length=200)
+    deep_model: str = Field(max_length=200)
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def normalize_symbols(cls, value: list[str]) -> list[str]:
+        if not isinstance(value, list) or not all(isinstance(symbol, str) for symbol in value):
+            return value
+        normalized = [symbol.strip().upper() for symbol in value]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("symbols must not contain duplicates")
+        if any(not _SYMBOL_PATTERN.fullmatch(symbol) for symbol in normalized):
+            raise ValueError("invalid symbol")
+        return normalized
+
+    @field_validator("analysts", mode="before")
+    @classmethod
+    def normalize_analysts(cls, value: list[str]) -> list[str]:
+        return AnalysisRequest.normalize_analysts(value)
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, value: str) -> str:
+        return AnalysisRequest.normalize_provider(value)
+
+    @field_validator("quick_model", "deep_model", mode="before")
+    @classmethod
+    def normalize_model_name(cls, value: str) -> str:
+        return AnalysisRequest.normalize_model_name(value)
+
+    def for_symbol(self, symbol: str) -> AnalysisRequest:
+        return AnalysisRequest(
+            symbol=symbol,
+            trade_date=self.trade_date,
+            analysts=self.analysts,
+            research_depth=self.research_depth,
+            llm_provider=self.llm_provider,
+            quick_model=self.quick_model,
+            deep_model=self.deep_model,
+        )
+
+
 class AnalysisResult(_StrictModel):
     reports: dict[str, str]
     investment_plan: str
@@ -103,6 +158,62 @@ class ToolError(_StrictModel):
     code: str
     message: str
     suggested_action: str
+
+
+class DailyReportBatchItem(_StrictModel):
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    session_id: str | None = None
+    submission_error: ToolError | None = None
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
+
+    @model_validator(mode="after")
+    def require_one_outcome(self) -> "DailyReportBatchItem":
+        if (self.session_id is None) == (self.submission_error is None):
+            raise ValueError("exactly one of session_id or submission_error is required")
+        return self
+
+
+class DailyReportArchive(_StrictModel):
+    filename: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}\.md$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: Literal["ready", "degraded"]
+    archived_at: datetime
+
+
+class DailyReportBatch(_StrictModel):
+    schema_version: Literal[1] = 1
+    batch_id: str
+    request: DailyReportRequest
+    created_at: datetime
+    items: list[DailyReportBatchItem] = Field(min_length=1, max_length=5)
+    archive: DailyReportArchive | None = None
+
+    @field_validator("batch_id")
+    @classmethod
+    def validate_batch_id(cls, value: str) -> str:
+        if not is_valid_report_batch_id(value):
+            raise ValueError("invalid report batch id")
+        return value
+
+    @model_validator(mode="after")
+    def require_requested_symbols_once(self) -> "DailyReportBatch":
+        item_symbols = [item.symbol for item in self.items]
+        if item_symbols != self.request.symbols:
+            raise ValueError("batch items must match request symbols in order")
+        return self
 
 
 class AnalysisSession(_StrictModel):
