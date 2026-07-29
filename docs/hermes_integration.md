@@ -14,6 +14,8 @@
 - MCP 会话目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`
 - MCP 复盘目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reviews`
 - 按币种学习目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/memories`
+- 每日报告批次目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches`
+- 每日报告归档目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports`
 - Hermes 长期记忆：`/home/ubuntu/.hermes/memories/MEMORY.md`
 - 会话 schema 版本：`1`
 
@@ -72,6 +74,8 @@ install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/ses
 install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/logs
 install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reviews
 install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/memories
+install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches
+install -d -m 700 /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports
 touch /home/ubuntu/.hermes/config.yaml
 chmod 600 /home/ubuntu/.hermes/config.yaml
 hermes config edit
@@ -115,6 +119,9 @@ mcp__tradingagents_crypto__health_check
 mcp__tradingagents_crypto__analyze_crypto
 mcp__tradingagents_crypto__get_analysis_result
 mcp__tradingagents_crypto__review_paper_decision
+mcp__tradingagents_crypto__start_daily_report_batch
+mcp__tradingagents_crypto__get_daily_report_batch
+mcp__tradingagents_crypto__archive_daily_report
 ```
 
 健康检查提示：
@@ -206,6 +213,68 @@ sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
   --dry-run
 ```
 
+## 每日研究报告 Cron
+
+每日报告由两个短 Hermes Cron job 组成。08:00 任务只提交 BTC、ETH、SOL 的异步研究批次；12:00 任务读取已持久化的会话并在所有会话终态时归档一份 Markdown 报告。它们均使用云主机 `Asia/Shanghai` 时区、Hermes 本地投递和项目结果目录，不配置 Telegram、Discord、邮件或其他外部投递。
+
+报告批次持久化到 `results/hermes/report_batches/<YYYY-MM-DD>.json`，归档保存为 `results/hermes/reports/<YYYY-MM-DD>.md`。同一天、同一配置的提交会返回既有批次，不会重复启动 worker。报告只能在所有会话已完成或失败时生成；有失败的终态批次生成标记为 degraded 的报告，不会自动重试。报告文件权限为 `600`，相同内容重试返回既有归档，不同内容不能覆盖历史报告。
+
+定时任务依赖 Hermes Gateway。先安装受版本控制的 skill，再以 `ubuntu` 用户安装并启动系统级 Gateway。不要为 Gateway 创建 `EnvironmentFile` 或在其中加入任何密钥；密钥仍只位于权限为 `600` 的 `/home/ubuntu/.hermes/config.yaml`。
+
+```bash
+cd /home/ubuntu/workspace/TradingAgents-crypto
+install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-daily-report
+install -m 600 deploy/hermes/skills/tradingagents-daily-report/SKILL.md /home/ubuntu/.hermes/skills/tradingagents-daily-report/SKILL.md
+sudo hermes gateway install --system --run-as-user ubuntu --start-now
+hermes cron status
+```
+
+创建 job 前确认 `hermes cron list` 没有同名 job。下列命令创建后立即暂停，避免在人工验收前按计划执行。Cron prompt 只调用 MCP 工具，绝不调用复盘、Hermes 长期记忆、交易所凭据或外部消息发送。
+
+```bash
+PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
+SUBMIT_PROMPT='Run /tradingagents-daily-report in Submit Mode for the current Asia/Shanghai date. Do not poll or retry.'
+ARCHIVE_PROMPT='Run /tradingagents-daily-report in Archive Mode for the current Asia/Shanghai date. If active, stop without writing.'
+
+hermes cron create --name tradingagents-daily-report-submit --deliver local --skill tradingagents-daily-report --workdir "$PROJECT_DIR" '0 8 * * *' "$SUBMIT_PROMPT"
+hermes cron create --name tradingagents-daily-report-archive --deliver local --skill tradingagents-daily-report --workdir "$PROJECT_DIR" '0 12 * * *' "$ARCHIVE_PROMPT"
+hermes cron list
+
+submit_job_id='<replace-with-submit-job-id-from-cron-list>'
+archive_job_id='<replace-with-archive-job-id-from-cron-list>'
+hermes cron pause "$submit_job_id"
+hermes cron pause "$archive_job_id"
+```
+
+在首次启用前依次手动验证。为手动触发而临时恢复 job 后，应在该次 run 结束后立即再次暂停。提交 job 成功只会创建批次和后台 worker；它不是实时分析等待器。等待所有会话达到终态后，再运行归档 job。使用 `hermes cron runs` 查看持久化执行记录；当归档 job 报告 active 时，不得手工创建部分报告或让 agent 使用终端写文件。
+
+```bash
+hermes cron resume "$submit_job_id"
+hermes cron run "$submit_job_id" --accept-hooks
+hermes cron pause "$submit_job_id"
+hermes cron runs "$submit_job_id"
+
+# 等待已提交的异步 session 全部终态后执行。
+hermes cron resume "$archive_job_id"
+hermes cron run "$archive_job_id" --accept-hooks
+hermes cron pause "$archive_job_id"
+hermes cron runs "$archive_job_id"
+
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports -maxdepth 1 -type f -name '*.md' -printf '%m %f\n'
+```
+
+确认提交和归档记录均正常、归档文件权限为 `600`、且报告包含研究和模拟交易声明后，恢复两个 job：
+
+```bash
+hermes cron resume "$submit_job_id"
+hermes cron resume "$archive_job_id"
+hermes cron status
+hermes cron list
+```
+
+日常观测使用 `hermes cron status`、`hermes cron list` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
+
 ## 会话存储和故障处理
 
 所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`，其中 `.log` 文件由 `tradingagents-hermes-maintenance.timer` 按 14 天保留期清理。确定性复盘记录保存在 `results/hermes/reviews`，每个币种最近 20 条学习项保存在 `results/hermes/memories/<SYMBOL>.json`；后续同币种分析最多加载最近 5 条。会话、复盘、学习索引和 Hermes 长期 memory 永不由维护任务删除。
@@ -228,6 +297,13 @@ sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
 | `REVIEW_STORE_UNAVAILABLE` | 检查 `results/hermes/reviews`、`results/hermes/memories` 的所有者、可用空间与 `TRADINGAGENTS_RESULTS_DIR`。 |
 | `REVIEW_WRITE_FAILED` | 保留已有文件，检查复盘目录写权限后重试。 |
 | `LEARNING_WRITE_FAILED` | 规范复盘可能已保存但学习索引未更新；检查学习目录写权限，然后以相同 `session_id` 和 `review_date` 重试以修复索引。 |
+| `INVALID_REPORT_REQUEST` | 使用 ISO `trade_date`、唯一支持币种和分析师、合法模型配置；不要传入额外字段。 |
+| `REPORT_BATCH_NOT_FOUND` | 先运行提交 job，或核对所用日期是否与批次日期一致。 |
+| `REPORT_BATCH_CONFLICT` | 同一日期已存在不同配置的批次；使用既有配置或选择新的日期，不得删除旧批次重建。 |
+| `REPORT_BATCH_ACTIVE` | 等待所有 session 终态后再归档；禁止创建部分报告。 |
+| `REPORT_BATCH_UNREADABLE` | 保留 batch/session 文件，检查 `report_batches`、`sessions` 目录权限和文件系统健康状况。 |
+| `REPORT_ARCHIVE_INVALID` | 使用非空且不超过 20,000 字符的报告 narrative，日期必须是 ISO 格式。 |
+| `REPORT_ARCHIVE_CONFLICT` | 历史报告不可变；保留已有归档，不得尝试覆盖。 |
 
 ## 静态校验
 

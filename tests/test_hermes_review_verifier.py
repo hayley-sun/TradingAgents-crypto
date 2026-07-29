@@ -22,6 +22,14 @@ REVIEW_ID = "review_0123456789abcdef"
 MEMORY_ENTRY = "Paper-trading research lesson for BTC: review_0123456789abcdef."
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILL_PATH = PROJECT_ROOT / "deploy" / "hermes" / "skills" / "tradingagents-paper-review" / "SKILL.md"
+DAILY_REPORT_SKILL_PATH = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "skills"
+    / "tradingagents-daily-report"
+    / "SKILL.md"
+)
 SERVICE_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.service"
 TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.timer"
 RUNBOOK_PATH = PROJECT_ROOT / "docs" / "hermes_integration.md"
@@ -165,6 +173,26 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("memory(action=add", text)
         self.assertIn("tradingagents-hermes-maintenance.timer", text)
         self.assertIn("hermes_review_verifier", text)
+
+    def test_daily_report_skill_and_runbook_keep_reports_local(self):
+        skill = DAILY_REPORT_SKILL_PATH.read_text(encoding="ascii")
+        normalized_skill = " ".join(skill.split())
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("start_daily_report_batch", skill)
+        self.assertIn("get_daily_report_batch", skill)
+        self.assertIn("archive_daily_report", skill)
+        self.assertIn("never a real order", normalized_skill)
+        self.assertNotIn("review_paper_decision", skill)
+        self.assertNotIn("memory(action=", skill)
+        self.assertIn("gateway install --system --run-as-user ubuntu", runbook)
+        self.assertIn("tradingagents-daily-report", runbook)
+        self.assertIn("--deliver local", runbook)
+        self.assertIn("hermes cron create", runbook)
+        self.assertIn("hermes cron pause", runbook)
+        self.assertIn("hermes cron resume", runbook)
+        self.assertIn("results/hermes/report_batches", runbook)
+        self.assertIn("results/hermes/reports", runbook)
 
 
 if __name__ == "__main__":
