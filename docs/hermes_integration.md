@@ -39,7 +39,7 @@ reviewed_integration_commit="<replace-with-reviewed-integration-commit-already-p
 reviewed_integration_ref="origin/feature/hermes-mcp-async-jobs"
 git fetch origin --tags
 git rev-parse --verify "$reviewed_integration_ref^{commit}"
-git show --verify --quiet "$reviewed_integration_commit^{commit}"
+git cat-file -e "$reviewed_integration_commit^{commit}"
 git merge-base --is-ancestor "$reviewed_integration_commit" "$reviewed_integration_ref" || { echo "reviewed commit is not reachable from $reviewed_integration_ref" >&2; exit 1; }
 git switch --detach "$reviewed_integration_commit"
 git log -1 --oneline
