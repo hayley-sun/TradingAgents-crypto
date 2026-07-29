@@ -1,0 +1,12 @@
+[Unit]
+Description=TradingAgents Hermes worker maintenance
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/workspace/TradingAgents-crypto
+ExecStart=/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_maintenance --results-dir /home/ubuntu/workspace/TradingAgents-crypto/results
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run TradingAgents Hermes maintenance every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=tradingagents-hermes-maintenance.service
+
+[Install]
+WantedBy=timers.target

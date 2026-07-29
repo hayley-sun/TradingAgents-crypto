@@ -14,6 +14,7 @@
 - MCP 会话目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`
 - MCP 复盘目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reviews`
 - 按币种学习目录：`/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/memories`
+- Hermes 长期记忆：`/home/ubuntu/.hermes/memories/MEMORY.md`
 - 会话 schema 版本：`1`
 
 不得提交密钥、在本文档中写入真实密钥，或经 nginx、公共 URL、日志或 shell 历史暴露密钥。
@@ -36,7 +37,7 @@ set -e
 git status --short
 test -z "$(git status --short)" || { echo "working tree must be clean" >&2; exit 1; }
 reviewed_integration_commit="<replace-with-reviewed-integration-commit-already-pushed-to-origin>"
-reviewed_integration_ref="origin/feature/hermes-mcp-async-jobs"
+reviewed_integration_ref="origin/main"
 git fetch origin --tags
 git rev-parse --verify "$reviewed_integration_ref^{commit}"
 git cat-file -e "$reviewed_integration_commit^{commit}"
@@ -89,11 +90,12 @@ mcp_servers:
       DEEPSEEK_API_KEY: "<replace-with-real-deepseek-secret-or-remove>"
       FINNHUB_API_KEY: "<replace-with-real-finnhub-secret-or-remove>"
       COINGECKO_DEMO_API_KEY: "<optional-replace-with-real-coingecko-secret-or-remove>"
+      CRYPTOCOMPARE_API_KEY: "<optional-replace-with-real-cryptocompare-secret-or-remove>"
     timeout: 900
     connect_timeout: 60
 ```
 
-仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。所有值只能保存在权限为 `600` 的 Hermes 配置中，绝不可写入仓库。
+仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用；它已在 Hermes 私有配置中时，不要再写入项目 `.env`、`crypto-trader.service` 或任何 systemd `EnvironmentFile`。所有值只能保存在权限为 `600` 的 Hermes 配置中，绝不可写入仓库。
 
 不得加入 `cwd`、工具 include 列表或其他未经验证的字段。这是 stdio 配置，不是 HTTP 服务。
 
@@ -134,9 +136,11 @@ mcp__tradingagents_crypto__review_paper_decision
 状态为 `failed` 时读取安全的错误代码并在修复原因后创建新的分析请求。不要对
 同一个请求重复调用 `analyze_crypto`，否则会创建额外的模型任务。
 
-完成分析后，使用晚于原 `trade_date` 且不晚于当前 UTC 日期的复盘日期；该工具只使用已持久化的分析和 CoinGecko 历史 USD 参考价，不会调用 LLM 或创建真实订单：
+完成分析后，使用晚于原 `trade_date` 且不晚于当前 UTC 日期的复盘日期；该工具只使用已持久化的分析和历史 USD 参考价，不会调用 LLM 或创建真实订单：
 
 > 请调用 mcp__tradingagents_crypto__review_paper_decision，参数为 session_id="<session_id>"，review_date="<YYYY-MM-DD>"。这是研究和模拟交易，不得真实下单。
+
+价格链严格按 `CoinGecko -> CryptoCompare -> Coinbase` 运行。每一次复盘的两个日期必须由同一个提供商给出精确 UTC 日线 USD 价格；不会把不同来源、实时价格或相邻日期混合。CoinGecko 失败后才使用配置了 `CRYPTOCOMPARE_API_KEY` 的 CryptoCompare，再失败才访问公开的 Coinbase 直连 `SYMBOL-USD` 日线。三个来源都不能给出完整成对价格时，工具以 `PRICE_DATA_UNAVAILABLE` 失败关闭。
 
 复盘响应中的 `hermes_memory_entry` 是短期、可审计的记忆候选项。MCP 子进程只写项目 `results/hermes/reviews` 与 `results/hermes/memories`，不会读取或修改 Hermes 内置 memory 文件、用户资料或会话数据库。先在云主机上确认内置 memory 已启用：
 
@@ -148,9 +152,63 @@ hermes memory status
 
 > 请使用刚才返回的 hermes_memory_entry 调用 Hermes 内置 memory 工具写入记忆。只记录该条交易对的研究和模拟交易经验，不得记录或输出任何密钥，也不得据此真实下单。
 
+## 显式复盘 Skill 与一致性验收
+
+只有用户明确调用 `/tradingagents-paper-review` 时才应创建或补齐 Hermes 长期记忆。普通的 `review_paper_decision` 调用只保存项目 review 和 learning index，不会自动污染长期记忆。
+
+在云主机上安装受版本控制的 skill，然后重新打开一个 Hermes 会话以加载它：
+
+```bash
+cd /home/ubuntu/workspace/TradingAgents-crypto
+install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-paper-review
+install -m 600 deploy/hermes/skills/tradingagents-paper-review/SKILL.md /home/ubuntu/.hermes/skills/tradingagents-paper-review/SKILL.md
+```
+
+在新的 Hermes 会话中，用完成的会话 ID 和复盘日期明确调用：
+
+```text
+/tradingagents-paper-review session_id=<session_id> review_date=<YYYY-MM-DD>
+```
+
+该 skill 会调用 review MCP 工具、先用 Hermes memory tool 检查精确条目是否已存在、仅在零条目时写入一次，然后执行只读校验器。它绝不允许通过终端直接编辑 `/home/ubuntu/.hermes/memories/MEMORY.md`。若需要在 Hermes 外部验收某一条 review，可在云主机上运行：
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_review_verifier \
+  --review-id <review_id> \
+  --results-dir /home/ubuntu/workspace/TradingAgents-crypto/results \
+  --hermes-memory-path /home/ubuntu/.hermes/memories/MEMORY.md
+```
+
+成功输出仅包含 `ok`、review ID、项目 review/index 状态和 `hermes_memory_occurrences: 1`。失败返回退出码 `1` 且不打印记忆正文、文件路径或密钥；先保留文件并人工调查，不要通过 shell 改写 memory。
+
+## 定时维护
+
+维护任务每 15 分钟检查已持久化的异步会话。它只会将带有已记录且已死亡 PID 的 `queued` 或 `running` 会话标记为 `WORKER_EXITED`；没有 PID 的活动会话只报告不修改。它只删除 `results/hermes/logs/*.log` 中超过 14 天的 worker 日志，绝不删除 sessions、reviews、learning indexes 或 Hermes memory。
+
+在云主机安装和启用无密钥的 systemd timer：
+
+```bash
+cd /home/ubuntu/workspace/TradingAgents-crypto
+sudo install -m 644 deploy/systemd/tradingagents-hermes-maintenance.service /etc/systemd/system/tradingagents-hermes-maintenance.service
+sudo install -m 644 deploy/systemd/tradingagents-hermes-maintenance.timer /etc/systemd/system/tradingagents-hermes-maintenance.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradingagents-hermes-maintenance.timer
+systemctl list-timers tradingagents-hermes-maintenance.timer
+sudo systemctl start tradingagents-hermes-maintenance.service
+sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
+```
+
+模板以 `ubuntu` 用户和项目专用虚拟环境运行，启用 `NoNewPrivileges=true`、`PrivateTmp=true` 与 `UMask=0077`，且没有 `EnvironmentFile`。安装前可使用只读预演：
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_maintenance \
+  --results-dir /home/ubuntu/workspace/TradingAgents-crypto/results \
+  --dry-run
+```
+
 ## 会话存储和故障处理
 
-所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`。确定性复盘记录保存在 `results/hermes/reviews`，每个币种最近 20 条学习项保存在 `results/hermes/memories/<SYMBOL>.json`；后续同币种分析最多加载最近 5 条。正常回滚和事件排查期间必须保留这些目录。
+所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`，其中 `.log` 文件由 `tradingagents-hermes-maintenance.timer` 按 14 天保留期清理。确定性复盘记录保存在 `results/hermes/reviews`，每个币种最近 20 条学习项保存在 `results/hermes/memories/<SYMBOL>.json`；后续同币种分析最多加载最近 5 条。会话、复盘、学习索引和 Hermes 长期 memory 永不由维护任务删除。
 
 | 错误代码 | 操作员处理 |
 | --- | --- |
@@ -162,11 +220,11 @@ hermes memory status
 | `SESSION_NOT_FOUND` | 核对分析工具返回的不透明 `session_id`，或启动新的分析。 |
 | `SESSION_UNREADABLE` | 保留会话文件，检查文件系统健康状况和文件权限，然后重试或创建新会话。 |
 | `WORKER_START_FAILED` | 检查 MCP Python 环境、`results/hermes` 的写权限和可执行文件路径，然后创建新的分析请求。 |
-| `WORKER_EXITED` | 后台 worker 在完成前退出；保留会话日志，检查数据或模型提供商后创建新的分析请求。 |
+| `WORKER_EXITED` | 后台 worker 在完成前退出；保留会话日志，检查数据或模型提供商后创建新的分析请求。定时维护和 `get_analysis_result` 都会执行这一相同判定。 |
 | `ANALYSIS_FAILED` | 查看安全的工具错误、提供商或数据可用性及模型请求，稍后重试。 |
 | `SESSION_NOT_COMPLETED` | 仅已完成的分析可复盘；失败、排队中或运行中的会话不能复盘。 |
 | `INVALID_REVIEW_REQUEST` | 使用 `analyze_crypto` 返回的会话 ID，并选择晚于原 `trade_date`、不晚于当前 UTC 日期的 ISO `review_date`。 |
-| `PRICE_DATA_UNAVAILABLE` | CoinGecko 历史参考价不可用。不得以实时价或其他日期替代；稍后重试或配置有效的 CoinGecko Demo/Pro Key。 |
+| `PRICE_DATA_UNAVAILABLE` | CoinGecko、CryptoCompare 和 Coinbase 都未能提供同一来源的精确历史 USD 价格。不得以实时价、其他日期或混合来源替代；稍后重试并检查私有 Hermes 配置中的可选数据提供商密钥。 |
 | `REVIEW_STORE_UNAVAILABLE` | 检查 `results/hermes/reviews`、`results/hermes/memories` 的所有者、可用空间与 `TRADINGAGENTS_RESULTS_DIR`。 |
 | `REVIEW_WRITE_FAILED` | 保留已有文件，检查复盘目录写权限后重试。 |
 | `LEARNING_WRITE_FAILED` | 规范复盘可能已保存但学习索引未更新；检查学习目录写权限，然后以相同 `session_id` 和 `review_date` 重试以修复索引。 |

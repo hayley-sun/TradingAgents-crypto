@@ -20,6 +20,11 @@ from tradingagents.integrations.hermes_review_verifier import (
 
 REVIEW_ID = "review_0123456789abcdef"
 MEMORY_ENTRY = "Paper-trading research lesson for BTC: review_0123456789abcdef."
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SKILL_PATH = PROJECT_ROOT / "deploy" / "hermes" / "skills" / "tradingagents-paper-review" / "SKILL.md"
+SERVICE_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.service"
+TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.timer"
+RUNBOOK_PATH = PROJECT_ROOT / "docs" / "hermes_integration.md"
 
 
 def saved_review(results_root: Path) -> PaperDecisionReview:
@@ -124,6 +129,38 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertEqual(failure_payload, {"ok": False, "review_id": REVIEW_ID})
         self.assertNotIn(directory, failure_stdout.getvalue())
         self.assertNotIn(MEMORY_ENTRY, failure_stdout.getvalue())
+
+    def test_skill_requires_explicit_mcp_memory_tool_and_verifier(self):
+        text = SKILL_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("explicitly invokes", text)
+        self.assertIn("mcp__tradingagents_crypto__review_paper_decision", text)
+        self.assertIn("memory tool", text)
+        self.assertIn("hermes_review_verifier", text)
+        self.assertIn("never a real order", text)
+
+    def test_timer_runs_secret_free_maintenance_service(self):
+        service = SERVICE_PATH.read_text(encoding="ascii")
+        timer = TIMER_PATH.read_text(encoding="ascii")
+
+        self.assertIn("hermes_maintenance", service)
+        self.assertIn("User=ubuntu", service)
+        self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("PrivateTmp=true", service)
+        self.assertIn("UMask=0077", service)
+        self.assertNotIn("EnvironmentFile", service)
+        self.assertIn("OnBootSec=5min", timer)
+        self.assertIn("OnUnitActiveSec=15min", timer)
+        self.assertIn("Persistent=true", timer)
+
+    def test_runbook_documents_skill_timer_and_price_fallback_configuration(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("CRYPTOCOMPARE_API_KEY", text)
+        self.assertIn("CoinGecko -> CryptoCompare -> Coinbase", text)
+        self.assertIn("tradingagents-paper-review", text)
+        self.assertIn("tradingagents-hermes-maintenance.timer", text)
+        self.assertIn("hermes_review_verifier", text)
 
 
 if __name__ == "__main__":
