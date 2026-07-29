@@ -1,3 +1,5 @@
+import multiprocessing
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -12,6 +14,8 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    PaperDecisionReview,
+    PriceReference,
     utc_now,
 )
 
@@ -42,7 +46,79 @@ def completed_session(action, final_trade_decision=None, symbol="BTC"):
     )
 
 
+def _concurrent_learning_upsert(root, review_payload, ready_queue, start_event):
+    from tradingagents.integrations import hermes_learning
+
+    original_write = hermes_learning._atomic_json_write
+
+    def delayed_write(destination, value):
+        time.sleep(0.25)
+        original_write(destination, value)
+
+    hermes_learning._atomic_json_write = delayed_write
+    ready_queue.put(True)
+    start_event.wait(timeout=5)
+    hermes_learning.LearningStore(Path(root)).upsert(
+        PaperDecisionReview.model_validate(review_payload)
+    )
+
+
 class HermesLearningTests(unittest.TestCase):
+    def test_concurrent_upserts_retain_each_review(self):
+        def review(review_id):
+            return PaperDecisionReview(
+                review_id=review_id,
+                session_id=f"hermes_{review_id.removeprefix('review_')}",
+                symbol="BTC",
+                trade_date="2026-07-28",
+                review_date="2026-07-29",
+                action="BUY",
+                entry_price=PriceReference(
+                    date="2026-07-28", usd_price=100.0, source="coingecko"
+                ),
+                review_price=PriceReference(
+                    date="2026-07-29", usd_price=110.0, source="coingecko"
+                ),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry=f"Paper-trading lesson for {review_id}.",
+            )
+
+        review_ids = (
+            "review_0123456789abcdea",
+            "review_0123456789abcdef",
+        )
+        context = multiprocessing.get_context("fork")
+        with TemporaryDirectory() as directory:
+            ready_queue = context.Queue()
+            start_event = context.Event()
+            processes = [
+                context.Process(
+                    target=_concurrent_learning_upsert,
+                    args=(
+                        directory,
+                        review(review_id).model_dump(mode="json"),
+                        ready_queue,
+                        start_event,
+                    ),
+                )
+                for review_id in review_ids
+            ]
+            for process in processes:
+                process.start()
+            for _ in processes:
+                ready_queue.get(timeout=5)
+            start_event.set()
+            for process in processes:
+                process.join(timeout=5)
+                self.assertEqual(process.exitcode, 0)
+
+            index = LearningStore(Path(directory)).load("BTC")
+
+        self.assertIsNotNone(index)
+        self.assertEqual({entry.review_id for entry in index.entries}, set(review_ids))
+
     def test_buy_review_is_idempotent_and_writes_a_paper_trading_lesson(self):
         calls = []
 

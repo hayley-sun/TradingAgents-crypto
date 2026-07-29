@@ -7,9 +7,11 @@ import os
 import re
 import tempfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
+import fcntl
 from pydantic import ValidationError
 
 from tradingagents.integrations.schemas import (
@@ -123,28 +125,41 @@ class LearningStore:
         with path.open(encoding="ascii") as learning_file:
             return SymbolLearningIndex.model_validate(json.load(learning_file))
 
+    @contextmanager
+    def _exclusive_write_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".learning.lock").open("a", encoding="ascii") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def upsert(self, review: PaperDecisionReview) -> SymbolLearningIndex:
-        current = self.load(review.symbol)
-        entry = SymbolLearningEntry(
-            review_id=review.review_id,
-            review_date=review.review_date,
-            lesson=review.hermes_memory_entry,
-        )
-        existing_entries = current.entries if current is not None else []
-        by_review_id = {item.review_id: item for item in existing_entries}
-        by_review_id[entry.review_id] = entry
-        entries = sorted(
-            by_review_id.values(),
-            key=lambda item: (item.review_date, item.review_id),
-            reverse=True,
-        )[:MAX_SYMBOL_LESSONS]
-        index = SymbolLearningIndex(
-            symbol=review.symbol,
-            updated_at=utc_now(),
-            entries=entries,
-        )
-        _atomic_json_write(self.path_for(index.symbol), index.model_dump(mode="json"))
-        return index
+        with self._exclusive_write_lock():
+            current = self.load(review.symbol)
+            entry = SymbolLearningEntry(
+                review_id=review.review_id,
+                review_date=review.review_date,
+                lesson=review.hermes_memory_entry,
+            )
+            existing_entries = current.entries if current is not None else []
+            by_review_id = {item.review_id: item for item in existing_entries}
+            by_review_id[entry.review_id] = entry
+            entries = sorted(
+                by_review_id.values(),
+                key=lambda item: (item.review_date, item.review_id),
+                reverse=True,
+            )[:MAX_SYMBOL_LESSONS]
+            index = SymbolLearningIndex(
+                symbol=review.symbol,
+                updated_at=utc_now(),
+                entries=entries,
+            )
+            _atomic_json_write(
+                self.path_for(index.symbol), index.model_dump(mode="json")
+            )
+            return index
 
     def lessons_for(self, symbol: str, limit: int = GRAPH_LESSON_LIMIT) -> list[str]:
         if limit < 1:
