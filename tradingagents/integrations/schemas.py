@@ -140,7 +140,7 @@ class ReviewRequest(_StrictModel):
 class PriceReference(_StrictModel):
     date: date
     usd_price: float = Field(gt=0)
-    source: Literal["coingecko"]
+    source: Literal["coingecko", "cryptocompare", "coinbase"]
 
     @field_validator("usd_price")
     @classmethod

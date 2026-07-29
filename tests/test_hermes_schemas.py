@@ -92,7 +92,7 @@ class HermesSchemaTests(unittest.TestCase):
             date="2026-07-28", usd_price=100.0, source="coingecko"
         )
         review_price = PriceReference(
-            date="2026-07-29", usd_price=110.0, source="coingecko"
+            date="2026-07-29", usd_price=110.0, source="cryptocompare"
         )
         review = PaperDecisionReview(
             review_id="review_0123456789abcdef",
@@ -123,6 +123,7 @@ class HermesSchemaTests(unittest.TestCase):
         self.assertEqual(request.review_date, date(2026, 7, 29))
         self.assertTrue(is_valid_review_id(review.review_id))
         self.assertEqual(review.symbol, "BTC")
+        self.assertEqual(review.review_price.source, "cryptocompare")
         self.assertEqual(index.symbol, "BTC")
         self.assertEqual(index.entries[0].review_id, review.review_id)
 
@@ -130,6 +131,8 @@ class HermesSchemaTests(unittest.TestCase):
             ReviewRequest(session_id="../session", review_date="2026-07-29")
         with self.assertRaises(ValidationError):
             PriceReference(date="2026-07-29", usd_price=0, source="coingecko")
+        with self.assertRaises(ValidationError):
+            PriceReference(date="2026-07-29", usd_price=1, source="unknown")
         with self.assertRaises(ValidationError):
             PaperDecisionReview.model_validate(
                 {
