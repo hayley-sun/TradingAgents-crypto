@@ -7,7 +7,13 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    PaperDecisionReview,
+    PriceReference,
+    ReviewRequest,
+    SymbolLearningEntry,
+    SymbolLearningIndex,
     ToolError,
+    is_valid_review_id,
     is_valid_session_id,
     utc_now,
 )
@@ -76,6 +82,62 @@ class HermesSchemaTests(unittest.TestCase):
         current = utc_now()
         self.assertIsNotNone(current.tzinfo)
         self.assertEqual(current.utcoffset(), timezone.utc.utcoffset(current))
+
+    def test_review_models_normalize_and_reject_invalid_values(self):
+        request = ReviewRequest(
+            session_id="hermes_0123456789abcdef",
+            review_date="2026-07-29",
+        )
+        entry_price = PriceReference(
+            date="2026-07-28", usd_price=100.0, source="coingecko"
+        )
+        review_price = PriceReference(
+            date="2026-07-29", usd_price=110.0, source="coingecko"
+        )
+        review = PaperDecisionReview(
+            review_id="review_0123456789abcdef",
+            session_id=request.session_id,
+            symbol=" btc ",
+            trade_date="2026-07-28",
+            review_date=request.review_date,
+            action="BUY",
+            entry_price=entry_price,
+            review_price=review_price,
+            raw_return_pct=10.0,
+            verdict="correct",
+            created_at=utc_now(),
+            hermes_memory_entry="Paper-trading research lesson for BTC.",
+        )
+        index = SymbolLearningIndex(
+            symbol=" btc ",
+            updated_at=utc_now(),
+            entries=[
+                SymbolLearningEntry(
+                    review_id=review.review_id,
+                    review_date=review.review_date,
+                    lesson=review.hermes_memory_entry,
+                )
+            ],
+        )
+
+        self.assertEqual(request.review_date, date(2026, 7, 29))
+        self.assertTrue(is_valid_review_id(review.review_id))
+        self.assertEqual(review.symbol, "BTC")
+        self.assertEqual(index.symbol, "BTC")
+        self.assertEqual(index.entries[0].review_id, review.review_id)
+
+        with self.assertRaises(ValidationError):
+            ReviewRequest(session_id="../session", review_date="2026-07-29")
+        with self.assertRaises(ValidationError):
+            PriceReference(date="2026-07-29", usd_price=0, source="coingecko")
+        with self.assertRaises(ValidationError):
+            PaperDecisionReview.model_validate(
+                {
+                    **review.model_dump(),
+                    "review_id": "../review",
+                    "raw_return_pct": float("nan"),
+                }
+            )
 
     def test_models_forbid_extra_fields(self):
         with self.assertRaises(ValidationError):
