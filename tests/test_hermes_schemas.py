@@ -8,6 +8,7 @@ from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    DailyReportBatch,
     DailyReportBatchItem,
     DailyReportRequest,
     PaperDecisionReview,
@@ -273,6 +274,26 @@ class HermesSchemaTests(unittest.TestCase):
             symbol=" btc ", session_id="hermes_0123456789abcdef"
         )
         self.assertEqual(item.symbol, "BTC")
+
+    def test_daily_report_batch_allows_empty_items_while_submission_starts(self):
+        request = DailyReportRequest(
+            trade_date="2026-07-29",
+            symbols=["BTC"],
+            analysts=["market"],
+            research_depth=1,
+            llm_provider="deepseek",
+            quick_model="quick",
+            deep_model="deep",
+        )
+
+        batch = DailyReportBatch(
+            batch_id="report_0123456789abcdef",
+            request=request,
+            created_at=utc_now(),
+            items=[],
+        )
+
+        self.assertEqual(batch.items, [])
 
 
 if __name__ == "__main__":

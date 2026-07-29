@@ -198,7 +198,7 @@ class DailyReportBatch(_StrictModel):
     batch_id: str
     request: DailyReportRequest
     created_at: datetime
-    items: list[DailyReportBatchItem] = Field(min_length=1, max_length=5)
+    items: list[DailyReportBatchItem] = Field(max_length=5)
     archive: DailyReportArchive | None = None
 
     @field_validator("batch_id")
@@ -211,8 +211,8 @@ class DailyReportBatch(_StrictModel):
     @model_validator(mode="after")
     def require_requested_symbols_once(self) -> "DailyReportBatch":
         item_symbols = [item.symbol for item in self.items]
-        if item_symbols != self.request.symbols:
-            raise ValueError("batch items must match request symbols in order")
+        if item_symbols != self.request.symbols[: len(item_symbols)]:
+            raise ValueError("batch items must be an ordered request-symbol prefix")
         return self
 
 
