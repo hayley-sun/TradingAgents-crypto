@@ -1,7 +1,10 @@
+import asyncio
 import json
 import os
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -9,15 +12,24 @@ from unittest.mock import patch
 import chromadb
 from chromadb.config import Settings
 
-from tradingagents.integrations.schemas import AnalysisRequest
+from tradingagents.agents.utils.memory import FinancialSituationMemory
+from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
+from tradingagents.integrations.schemas import (
+    AnalysisRequest,
+    AnalysisResult,
+    AnalysisSession,
+    utc_now,
+)
 
 from tradingagents.integrations.hermes_mcp import (
+    MCP,
     PAPER_TRADING_DISCLAIMER,
     SessionStore,
     _cleanup_session_collections,
     execute_analysis,
     get_analysis_result_impl,
     health_check_impl,
+    review_paper_decision_impl,
 )
 
 
@@ -49,6 +61,12 @@ class FailingGraph(FakeGraph):
     def propagate(self, symbol, trade_date):
         self.propagate_calls.append((symbol, trade_date))
         raise RuntimeError("provider secret at /private/failure")
+
+
+class PrintingGraph(FakeGraph):
+    def propagate(self, symbol, trade_date):
+        print("graph output must not reach MCP stdout")
+        return super().propagate(symbol, trade_date)
 
 
 class HermesMcpTests(unittest.TestCase):
@@ -129,7 +147,7 @@ class HermesMcpTests(unittest.TestCase):
                 "openrouter": False,
             },
         )
-        self.assertEqual(data["configured_llm_providers"], ["openai"])
+        self.assertEqual(data["configured_llm_providers"], ["ollama", "openai"])
         self.assertIs(data["finnhub_key_available"], True)
         self.assertIs(data["coingecko_key_available"], True)
         self.assertEqual(data["disclaimer"], PAPER_TRADING_DISCLAIMER)
@@ -148,6 +166,18 @@ class HermesMcpTests(unittest.TestCase):
             result = health_check_impl()
 
         self.assertIs(result["data"]["coingecko_key_available"], False)
+
+    def test_health_treats_ollama_as_a_configured_local_provider(self):
+        with TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"TRADINGAGENTS_RESULTS_DIR": temp_dir},
+            clear=True,
+        ):
+            result = health_check_impl()
+
+        self.assertEqual(result["data"]["status"], "ready")
+        self.assertEqual(result["data"]["configured_llm_providers"], ["ollama"])
+        self.assertNotIn("ollama", result["data"]["llm_provider_key_available"])
 
     def test_health_contains_session_store_resolution_errors(self):
         with TemporaryDirectory() as temp_dir:
@@ -238,6 +268,192 @@ class HermesMcpTests(unittest.TestCase):
                 if collection_name in remaining_names:
                     chroma_client.delete_collection(name=collection_name)
 
+    def test_analyze_crypto_schema_forbids_unknown_fields(self):
+        tool = MCP._tool_manager.get_tool("analyze_crypto")
+
+        self.assertIs(tool.parameters["additionalProperties"], False)
+
+    def test_static_review_lessons_are_available_without_embeddings(self):
+        memory = FinancialSituationMemory(
+            "trader_memory",
+            {
+                "llm_provider": "deepseek",
+                "hermes_review_lessons": ["BTC paper-trading lesson"],
+            },
+        )
+
+        self.assertEqual(
+            memory.get_memories("current market situation"),
+            [
+                {
+                    "matched_situation": "",
+                    "recommendation": "BTC paper-trading lesson",
+                    "similarity_score": 1.0,
+                }
+            ],
+        )
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    @patch("tradingagents.integrations.hermes_mcp.LearningStore.from_environment")
+    def test_execute_analysis_passes_review_lessons_to_graph(
+        self, learning_store_factory, provider_key, cleanup
+    ):
+        FakeGraph.instances = []
+        learning_store_factory.return_value.lessons_for.return_value = [
+            "BTCUSDT paper-trading lesson"
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            execute_analysis(
+                self.make_request().model_dump(mode="json"),
+                store=SessionStore(Path(temp_dir) / "sessions"),
+                graph_factory=FakeGraph,
+            )
+
+        self.assertEqual(
+            FakeGraph.instances[-1].config["hermes_review_lessons"],
+            ["BTCUSDT paper-trading lesson"],
+        )
+        learning_store_factory.return_value.lessons_for.assert_called_once_with(
+            "BTCUSDT", limit=5
+        )
+        provider_key.assert_called_once_with("openai")
+        cleanup.assert_called_once()
+
+    def test_review_tool_forbids_unknown_fields(self):
+        tool = MCP._tool_manager.get_tool("review_paper_decision")
+        self.assertIs(tool.parameters["additionalProperties"], False)
+
+        _, result = asyncio.run(
+            MCP.call_tool(
+                "review_paper_decision",
+                {
+                    "session_id": "hermes_0123456789abcdef",
+                    "review_date": "2026-07-29",
+                    "unexpected_field": "unexpected",
+                },
+            )
+        )
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "INVALID_REVIEW_REQUEST")
+
+    def test_review_completed_session_returns_structured_paper_trading_result(self):
+        with TemporaryDirectory() as temp_dir:
+            session_store = SessionStore(Path(temp_dir) / "sessions")
+            session = session_store.create("hermes_0123456789abcdef", self.make_request())
+            completed = AnalysisSession(
+                session_id=session.session_id,
+                status="completed",
+                created_at=session.created_at,
+                completed_at=utc_now(),
+                request=session.request,
+                result=AnalysisResult(
+                    reports={"market": "report"},
+                    investment_plan="plan",
+                    trader_investment_plan="trader plan",
+                    final_trade_decision="FINAL TRANSACTION PROPOSAL: **BUY**",
+                    processed_signal="BUY",
+                ),
+            )
+            session_store.save(completed)
+            result = review_paper_decision_impl(
+                {
+                    "session_id": session.session_id,
+                    "review_date": "2026-07-29",
+                },
+                store=session_store,
+                review_store=ReviewStore(Path(temp_dir) / "reviews"),
+                learning_store=LearningStore(Path(temp_dir) / "memories"),
+                price_lookup=lambda _symbol, value: 100.0
+                if value == date(2026, 7, 28)
+                else 110.0,
+                current_date=date(2026, 7, 29),
+            )
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["review"]["action"], "BUY")
+        self.assertEqual(result["data"]["review"]["verdict"], "correct")
+        self.assertIn("paper-trading", result["data"]["hermes_memory_entry"].lower())
+        self.assertEqual(result["data"]["disclaimer"], PAPER_TRADING_DISCLAIMER)
+
+    def test_review_reports_learning_write_failure_after_persisting_review(self):
+        class FailingLearningStore:
+            def upsert(self, _review):
+                raise OSError("learning storage is read-only")
+
+        with TemporaryDirectory() as temp_dir:
+            session_store = SessionStore(Path(temp_dir) / "sessions")
+            session = session_store.create("hermes_0123456789abcdef", self.make_request())
+            session_store.save(
+                AnalysisSession(
+                    session_id=session.session_id,
+                    status="completed",
+                    created_at=session.created_at,
+                    completed_at=utc_now(),
+                    request=session.request,
+                    result=AnalysisResult(
+                        reports={"market": "report"},
+                        investment_plan="plan",
+                        trader_investment_plan="trader plan",
+                        final_trade_decision="FINAL TRANSACTION PROPOSAL: **BUY**",
+                        processed_signal="BUY",
+                    ),
+                )
+            )
+            result = review_paper_decision_impl(
+                {"session_id": session.session_id, "review_date": "2026-07-29"},
+                store=session_store,
+                review_store=ReviewStore(Path(temp_dir) / "reviews"),
+                learning_store=FailingLearningStore(),
+                price_lookup=lambda _symbol, _date: 100.0,
+                current_date=date(2026, 7, 29),
+            )
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "LEARNING_WRITE_FAILED")
+
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="")
+    def test_analyze_crypto_rejects_unknown_mcp_fields_before_provider_access(
+        self, provider_key
+    ):
+        request_data = self.make_request().model_dump(mode="json")
+        request_data["unexpected_field"] = "unexpected"
+
+        _, result = asyncio.run(MCP.call_tool("analyze_crypto", request_data))
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "INVALID_REQUEST")
+        provider_key.assert_not_called()
+
+    @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
+    @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
+    def test_analyze_crypto_redirects_graph_stdout_to_stderr(self, provider_key, cleanup):
+        original_defaults = execute_analysis.__defaults__
+        execute_analysis.__defaults__ = (None, PrintingGraph)
+        stdout = StringIO()
+        stderr = StringIO()
+
+        try:
+            with TemporaryDirectory() as temp_dir, patch.dict(
+                os.environ,
+                {"TRADINGAGENTS_RESULTS_DIR": temp_dir},
+                clear=True,
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                _, result = asyncio.run(
+                    MCP.call_tool("analyze_crypto", self.make_request().model_dump(mode="json"))
+                )
+        finally:
+            execute_analysis.__defaults__ = original_defaults
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["data"]["processed_signal"], "HOLD")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("graph output must not reach MCP stdout", stderr.getvalue())
+        provider_key.assert_called_once_with("openai")
+        cleanup.assert_called_once()
+
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
     def test_execute_analysis_persists_completed_fake_graph_result(
@@ -268,6 +484,7 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(graph.config["deep_think_llm"], "deep")
         self.assertEqual(graph.config["max_debate_rounds"], 1)
         self.assertEqual(graph.config["max_risk_discuss_rounds"], 1)
+        self.assertIs(graph.config["log_graph_states"], False)
         self.assertEqual(graph.config["session_id"], result["data"]["session_id"])
         self.assertEqual(session.status, "completed")
         self.assertIsNotNone(session.completed_at)

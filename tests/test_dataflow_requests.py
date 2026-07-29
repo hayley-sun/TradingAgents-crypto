@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
-from datetime import datetime
+from datetime import date, datetime
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -137,6 +137,35 @@ class DataflowRequestTest(unittest.TestCase):
         self.assertEqual(from_date, "2025-07-25")
         self.assertEqual(to_date, "2026-07-24")
         self.assertIn("adjusted to 2025-07-25", result)
+
+    def test_historical_usd_price_uses_coin_history_endpoint(self):
+        module = load_module("coingecko_utils_history_under_test", "tradingagents/dataflows/coingecko_utils.py")
+        captured = {}
+
+        def fake_make_request(self, endpoint, params=None):
+            captured["endpoint"] = endpoint
+            captured["params"] = params
+            return {"market_data": {"current_price": {"usd": 101.25}}}
+
+        with patch.object(module.CoinGeckoAPI, "_make_request", fake_make_request):
+            price = module.get_crypto_historical_usd_price("BTC", date(2026, 7, 28))
+
+        self.assertEqual(price, 101.25)
+        self.assertEqual(captured["endpoint"], "/coins/bitcoin/history")
+        self.assertEqual(
+            captured["params"],
+            {"date": "28-07-2026", "localization": "false"},
+        )
+
+    def test_historical_usd_price_rejects_missing_or_non_positive_values(self):
+        module = load_module("coingecko_utils_history_errors_under_test", "tradingagents/dataflows/coingecko_utils.py")
+
+        for payload in ({}, {"market_data": {"current_price": {"usd": 0}}}):
+            with self.subTest(payload=payload), patch.object(
+                module.CoinGeckoAPI, "_make_request", return_value=payload
+            ):
+                with self.assertRaises(ValueError):
+                    module.get_crypto_historical_usd_price("BTC", date(2026, 7, 28))
 
 
 if __name__ == "__main__":

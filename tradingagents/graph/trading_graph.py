@@ -218,8 +218,8 @@ class TradingAgentsGraph:
         # Store current state for reflection
         self.curr_state = final_state
 
-        # Log state
-        self._log_state(trade_date, final_state)
+        if self.config.get("log_graph_states", True):
+            self._log_state(trade_date, final_state)
 
         # Return decision and processed signal
         return final_state, self.process_signal(final_state["final_trade_decision"])
