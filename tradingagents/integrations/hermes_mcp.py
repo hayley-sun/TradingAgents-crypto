@@ -33,10 +33,18 @@ from tradingagents.integrations.hermes_learning import (
     ReviewStore,
     review_completed_session,
 )
+from tradingagents.integrations.hermes_reports import (
+    ReportArchiveConflict,
+    ReportBatchActive,
+    ReportBatchConflict,
+    ReportBatchStorageError,
+    ReportBatchStore,
+)
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    DailyReportRequest,
     PriceReference,
     ReviewRequest,
     ToolError,
@@ -315,6 +323,227 @@ def _analysis_error(code: str, message: str, suggested_action: str) -> dict[str,
 def _review_error(code: str, message: str, suggested_action: str) -> dict[str, Any]:
     return failure(
         ToolError(code=code, message=message, suggested_action=suggested_action)
+    )
+
+
+def _report_error(code: str, message: str, suggested_action: str) -> dict[str, Any]:
+    return failure(
+        ToolError(code=code, message=message, suggested_action=suggested_action)
+    )
+
+
+def _report_batch_store_from_environment() -> ReportBatchStore:
+    results_dir = os.getenv("TRADINGAGENTS_RESULTS_DIR")
+    base_dir = Path(results_dir) if results_dir else PROJECT_ROOT / "results"
+    return ReportBatchStore(base_dir / "hermes" / "report_batches")
+
+
+def _parse_report_trade_date(value: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError("invalid trade date")
+    return date.fromisoformat(value)
+
+
+def _report_session_starter(
+    request: AnalysisRequest,
+    store: SessionStore,
+    worker_launcher=None,
+) -> str | ToolError:
+    result = start_analysis(
+        request.model_dump(mode="json"),
+        store=store,
+        worker_launcher=worker_launcher or launch_analysis_worker,
+    )
+    if result.get("ok"):
+        return result["data"]["session_id"]
+    try:
+        return ToolError.model_validate(result["error"])
+    except (KeyError, TypeError, ValidationError):
+        return ToolError(
+            code="REPORT_SUBMISSION_FAILED",
+            message="The daily report analysis could not be submitted.",
+            suggested_action="Inspect the safe analysis status and start a later batch.",
+        )
+
+
+def _report_summary_data(summary) -> dict[str, Any]:
+    return {
+        "state": summary.state,
+        "items": [
+            {
+                "symbol": item.symbol,
+                "session_id": item.session_id,
+                "status": item.status,
+                "processed_signal": item.result.processed_signal
+                if item.result is not None
+                else None,
+                "final_trade_decision": item.result.final_trade_decision
+                if item.result is not None
+                else None,
+                "error": item.error.model_dump(mode="json")
+                if item.error is not None
+                else None,
+            }
+            for item in summary.items
+        ],
+    }
+
+
+def _previous_report_data(previous) -> dict[str, Any] | None:
+    if previous is None:
+        return None
+    return {
+        "trade_date": previous.trade_date.isoformat(),
+        "items": [item.model_dump(mode="json") for item in previous.items],
+    }
+
+
+def start_daily_report_batch_impl(
+    request_data: Mapping[str, Any],
+    batch_store: ReportBatchStore | None = None,
+    session_store: SessionStore | None = None,
+    starter: Callable[[AnalysisRequest], str | ToolError] | None = None,
+    worker_launcher=None,
+) -> dict[str, Any]:
+    try:
+        request = DailyReportRequest.model_validate(request_data)
+    except ValidationError:
+        return _report_error(
+            "INVALID_REPORT_REQUEST",
+            "The daily report request is invalid.",
+            "Use one ISO trade date, unique supported symbols and analysts, and valid model settings.",
+        )
+
+    try:
+        active_batch_store = batch_store or _report_batch_store_from_environment()
+        active_session_store = session_store or SessionStore.from_environment()
+        active_starter = starter or (
+            lambda analysis_request: _report_session_starter(
+                analysis_request, active_session_store, worker_launcher
+            )
+        )
+        batch = active_batch_store.create_or_load(request, active_starter)
+    except ReportBatchConflict:
+        return _report_error(
+            "REPORT_BATCH_CONFLICT",
+            "A daily report batch already exists for this date with different settings.",
+            "Use the existing batch settings or create a batch for a different trade date.",
+        )
+    except ReportBatchStorageError:
+        return _report_error(
+            "REPORT_BATCH_UNREADABLE",
+            "The daily report batch could not be read or written.",
+            "Verify report batch storage and retry later.",
+        )
+    except (OSError, ValueError, ValidationError):
+        return _report_error(
+            "REPORT_BATCH_WRITE_FAILED",
+            "The daily report batch could not be created.",
+            "Verify report batch storage and retry later.",
+        )
+
+    return success(
+        {
+            "batch": batch.model_dump(mode="json"),
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
+
+
+def get_daily_report_batch_impl(
+    trade_date: str,
+    batch_store: ReportBatchStore | None = None,
+    session_store: SessionStore | None = None,
+    session_loader: Callable[[str], AnalysisSession | None] | None = None,
+) -> dict[str, Any]:
+    try:
+        requested_date = _parse_report_trade_date(trade_date)
+        active_batch_store = batch_store or _report_batch_store_from_environment()
+        batch = active_batch_store.load(requested_date)
+        if batch is None:
+            return _report_error(
+                "REPORT_BATCH_NOT_FOUND",
+                "No daily report batch exists for this trade date.",
+                "Start a daily report batch for this trade date first.",
+            )
+        loader = session_loader or (session_store or SessionStore.from_environment()).load
+        summary = active_batch_store.summarize(batch, loader)
+        previous = active_batch_store.previous_snapshot(requested_date)
+    except ReportBatchStorageError:
+        return _report_error(
+            "REPORT_BATCH_UNREADABLE",
+            "The daily report batch could not be read.",
+            "Verify report batch and session storage, then retry later.",
+        )
+    except (OSError, ValueError, ValidationError, json.JSONDecodeError):
+        return _report_error(
+            "INVALID_REPORT_REQUEST",
+            "The daily report trade date is invalid.",
+            "Use an ISO trade date in YYYY-MM-DD format.",
+        )
+
+    return success(
+        {
+            "batch": batch.model_dump(mode="json"),
+            "summary": _report_summary_data(summary),
+            "previous_report": _previous_report_data(previous),
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
+
+
+def archive_daily_report_impl(
+    trade_date: str,
+    narrative: str,
+    batch_store: ReportBatchStore | None = None,
+    session_store: SessionStore | None = None,
+    session_loader: Callable[[str], AnalysisSession | None] | None = None,
+) -> dict[str, Any]:
+    try:
+        requested_date = _parse_report_trade_date(trade_date)
+        active_batch_store = batch_store or _report_batch_store_from_environment()
+        batch = active_batch_store.load(requested_date)
+        if batch is None:
+            return _report_error(
+                "REPORT_BATCH_NOT_FOUND",
+                "No daily report batch exists for this trade date.",
+                "Start a daily report batch for this trade date first.",
+            )
+        loader = session_loader or (session_store or SessionStore.from_environment()).load
+        archive = active_batch_store.archive(batch, loader, narrative)
+    except ReportBatchActive:
+        return _report_error(
+            "REPORT_BATCH_ACTIVE",
+            "The daily report batch still has queued or running analyses.",
+            "Wait for all sessions to reach a terminal state, then archive the report.",
+        )
+    except ReportArchiveConflict:
+        return _report_error(
+            "REPORT_ARCHIVE_CONFLICT",
+            "A different immutable report archive already exists for this date.",
+            "Use the existing archive and do not attempt to overwrite it.",
+        )
+    except ReportBatchStorageError:
+        return _report_error(
+            "REPORT_BATCH_UNREADABLE",
+            "The daily report batch or archive could not be read or written.",
+            "Verify report batch and archive storage, then retry later.",
+        )
+    except (OSError, ValueError, ValidationError, json.JSONDecodeError):
+        return _report_error(
+            "REPORT_ARCHIVE_INVALID",
+            "The daily report archive request is invalid.",
+            "Use an ISO trade date and a non-empty report narrative.",
+        )
+
+    return success(
+        {
+            "batch_id": batch.batch_id,
+            "filename": archive.path.name,
+            "sha256": archive.sha256,
+            "state": archive.state,
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
     )
 
 
@@ -848,6 +1077,59 @@ def review_paper_decision(
     return review_paper_decision_impl(request_data)
 
 
+@MCP.tool()
+def start_daily_report_batch(
+    trade_date: str,
+    symbols: list[str],
+    analysts: list[str],
+    research_depth: int,
+    llm_provider: str,
+    quick_model: str,
+    deep_model: str,
+    **unknown_fields: Any,
+) -> dict[str, Any]:
+    """Start or retrieve one idempotent daily paper-trading research batch."""
+    request_data = {
+        "trade_date": trade_date,
+        "symbols": symbols,
+        "analysts": analysts,
+        "research_depth": research_depth,
+        "llm_provider": llm_provider,
+        "quick_model": quick_model,
+        "deep_model": deep_model,
+    }
+    request_data.update(unknown_fields)
+    return start_daily_report_batch_impl(request_data)
+
+
+@MCP.tool()
+def get_daily_report_batch(
+    trade_date: str, **unknown_fields: Any
+) -> dict[str, Any]:
+    """Read one daily report batch and safe per-symbol completion state."""
+    if unknown_fields:
+        return _report_error(
+            "INVALID_REPORT_REQUEST",
+            "The daily report request is invalid.",
+            "Use only an ISO trade date in YYYY-MM-DD format.",
+        )
+    return get_daily_report_batch_impl(trade_date)
+
+
+@MCP.tool()
+def archive_daily_report(
+    trade_date: str, narrative: str, **unknown_fields: Any
+) -> dict[str, Any]:
+    """Archive one terminal daily report batch as immutable Markdown."""
+    if unknown_fields:
+        return _report_error(
+            "INVALID_REPORT_REQUEST",
+            "The daily report request is invalid.",
+            "Use only an ISO trade date and a report narrative.",
+        )
+    return archive_daily_report_impl(trade_date, narrative)
+
+
 class _AnalyzeCryptoArguments(ArgModelBase):
     """Preserve raw flat MCP fields so AnalysisRequest can reject unknown inputs."""
 
@@ -877,6 +1159,46 @@ class _ReviewPaperDecisionArguments(ArgModelBase):
         return self.model_dump()
 
 
+class _DailyReportBatchArguments(ArgModelBase):
+    """Preserve raw batch fields so DailyReportRequest rejects unknown inputs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    trade_date: str
+    symbols: list[str]
+    analysts: list[str]
+    research_depth: int
+    llm_provider: str
+    quick_model: str
+    deep_model: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class _DailyReportLookupArguments(ArgModelBase):
+    """Preserve raw lookup fields so the wrapper can reject extras."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    trade_date: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+class _DailyReportArchiveArguments(ArgModelBase):
+    """Preserve raw archive fields so the wrapper can reject extras."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    trade_date: str
+    narrative: str
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
 def _configure_analyze_crypto_tool() -> None:
     tool = MCP._tool_manager.get_tool("analyze_crypto")
     if tool is None:
@@ -897,8 +1219,21 @@ def _configure_review_paper_decision_tool() -> None:
     tool.parameters["additionalProperties"] = False
 
 
+def _configure_daily_report_tool(name: str, arguments: type[ArgModelBase]) -> None:
+    tool = MCP._tool_manager.get_tool(name)
+    if tool is None:
+        raise RuntimeError(f"{name} tool registration is unavailable")
+
+    tool.fn_metadata.arg_model = arguments
+    tool.parameters = arguments.model_json_schema()
+    tool.parameters["additionalProperties"] = False
+
+
 _configure_analyze_crypto_tool()
 _configure_review_paper_decision_tool()
+_configure_daily_report_tool("start_daily_report_batch", _DailyReportBatchArguments)
+_configure_daily_report_tool("get_daily_report_batch", _DailyReportLookupArguments)
+_configure_daily_report_tool("archive_daily_report", _DailyReportArchiveArguments)
 
 
 if __name__ == "__main__":

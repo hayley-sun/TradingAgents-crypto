@@ -13,18 +13,26 @@ from chromadb.config import Settings
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
-from tradingagents.integrations.schemas import AnalysisRequest, AnalysisResult, PriceReference
+from tradingagents.integrations.hermes_reports import ReportBatchStore
+from tradingagents.integrations.schemas import (
+    AnalysisRequest,
+    AnalysisResult,
+    AnalysisSession,
+    PriceReference,
+)
 
 from tradingagents.integrations.hermes_mcp import (
     MCP,
     PAPER_TRADING_DISCLAIMER,
     SessionStore,
     _cleanup_session_collections,
+    archive_daily_report_impl,
     execute_analysis,
     get_analysis_result_impl,
     health_check_impl,
     review_paper_decision_impl,
     run_queued_analysis,
+    start_daily_report_batch_impl,
     start_analysis,
 )
 
@@ -80,6 +88,18 @@ class HermesMcpTests(unittest.TestCase):
             quick_model="quick",
             deep_model="deep",
         )
+
+    def daily_request_data(self, **updates):
+        values = {
+            "trade_date": "2026-07-29",
+            "symbols": ["BTC"],
+            "analysts": ["market", "news"],
+            "research_depth": 1,
+            "llm_provider": "deepseek",
+            "quick_model": "deepseek-v4-flash",
+            "deep_model": "deepseek-v4-pro",
+        }
+        return {**values, **updates}
 
     def test_atomic_store_write_load_and_internal_result_lookup(self):
         with TemporaryDirectory() as temp_dir:
@@ -293,6 +313,78 @@ class HermesMcpTests(unittest.TestCase):
 
         self.assertEqual(result["ok"], False)
         self.assertEqual(result["error"]["code"], "INVALID_REVIEW_REQUEST")
+
+    def test_daily_report_batch_tool_rejects_unknown_input_before_starting_workers(self):
+        calls = []
+
+        def starter(request):
+            calls.append(request.symbol)
+            return "hermes_0123456789abcdef"
+
+        with TemporaryDirectory() as temp_dir:
+            result = start_daily_report_batch_impl(
+                self.daily_request_data(unexpected_field=True),
+                batch_store=ReportBatchStore(Path(temp_dir) / "report_batches"),
+                starter=starter,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REQUEST")
+        self.assertEqual(calls, [])
+
+    def test_daily_report_archive_refuses_active_batch(self):
+        with TemporaryDirectory() as temp_dir:
+            batch_store = ReportBatchStore(Path(temp_dir) / "report_batches")
+            session = AnalysisSession(
+                session_id="hermes_0123456789abcdef",
+                status="running",
+                created_at=datetime.now(timezone.utc),
+                request=AnalysisRequest(
+                    symbol="BTC",
+                    trade_date="2026-07-29",
+                    analysts=["market", "news"],
+                    research_depth=1,
+                    llm_provider="deepseek",
+                    quick_model="deepseek-v4-flash",
+                    deep_model="deepseek-v4-pro",
+                ),
+            )
+            start_result = start_daily_report_batch_impl(
+                self.daily_request_data(),
+                batch_store=batch_store,
+                starter=lambda _request: session.session_id,
+            )
+            result = archive_daily_report_impl(
+                "2026-07-29",
+                "Chinese narrative",
+                batch_store=batch_store,
+                session_loader=lambda _session_id: session,
+            )
+
+        self.assertTrue(start_result["ok"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "REPORT_BATCH_ACTIVE")
+
+    def test_daily_report_mcp_tools_forbid_unknown_fields(self):
+        for tool_name in (
+            "start_daily_report_batch",
+            "get_daily_report_batch",
+            "archive_daily_report",
+        ):
+            with self.subTest(tool_name=tool_name):
+                tool = MCP._tool_manager.get_tool(tool_name)
+                self.assertIsNotNone(tool)
+                self.assertIs(tool.parameters["additionalProperties"], False)
+
+        _, result = asyncio.run(
+            MCP.call_tool(
+                "start_daily_report_batch",
+                self.daily_request_data(unexpected_field=True),
+            )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REQUEST")
 
     def test_static_review_lessons_are_available_without_embeddings(self):
         memory = FinancialSituationMemory(
