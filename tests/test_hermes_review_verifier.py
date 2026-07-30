@@ -33,6 +33,20 @@ DAILY_REPORT_SKILL_PATH = (
 SERVICE_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.service"
 TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.timer"
 RUNBOOK_PATH = PROJECT_ROOT / "docs" / "hermes_integration.md"
+DAILY_REPORT_SUBMIT_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-daily-report-submit.sh"
+)
+DAILY_REPORT_ARCHIVE_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-daily-report-archive.sh"
+)
 
 
 def saved_review(results_root: Path) -> PaperDecisionReview:
@@ -193,6 +207,16 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("hermes cron resume", runbook)
         self.assertIn("results/hermes/report_batches", runbook)
         self.assertIn("results/hermes/reports", runbook)
+
+    def test_daily_report_no_agent_wrappers_are_fixed_and_secret_free(self):
+        submit = DAILY_REPORT_SUBMIT_SCRIPT.read_text(encoding="ascii")
+        archive = DAILY_REPORT_ARCHIVE_SCRIPT.read_text(encoding="ascii")
+
+        self.assertIn("hermes_daily_report_runner submit", submit)
+        self.assertIn("hermes_daily_report_runner archive", archive)
+        self.assertIn(".venv-hermes-mcp/bin/python", submit)
+        self.assertNotIn("hermes ", submit)
+        self.assertNotIn("API_KEY", submit + archive)
 
 
 if __name__ == "__main__":
