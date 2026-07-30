@@ -124,7 +124,7 @@ COINGECKO_DEMO_API_KEY=<replace-with-real-coingecko-secret-or-delete-line>
 CRYPTOCOMPARE_API_KEY=<replace-with-real-cryptocompare-secret-or-delete-line>
 ```
 
-创建 Gateway drop-in 并重启服务。`grep -q` 只检查变量名称，绝不输出其值；重启会短暂中断交互式 Gateway，会话应在此之前结束。
+创建 Gateway drop-in 并重启服务。`EnvironmentFile` 的值不会显示在 `systemctl show ... --property=Environment` 中，因此以 root 读取 Gateway 主进程环境并仅匹配变量名称；该命令绝不输出其值。重启会短暂中断交互式 Gateway，会话应在此之前结束。
 
 ```bash
 sudo install -d -o root -g root -m 755 /etc/systemd/system/hermes-gateway.service.d
@@ -135,7 +135,8 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl restart hermes-gateway.service
 sudo systemctl is-active --quiet hermes-gateway.service
-sudo systemctl show hermes-gateway.service --property=Environment | grep -q 'DEEPSEEK_API_KEY='
+gateway_pid="$(systemctl show -p MainPID --value hermes-gateway.service)"
+sudo sh -c 'tr "\0" "\n" < "/proc/$1/environ" | grep -q "^DEEPSEEK_API_KEY="' sh "$gateway_pid"
 ```
 
 ## 重载和验证
@@ -269,14 +270,14 @@ sudo systemctl is-active --quiet hermes-gateway.service
 hermes cron status
 ```
 
-替换旧任务前使用 `hermes cron list --all` 记录 job ID，并确认旧任务均为 paused。先创建并暂停 replacement job，再移除旧的 agent 驱动 job；这样创建失败时旧配置仍可保留。不得删除 batch、reports、sessions、reviews、learning indexes 或 Hermes memory。创建与暂停之间不可执行其它命令。
+替换旧任务前使用 `hermes cron list --all` 记录 job ID，并确认旧任务均为 paused。先创建并暂停 replacement job，再移除旧的 agent 驱动 job；这样创建失败时旧配置仍可保留。Hermes 仅接受相对于 `~/.hermes/scripts/` 的 `--script` 文件名，不能传安装时使用的绝对路径。不得删除 batch、reports、sessions、reviews、learning indexes 或 Hermes memory。创建与暂停之间不可执行其它命令。
 
 ```bash
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
 old_submit_job_id='<replace-with-paused-agent-submit-job-id>'
 old_archive_job_id='<replace-with-paused-agent-archive-job-id>'
-hermes cron create --name tradingagents-daily-report-submit --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh --workdir "$PROJECT_DIR" '0 8 * * *'
-hermes cron create --name tradingagents-daily-report-archive --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh --workdir "$PROJECT_DIR" '0 12 * * *'
+hermes cron create --name tradingagents-daily-report-submit --deliver local --no-agent --script tradingagents-daily-report-submit.sh --workdir "$PROJECT_DIR" '0 8 * * *'
+hermes cron create --name tradingagents-daily-report-archive --deliver local --no-agent --script tradingagents-daily-report-archive.sh --workdir "$PROJECT_DIR" '0 12 * * *'
 hermes cron list --all
 
 submit_job_id='<replace-with-new-submit-job-id-from-cron-list-all>'
