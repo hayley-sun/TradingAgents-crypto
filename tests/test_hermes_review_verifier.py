@@ -222,6 +222,16 @@ class HermesReviewVerifierTests(unittest.TestCase):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
         self.assertIn("--no-agent --script", runbook)
+        self.assertIn("--script tradingagents-daily-report-submit.sh", runbook)
+        self.assertIn("--script tradingagents-daily-report-archive.sh", runbook)
+        self.assertNotIn(
+            "--script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh",
+            runbook,
+        )
+        self.assertNotIn(
+            "--script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh",
+            runbook,
+        )
         self.assertIn("tradingagents-daily-report-submit.sh", runbook)
         self.assertIn("tradingagents-daily-report-archive.sh", runbook)
         self.assertIn("hermes cron remove", runbook)
@@ -231,6 +241,12 @@ class HermesReviewVerifierTests(unittest.TestCase):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
         self.assertIn("EnvironmentFile=/etc/tradingagents/hermes-gateway.env", runbook)
+        self.assertIn('gateway_pid="$(systemctl show -p MainPID --value hermes-gateway.service)"', runbook)
+        self.assertIn('"/proc/$1/environ"', runbook)
+        self.assertNotIn(
+            "systemctl show hermes-gateway.service --property=Environment",
+            runbook,
+        )
         self.assertIn("run_once_and_pause", runbook)
         self.assertIn('hermes cron runs "$job_id" --limit 1', runbook)
         self.assertLess(
