@@ -1,8 +1,10 @@
 import io
+import importlib
 import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
+from unittest.mock import patch
 
 from tradingagents.integrations import hermes_daily_report_runner as runner
 
@@ -73,6 +75,26 @@ class HermesDailyReportRunnerTests(unittest.TestCase):
         self.assertIn("批次状态：ready", first)
         self.assertIn("BTC：状态 completed", first)
         self.assertIn("仅用于研究和模拟交易", first)
+
+    def test_narrative_redacts_secret_like_model_output(self):
+        summary = {
+            "state": "ready",
+            "items": [
+                {
+                    "symbol": "BTC",
+                    "status": "completed",
+                    "processed_signal": "DEEPSEEK_API_KEY=visible-secret",
+                    "final_trade_decision": "token sk-1234567890abcdefgh",
+                    "error": None,
+                }
+            ],
+        }
+
+        narrative = runner.render_archive_narrative(summary, None)
+
+        self.assertNotIn("visible-secret", narrative)
+        self.assertNotIn("sk-1234567890abcdefgh", narrative)
+        self.assertIn("[REDACTED]", narrative)
 
     def test_archive_active_returns_zero_without_calling_archive(self):
         archive_called = False
@@ -149,6 +171,37 @@ class HermesDailyReportRunnerTests(unittest.TestCase):
             json.loads(stdout.getvalue())["error"]["code"],
             "INVALID_REPORT_REQUEST",
         )
+
+    def test_main_redacts_unexpected_runner_failure(self):
+        stdout = io.StringIO()
+
+        with patch.object(runner, "run_submit", side_effect=OSError("disk failure")):
+            with redirect_stdout(stdout):
+                code = runner.main(["submit", "--trade-date", "2026-07-30"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "REPORT_RUNNER_FAILED")
+        self.assertNotIn("disk failure", stdout.getvalue())
+
+    def test_bootstrap_redacts_runner_import_failure(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_daily_report_bootstrap"
+        )
+        stdout = io.StringIO()
+
+        with patch.object(
+            bootstrap,
+            "import_module",
+            side_effect=ModuleNotFoundError("private dependency path"),
+        ):
+            with redirect_stdout(stdout):
+                code = bootstrap.main(["submit"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "REPORT_RUNNER_FAILED")
+        self.assertNotIn("private dependency path", stdout.getvalue())
 
 
 if __name__ == "__main__":

@@ -99,9 +99,44 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用；它已在 Hermes 私有配置中时，不要再写入项目 `.env`、`crypto-trader.service` 或任何 systemd `EnvironmentFile`。所有值只能保存在权限为 `600` 的 Hermes 配置中，绝不可写入仓库。
+仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用。以上 `mcp_servers.*.env` 仅传给交互式 MCP stdio 子进程；它不会传给 Hermes `--no-agent --script` Cron。
 
 不得加入 `cwd`、工具 include 列表或其他未经验证的字段。这是 stdio 配置，不是 HTTP 服务。
+
+### Gateway Cron 环境
+
+无 agent 日报 submit 会启动现有的 DeepSeek 异步 worker，因此 Gateway 的 Cron 子进程必须继承 `DEEPSEEK_API_KEY`。将当前私有 Hermes 配置中的已用值镜像到 root-only 的 systemd `EnvironmentFile`；不要创建项目 `.env`，不要将该文件提交到仓库，也不要在终端、日志或本文档中打印真实值。`FINNHUB_API_KEY`、`COINGECKO_DEMO_API_KEY` 和 `CRYPTOCOMPARE_API_KEY` 仅在已配置且需要对应数据源时保留；不存在的可选项应整行删除。
+
+```bash
+sudo hermes gateway install --system --run-as-user ubuntu --start-now
+sudo install -d -o root -g root -m 700 /etc/tradingagents
+sudo install -o root -g root -m 600 /dev/null /etc/tradingagents/hermes-gateway.env
+sudoedit /etc/tradingagents/hermes-gateway.env
+```
+
+在编辑器中使用 systemd `EnvironmentFile` 语法（不使用 `export`），写入 `TRADINGAGENTS_RESULTS_DIR`、必需的 DeepSeek 值和当前已用的可选数据源值：
+
+```text
+TRADINGAGENTS_RESULTS_DIR=/home/ubuntu/workspace/TradingAgents-crypto/results
+DEEPSEEK_API_KEY=<replace-with-real-deepseek-secret>
+FINNHUB_API_KEY=<replace-with-real-finnhub-secret-or-delete-line>
+COINGECKO_DEMO_API_KEY=<replace-with-real-coingecko-secret-or-delete-line>
+CRYPTOCOMPARE_API_KEY=<replace-with-real-cryptocompare-secret-or-delete-line>
+```
+
+创建 Gateway drop-in 并重启服务。`grep -q` 只检查变量名称，绝不输出其值；重启会短暂中断交互式 Gateway，会话应在此之前结束。
+
+```bash
+sudo install -d -o root -g root -m 755 /etc/systemd/system/hermes-gateway.service.d
+sudo tee /etc/systemd/system/hermes-gateway.service.d/tradingagents-env.conf >/dev/null <<'EOF'
+[Service]
+EnvironmentFile=/etc/tradingagents/hermes-gateway.env
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart hermes-gateway.service
+sudo systemctl is-active --quiet hermes-gateway.service
+sudo systemctl show hermes-gateway.service --property=Environment | grep -q 'DEEPSEEK_API_KEY='
+```
 
 ## 重载和验证
 
@@ -215,65 +250,95 @@ sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
 
 ## 每日研究报告 Cron
 
-每日报告由两个短 Hermes Cron job 组成。08:00 任务只提交 BTC、ETH、SOL 的异步研究批次；12:00 任务读取已持久化的会话并在所有会话终态时归档一份 Markdown 报告。它们均使用云主机 `Asia/Shanghai` 时区、Hermes 本地投递和项目结果目录，不配置 Telegram、Discord、邮件或其他外部投递。
+每日报告由两个无 agent 的 Hermes Cron job 组成。08:00 任务只提交 BTC、ETH、SOL 的异步研究批次；12:00 任务读取已持久化的会话并在所有会话终态时归档一份 Markdown 报告。它们均使用云主机 `Asia/Shanghai` 时区、Hermes 本地投递和项目结果目录，不配置 Telegram、Discord、邮件或其他外部投递。
 
 报告批次持久化到 `results/hermes/report_batches/<YYYY-MM-DD>.json`，归档保存为 `results/hermes/reports/<YYYY-MM-DD>.md`。同一天、同一配置的提交会返回既有批次，不会重复启动 worker。报告只能在所有会话已完成或失败时生成；有失败的终态批次生成标记为 degraded 的报告，不会自动重试。报告文件权限为 `600`，相同内容重试返回既有归档，不同内容不能覆盖历史报告。
 
-定时任务依赖 Hermes Gateway。先安装受版本控制的 skill，再以 `ubuntu` 用户安装并启动系统级 Gateway。不要为 Gateway 创建 `EnvironmentFile` 或在其中加入任何密钥；密钥仍只位于权限为 `600` 的 `/home/ubuntu/.hermes/config.yaml`。
+两个 Cron job 使用 Hermes `--no-agent` 直接运行项目内的确定性 runner。它们不会调用 Hermes 控制模型、不会启动 MCP stdio client，也不会使用 daily-report skill；submit 按既有设计仅创建后台 DeepSeek 分析 worker。runner 只复用项目既有的批次、会话和不可变归档实现；归档 narrative 由安全的持久化结果确定性生成。交互式 `/tradingagents-daily-report` skill 仅供人工 Hermes 会话使用，保留但不由 Cron 附加。
+
+定时任务依赖已按上节配置 `EnvironmentFile` 的 Hermes Gateway。安装交互式 skill 和无 agent scripts 后，以 `ubuntu` 用户确认 Gateway 已运行。wrapper 本身不读取密钥文件，Cron 仅从 Gateway 进程继承环境。
 
 ```bash
 cd /home/ubuntu/workspace/TradingAgents-crypto
 install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-daily-report
 install -m 600 deploy/hermes/skills/tradingagents-daily-report/SKILL.md /home/ubuntu/.hermes/skills/tradingagents-daily-report/SKILL.md
-sudo hermes gateway install --system --run-as-user ubuntu --start-now
+install -d -m 700 /home/ubuntu/.hermes/scripts
+install -m 700 deploy/hermes/scripts/tradingagents-daily-report-submit.sh /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh
+install -m 700 deploy/hermes/scripts/tradingagents-daily-report-archive.sh /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh
+sudo systemctl is-active --quiet hermes-gateway.service
 hermes cron status
 ```
 
-创建 job 前确认 `hermes cron list` 没有同名 job。下列命令创建后立即暂停，避免在人工验收前按计划执行。Cron prompt 只调用 MCP 工具，绝不调用复盘、Hermes 长期记忆、交易所凭据或外部消息发送。
+替换旧任务前使用 `hermes cron list --all` 记录 job ID，并确认旧任务均为 paused。先创建并暂停 replacement job，再移除旧的 agent 驱动 job；这样创建失败时旧配置仍可保留。不得删除 batch、reports、sessions、reviews、learning indexes 或 Hermes memory。创建与暂停之间不可执行其它命令。
 
 ```bash
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
-SUBMIT_PROMPT='Run /tradingagents-daily-report in Submit Mode for the current Asia/Shanghai date. Do not poll or retry.'
-ARCHIVE_PROMPT='Run /tradingagents-daily-report in Archive Mode for the current Asia/Shanghai date. If active, stop without writing.'
+old_submit_job_id='<replace-with-paused-agent-submit-job-id>'
+old_archive_job_id='<replace-with-paused-agent-archive-job-id>'
+hermes cron create --name tradingagents-daily-report-submit --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh --workdir "$PROJECT_DIR" '0 8 * * *'
+hermes cron create --name tradingagents-daily-report-archive --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh --workdir "$PROJECT_DIR" '0 12 * * *'
+hermes cron list --all
 
-hermes cron create --name tradingagents-daily-report-submit --deliver local --skill tradingagents-daily-report --workdir "$PROJECT_DIR" '0 8 * * *' "$SUBMIT_PROMPT"
-hermes cron create --name tradingagents-daily-report-archive --deliver local --skill tradingagents-daily-report --workdir "$PROJECT_DIR" '0 12 * * *' "$ARCHIVE_PROMPT"
-hermes cron list
-
-submit_job_id='<replace-with-submit-job-id-from-cron-list>'
-archive_job_id='<replace-with-archive-job-id-from-cron-list>'
+submit_job_id='<replace-with-new-submit-job-id-from-cron-list-all>'
+archive_job_id='<replace-with-new-archive-job-id-from-cron-list-all>'
 hermes cron pause "$submit_job_id"
 hermes cron pause "$archive_job_id"
+hermes cron list --all
+hermes cron remove "$old_submit_job_id"
+hermes cron remove "$old_archive_job_id"
 ```
 
-在首次启用前依次手动验证。为手动触发而临时恢复 job 后，应在该次 run 结束后立即再次暂停。提交 job 成功只会创建批次和后台 worker；它不是实时分析等待器。等待所有会话达到终态后，再运行归档 job。使用 `hermes cron runs` 查看持久化执行记录；当归档 job 报告 active 时，不得手工创建部分报告或让 agent 使用终端写文件。
+在首次启用前依次手动验证。`hermes cron run` 只把任务安排到下一次 scheduler tick，不会同步等待；因此必须等待新的 durable execution 达到终态后再暂停 job。无 agent submit 成功只会创建批次和后台 worker；它不是实时分析等待器。runner 对成功、active archive 等正常状态输出单行 JSON，其他安全错误返回非零退出码。等待所有会话达到终态后，再运行 terminal archive。使用 `hermes cron runs` 查看持久化执行记录；当 archive job 输出 active 时，不得手工创建部分报告或让 agent 使用终端写文件。
 
 ```bash
-hermes cron resume "$submit_job_id"
-hermes cron run "$submit_job_id" --accept-hooks
-hermes cron pause "$submit_job_id"
-hermes cron runs "$submit_job_id"
+set -e
+run_once_and_pause() {
+  local job_id="$1" before current
+  before="$(hermes cron runs "$job_id" --limit 1 2>&1 || true)"
+  hermes cron resume "$job_id"
+  hermes cron run "$job_id"
+  for _ in $(seq 1 60); do
+    current="$(hermes cron runs "$job_id" --limit 1 2>&1 || true)"
+    if [ "$current" != "$before" ] && printf '%s\n' "$current" | grep -Eq '[[:space:]](completed|failed)[[:space:]]'; then
+      hermes cron pause "$job_id"
+      printf '%s\n' "$current"
+      if printf '%s\n' "$current" | grep -Eq '[[:space:]]failed[[:space:]]'; then return 1; fi
+      return 0
+    fi
+    sleep 2
+  done
+  hermes cron pause "$job_id"
+  echo "Cron run did not reach a terminal state before timeout" >&2
+  return 1
+}
 
-# 等待已提交的异步 session 全部终态后执行。
-hermes cron resume "$archive_job_id"
-hermes cron run "$archive_job_id" --accept-hooks
-hermes cron pause "$archive_job_id"
-hermes cron runs "$archive_job_id"
+run_once_and_pause "$submit_job_id"
+
+# 提交后立即验证批次已创建，并确认此时没有报告。
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports -maxdepth 1 -type f -name '*.md' -printf '%m %f\n'
+
+# 在 session 仍为 queued 或 running 时验证 active archive 不写报告。
+run_once_and_pause "$archive_job_id"
+
+# 等待已提交的异步 session 全部终态后执行 terminal archive。
+run_once_and_pause "$archive_job_id"
 
 find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
 find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports -maxdepth 1 -type f -name '*.md' -printf '%m %f\n'
+test "$(find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reports -maxdepth 1 -type f -name '*.md' -printf '%m\n' | sort -u)" = "600"
 ```
 
-确认提交和归档记录均正常、归档文件权限为 `600`、且报告包含研究和模拟交易声明后，恢复两个 job：
+确认 submit、active archive 与 terminal archive 记录均正常，归档文件权限为 `600`，且报告包含研究和模拟交易声明后，恢复两个 job：
 
 ```bash
 hermes cron resume "$submit_job_id"
 hermes cron resume "$archive_job_id"
 hermes cron status
-hermes cron list
+hermes cron list --all
 ```
 
-日常观测使用 `hermes cron status`、`hermes cron list` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
+日常观测使用 `hermes cron status`、`hermes cron list --all` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
 
 ## 会话存储和故障处理
 
@@ -282,7 +347,7 @@ hermes cron list
 | 错误代码 | 操作员处理 |
 | --- | --- |
 | `INVALID_REQUEST` | 更正必填分析字段、提供商、模型、交易对或日期后重试。 |
-| `MISSING_API_KEY` | 仅向私有 Hermes 配置添加已选提供商的真实密钥，然后重载 MCP。 |
+| `MISSING_API_KEY` | 交互式 MCP：更新私有 Hermes 配置后重载 MCP。无 agent 日报：更新 root-only Gateway `EnvironmentFile` 后重启 `hermes-gateway.service`；不得写入项目 `.env`。 |
 | `SESSION_STORE_UNAVAILABLE` | 检查 `TRADINGAGENTS_RESULTS_DIR`、目录所有者、可用空间及结果目录是否可创建。 |
 | `SESSION_WRITE_FAILED` | 检查 `results/hermes/sessions` 的写权限和存储健康状况，然后重试。 |
 | `INVALID_SESSION_ID` | 使用 `analyze_crypto` 返回的不透明 `hermes_<hex>` 会话 ID；不得手工猜测或修改该 ID。 |

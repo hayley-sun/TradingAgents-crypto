@@ -4,7 +4,7 @@
 
 **Goal:** Replace LLM-driven daily-report Cron jobs with deterministic Hermes \`--no-agent\` scripts that submit and archive local paper-trading reports safely.
 
-**Architecture:** A small command module is the only adapter between Hermes scripts and the existing report implementation. It computes an Asia/Shanghai trade date, invokes existing internal submit/lookup/archive functions, renders a bounded deterministic Chinese narrative, and emits one safe JSON envelope. Version-controlled shell wrappers invoke the module through the project virtual environment; the runbook replaces the paused agent jobs with paused no-agent jobs.
+**Architecture:** A standard-library bootstrap is the only boundary between Hermes scripts and the runner, so import failures still return a safe JSON envelope. The runner computes an Asia/Shanghai trade date, invokes existing internal submit/lookup/archive functions, and renders a bounded deterministic Chinese narrative with secret-like-token redaction. Version-controlled shell wrappers invoke the bootstrap through the project virtual environment; a root-only Gateway \`EnvironmentFile\` supplies the values required by the detached analysis workers, and the runbook creates and pauses replacement jobs before removing paused agent jobs.
 
 **Tech Stack:** Python 3.10+, stdlib \`argparse\`/\`json\`/\`zoneinfo\`, existing Pydantic report schemas and MCP implementation, Bash, Hermes Agent Cron, \`unittest\`.
 
@@ -14,6 +14,7 @@
 
 | File | Responsibility |
 | --- | --- |
+| \`tradingagents/integrations/hermes_daily_report_bootstrap.py\` | Standard-library bootstrap that turns runner import failures into safe JSON. |
 | \`tradingagents/integrations/hermes_daily_report_runner.py\` | Deterministic submit/archive CLI, date normalization, safe JSON output, bounded Chinese narrative. |
 | \`tests/test_hermes_daily_report_runner.py\` | Unit tests without real workers, providers, or writes outside temporary directories. |
 | \`deploy/hermes/scripts/tradingagents-daily-report-submit.sh\` | Owner-executable no-agent wrapper for submit mode. |
@@ -356,8 +357,8 @@ def test_daily_report_no_agent_wrappers_are_fixed_and_secret_free(self):
     submit = SUBMIT_SCRIPT.read_text(encoding="ascii")
     archive = ARCHIVE_SCRIPT.read_text(encoding="ascii")
 
-    self.assertIn("hermes_daily_report_runner submit", submit)
-    self.assertIn("hermes_daily_report_runner archive", archive)
+    self.assertIn("hermes_daily_report_bootstrap submit", submit)
+    self.assertIn("hermes_daily_report_bootstrap archive", archive)
     self.assertIn(".venv-hermes-mcp/bin/python", submit)
     self.assertNotIn("hermes ", submit)
     self.assertNotIn("API_KEY", submit + archive)
@@ -378,7 +379,7 @@ Expected: failure because the wrappers do not exist.
 set -euo pipefail
 
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
-exec "$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m tradingagents.integrations.hermes_daily_report_runner submit "$@"
+exec "$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m tradingagents.integrations.hermes_daily_report_bootstrap submit "$@"
 ~~~
 
 Create the archive wrapper with the same body except for the final \`archive\`
@@ -430,18 +431,21 @@ install -d -m 700 /home/ubuntu/.hermes/scripts
 install -m 700 deploy/hermes/scripts/tradingagents-daily-report-submit.sh /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh
 install -m 700 deploy/hermes/scripts/tradingagents-daily-report-archive.sh /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh
 
-hermes cron remove '<old-agent-submit-job-id>'
-hermes cron remove '<old-agent-archive-job-id>'
 hermes cron create --name tradingagents-daily-report-submit --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-submit.sh --workdir /home/ubuntu/workspace/TradingAgents-crypto '0 8 * * *'
 hermes cron create --name tradingagents-daily-report-archive --deliver local --no-agent --script /home/ubuntu/.hermes/scripts/tradingagents-daily-report-archive.sh --workdir /home/ubuntu/workspace/TradingAgents-crypto '0 12 * * *'
+hermes cron pause '<new-submit-job-id>'
+hermes cron pause '<new-archive-job-id>'
+hermes cron remove '<old-agent-submit-job-id>'
+hermes cron remove '<old-agent-archive-job-id>'
 ~~~
 
-Immediately pause both created jobs. Document manual submit, active archive,
-terminal archive, JSON output, batch/report paths, and mode-600 report checks.
-State that no-agent jobs do not attach a skill; retain the interactive skill
-for manual operator use. Keep keys only in
-\`/home/ubuntu/.hermes/config.yaml\`; do not add an \`.env\` or
-\`EnvironmentFile\`.
+Immediately pause both created jobs. Document a root-only
+\`/etc/tradingagents/hermes-gateway.env\` and its \`hermes-gateway.service\`
+drop-in so no-agent scripts inherit the required values without reading a
+project \`.env\`. Document manual submit, active archive, terminal archive,
+JSON output, batch/report paths, mode-600 report checks, and durable-run
+polling before each job is paused. State that no-agent jobs do not attach a
+skill; retain the interactive skill for manual operator use.
 
 - [ ] **Step 4: Run static tests and full regression.**
 
@@ -465,4 +469,3 @@ git log --oneline origin/main..HEAD
 
 Expected: a clean worktree with focused implementation commits ready for a new
 PR. Do not replace the cloud jobs until the PR has been reviewed and merged.
-

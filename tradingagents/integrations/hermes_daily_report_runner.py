@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable
 from datetime import date, datetime
@@ -16,6 +17,10 @@ from tradingagents.integrations.hermes_mcp import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)\s*[:=]\s*[^\s,;]+"
+)
+_SECRET_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 FIXED_REQUEST = {
     "symbols": ["BTC", "ETH", "SOL"],
     "analysts": ["market", "news", "fundamentals"],
@@ -50,6 +55,8 @@ def run_submit(
 
 def _short(value: object, limit: int = 500) -> str:
     text = str(value or "不可用").replace("\r", " ").replace("\n", " ").strip()
+    text = _SECRET_ASSIGNMENT.sub(r"\1=[REDACTED]", text)
+    text = _SECRET_TOKEN.sub("[REDACTED]", text)
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
@@ -136,6 +143,18 @@ def _invalid_request() -> dict[str, Any]:
     }
 
 
+def _runner_failure(mode: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "mode": mode,
+        "error": {
+            "code": "REPORT_RUNNER_FAILED",
+            "message": "The daily report command could not complete.",
+            "suggested_action": "Inspect the safe Cron result and retry later.",
+        },
+    }
+
+
 class _SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise ValueError(message)
@@ -163,11 +182,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
 
-    code, payload = (
-        run_submit(trade_date)
-        if arguments.mode == "submit"
-        else run_archive(trade_date)
-    )
+    try:
+        code, payload = (
+            run_submit(trade_date)
+            if arguments.mode == "submit"
+            else run_archive(trade_date)
+        )
+    except Exception:
+        code, payload = 1, _runner_failure(arguments.mode)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return code
 
