@@ -99,44 +99,30 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用。以上 `mcp_servers.*.env` 仅传给交互式 MCP stdio 子进程；它不会传给 Hermes `--no-agent --script` Cron。
+仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用。
 
 不得加入 `cwd`、工具 include 列表或其他未经验证的字段。这是 stdio 配置，不是 HTTP 服务。
 
-### Gateway Cron 环境
+### No-Agent Cron 配置
 
-无 agent 日报 submit 会启动现有的 DeepSeek 异步 worker，因此 Gateway 的 Cron 子进程必须继承 `DEEPSEEK_API_KEY`。将当前私有 Hermes 配置中的已用值镜像到 root-only 的 systemd `EnvironmentFile`；不要创建项目 `.env`，不要将该文件提交到仓库，也不要在终端、日志或本文档中打印真实值。`FINNHUB_API_KEY`、`COINGECKO_DEMO_API_KEY` 和 `CRYPTOCOMPARE_API_KEY` 仅在已配置且需要对应数据源时保留；不存在的可选项应整行删除。
+Hermes 有意从 Cron 脚本子进程中剥离 provider 密钥，`EnvironmentFile` 和 `terminal.env_passthrough` 都不能改变这一安全边界。受版本控制的 `hermes_daily_report_bootstrap` 在导入 runner 前，从 `mcp_servers.tradingagents_crypto.env` 加载白名单值：`TRADINGAGENTS_RESULTS_DIR`、`DEEPSEEK_API_KEY`、`FINNHUB_API_KEY`、`COINGECKO_DEMO_API_KEY`、`COINGECKO_PRO_API_KEY` 和 `CRYPTOCOMPARE_API_KEY`。它只读取当前 `ubuntu` 用户的 `600` Hermes 配置，不写入项目 `.env`、第二份密钥文件、日志或 Cron 输出。
+
+首次部署或 Gateway 未运行时，使用系统服务安装并启动 Gateway：
 
 ```bash
 sudo hermes gateway install --system --run-as-user ubuntu --start-now
-sudo install -d -o root -g root -m 700 /etc/tradingagents
-sudo install -o root -g root -m 600 /dev/null /etc/tradingagents/hermes-gateway.env
-sudoedit /etc/tradingagents/hermes-gateway.env
 ```
 
-在编辑器中使用 systemd `EnvironmentFile` 语法（不使用 `export`），写入 `TRADINGAGENTS_RESULTS_DIR`、必需的 DeepSeek 值和当前已用的可选数据源值：
-
-```text
-TRADINGAGENTS_RESULTS_DIR=/home/ubuntu/workspace/TradingAgents-crypto/results
-DEEPSEEK_API_KEY=<replace-with-real-deepseek-secret>
-FINNHUB_API_KEY=<replace-with-real-finnhub-secret-or-delete-line>
-COINGECKO_DEMO_API_KEY=<replace-with-real-coingecko-secret-or-delete-line>
-CRYPTOCOMPARE_API_KEY=<replace-with-real-cryptocompare-secret-or-delete-line>
-```
-
-创建 Gateway drop-in 并重启服务。`EnvironmentFile` 的值不会显示在 `systemctl show ... --property=Environment` 中，因此以 root 读取 Gateway 主进程环境并仅匹配变量名称；该命令绝不输出其值。重启会短暂中断交互式 Gateway，会话应在此之前结束。
+已经安装过旧版 systemd 凭据副本时，在部署包含 bootstrap 修复的已评审提交后移除它。重启会短暂中断交互式 Gateway，会话应在此之前结束；以下命令不输出任何密钥：
 
 ```bash
-sudo install -d -o root -g root -m 755 /etc/systemd/system/hermes-gateway.service.d
-sudo tee /etc/systemd/system/hermes-gateway.service.d/tradingagents-env.conf >/dev/null <<'EOF'
-[Service]
-EnvironmentFile=/etc/tradingagents/hermes-gateway.env
-EOF
+sudo rm -f /etc/systemd/system/hermes-gateway.service.d/tradingagents-env.conf
+sudo rm -f /etc/tradingagents/hermes-gateway.env
+sudo rmdir /etc/tradingagents 2>/dev/null || true
 sudo systemctl daemon-reload
 sudo systemctl restart hermes-gateway.service
 sudo systemctl is-active --quiet hermes-gateway.service
-gateway_pid="$(systemctl show -p MainPID --value hermes-gateway.service)"
-sudo sh -c 'tr "\0" "\n" < "/proc/$1/environ" | grep -q "^DEEPSEEK_API_KEY="' sh "$gateway_pid"
+test "$(stat -c '%a' /home/ubuntu/.hermes/config.yaml)" = "600"
 ```
 
 ## 重载和验证
@@ -257,7 +243,7 @@ sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
 
 两个 Cron job 使用 Hermes `--no-agent` 直接运行项目内的确定性 runner。它们不会调用 Hermes 控制模型、不会启动 MCP stdio client，也不会使用 daily-report skill；submit 按既有设计仅创建后台 DeepSeek 分析 worker。runner 只复用项目既有的批次、会话和不可变归档实现；归档 narrative 由安全的持久化结果确定性生成。交互式 `/tradingagents-daily-report` skill 仅供人工 Hermes 会话使用，保留但不由 Cron 附加。
 
-定时任务依赖已按上节配置 `EnvironmentFile` 的 Hermes Gateway。安装交互式 skill 和无 agent scripts 后，以 `ubuntu` 用户确认 Gateway 已运行。wrapper 本身不读取密钥文件，Cron 仅从 Gateway 进程继承环境。
+定时任务依赖上节的 `600` Hermes 配置。每个 wrapper 只调用 bootstrap；bootstrap 在导入 runner 前读取 `mcp_servers.tradingagents_crypto.env` 的固定白名单，因此不会依赖被 Hermes 清洗的 Gateway 子进程环境。安装交互式 skill 和无 agent scripts 后，以 `ubuntu` 用户确认 Gateway 已运行。
 
 ```bash
 cd /home/ubuntu/workspace/TradingAgents-crypto
@@ -339,6 +325,8 @@ hermes cron status
 hermes cron list --all
 ```
 
+首次修复凭据加载时，不得修改已经创建的当天 batch。保留两个生产 job 为 paused，并使用不晚于当前日期、且 `report_batches` 中不存在的历史日期创建临时历史日期无 agent job。临时 wrapper 只向现有 bootstrap 传入 `--trade-date`，不包含密钥；临时 job 必须在每次运行后暂停。依次验证 submit 创建三个 session、session 为 queued 或 running 时 archive 输出 active 且不创建报告、全部终态后 archive 创建一份权限 `600` 且包含研究和模拟交易声明的报告。完成后删除临时 job 和临时 wrapper；只有全部通过后才恢复生产 job。
+
 日常观测使用 `hermes cron status`、`hermes cron list --all` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
 
 ## 会话存储和故障处理
@@ -348,7 +336,7 @@ hermes cron list --all
 | 错误代码 | 操作员处理 |
 | --- | --- |
 | `INVALID_REQUEST` | 更正必填分析字段、提供商、模型、交易对或日期后重试。 |
-| `MISSING_API_KEY` | 交互式 MCP：更新私有 Hermes 配置后重载 MCP。无 agent 日报：更新 root-only Gateway `EnvironmentFile` 后重启 `hermes-gateway.service`；不得写入项目 `.env`。 |
+| `MISSING_API_KEY` | 更新私有 Hermes 配置中 `mcp_servers.tradingagents_crypto.env` 的必需值，保持配置权限为 `600`，然后使用新的交易日期重试。无 agent bootstrap 会在每次运行前读取该白名单；不得写入项目 `.env` 或创建第二份密钥文件。 |
 | `SESSION_STORE_UNAVAILABLE` | 检查 `TRADINGAGENTS_RESULTS_DIR`、目录所有者、可用空间及结果目录是否可创建。 |
 | `SESSION_WRITE_FAILED` | 检查 `results/hermes/sessions` 的写权限和存储健康状况，然后重试。 |
 | `INVALID_SESSION_ID` | 使用 `analyze_crypto` 返回的不透明 `hermes_<hex>` 会话 ID；不得手工猜测或修改该 ID。 |

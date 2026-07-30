@@ -4,6 +4,8 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from tradingagents.integrations import hermes_daily_report_runner as runner
@@ -202,6 +204,96 @@ class HermesDailyReportRunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(payload["error"]["code"], "REPORT_RUNNER_FAILED")
         self.assertNotIn("private dependency path", stdout.getvalue())
+
+    def test_bootstrap_loads_only_tradingagents_config_environment(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_daily_report_bootstrap"
+        )
+        config_text = """
+mcp_servers:
+  tradingagents_crypto:
+    env:
+      TRADINGAGENTS_RESULTS_DIR: /tmp/tradingagents-results
+      DEEPSEEK_API_KEY: test-deepseek-key
+      CRYPTOCOMPARE_API_KEY: test-cryptocompare-key
+      UNRELATED_VALUE: must-not-be-loaded
+  another_server:
+    env:
+      DEEPSEEK_API_KEY: wrong-key
+"""
+
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(config_text, encoding="utf-8")
+            environment = {"EXISTING": "value"}
+
+            loaded = bootstrap.load_tradingagents_cron_environment(
+                config_path, environment
+            )
+
+        self.assertTrue(loaded)
+        self.assertEqual(environment["EXISTING"], "value")
+        self.assertEqual(
+            environment["TRADINGAGENTS_RESULTS_DIR"],
+            "/tmp/tradingagents-results",
+        )
+        self.assertEqual(environment["DEEPSEEK_API_KEY"], "test-deepseek-key")
+        self.assertEqual(
+            environment["CRYPTOCOMPARE_API_KEY"], "test-cryptocompare-key"
+        )
+        self.assertNotIn("UNRELATED_VALUE", environment)
+
+    def test_bootstrap_invalid_config_does_not_mutate_environment(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_daily_report_bootstrap"
+        )
+
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text("mcp_servers: [", encoding="utf-8")
+            environment = {"EXISTING": "value"}
+
+            loaded = bootstrap.load_tradingagents_cron_environment(
+                config_path, environment
+            )
+
+        self.assertFalse(loaded)
+        self.assertEqual(environment, {"EXISTING": "value"})
+
+    def test_bootstrap_loads_environment_before_importing_runner(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_daily_report_bootstrap"
+        )
+        events = []
+
+        class FakeRunner:
+            @staticmethod
+            def main(arguments):
+                events.append(("runner", arguments))
+                return 0
+
+        def load_environment():
+            events.append(("load", None))
+            return True
+
+        def import_runner(module_name):
+            events.append(("import", module_name))
+            return FakeRunner
+
+        with patch.object(
+            bootstrap, "_load_default_cron_environment", side_effect=load_environment
+        ), patch.object(bootstrap, "import_module", side_effect=import_runner):
+            code = bootstrap.main(["submit"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            events,
+            [
+                ("load", None),
+                ("import", "tradingagents.integrations.hermes_daily_report_runner"),
+                ("runner", ["submit"]),
+            ],
+        )
 
 
 if __name__ == "__main__":
