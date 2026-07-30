@@ -237,14 +237,14 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("hermes cron remove", runbook)
         self.assertNotIn("--skill tradingagents-daily-report", runbook)
 
-    def test_daily_report_runbook_configures_gateway_environment_and_waits_for_runs(self):
+    def test_daily_report_runbook_loads_bootstrap_config_and_waits_for_runs(self):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("EnvironmentFile=/etc/tradingagents/hermes-gateway.env", runbook)
-        self.assertIn('gateway_pid="$(systemctl show -p MainPID --value hermes-gateway.service)"', runbook)
-        self.assertIn('"/proc/$1/environ"', runbook)
+        self.assertIn("从 `mcp_servers.tradingagents_crypto.env` 加载白名单值", runbook)
+        self.assertIn("mcp_servers.tradingagents_crypto.env", runbook)
+        self.assertIn("临时历史日期无 agent job", runbook)
         self.assertNotIn(
-            "systemctl show hermes-gateway.service --property=Environment",
+            "EnvironmentFile=/etc/tradingagents/hermes-gateway.env",
             runbook,
         )
         self.assertIn("run_once_and_pause", runbook)
