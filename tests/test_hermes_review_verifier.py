@@ -33,6 +33,20 @@ DAILY_REPORT_SKILL_PATH = (
 SERVICE_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.service"
 TIMER_PATH = PROJECT_ROOT / "deploy" / "systemd" / "tradingagents-hermes-maintenance.timer"
 RUNBOOK_PATH = PROJECT_ROOT / "docs" / "hermes_integration.md"
+DAILY_REPORT_SUBMIT_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-daily-report-submit.sh"
+)
+DAILY_REPORT_ARCHIVE_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-daily-report-archive.sh"
+)
 
 
 def saved_review(results_root: Path) -> PaperDecisionReview:
@@ -193,6 +207,44 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("hermes cron resume", runbook)
         self.assertIn("results/hermes/report_batches", runbook)
         self.assertIn("results/hermes/reports", runbook)
+
+    def test_daily_report_no_agent_wrappers_are_fixed_and_secret_free(self):
+        submit = DAILY_REPORT_SUBMIT_SCRIPT.read_text(encoding="ascii")
+        archive = DAILY_REPORT_ARCHIVE_SCRIPT.read_text(encoding="ascii")
+
+        self.assertIn("hermes_daily_report_bootstrap submit", submit)
+        self.assertIn("hermes_daily_report_bootstrap archive", archive)
+        self.assertIn(".venv-hermes-mcp/bin/python", submit)
+        self.assertNotIn("hermes ", submit)
+        self.assertNotIn("API_KEY", submit + archive)
+
+    def test_daily_report_runbook_uses_paused_no_agent_local_jobs(self):
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("--no-agent --script", runbook)
+        self.assertIn("tradingagents-daily-report-submit.sh", runbook)
+        self.assertIn("tradingagents-daily-report-archive.sh", runbook)
+        self.assertIn("hermes cron remove", runbook)
+        self.assertNotIn("--skill tradingagents-daily-report", runbook)
+
+    def test_daily_report_runbook_configures_gateway_environment_and_waits_for_runs(self):
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("EnvironmentFile=/etc/tradingagents/hermes-gateway.env", runbook)
+        self.assertIn("run_once_and_pause", runbook)
+        self.assertIn('hermes cron runs "$job_id" --limit 1', runbook)
+        self.assertLess(
+            runbook.index('hermes cron pause "$submit_job_id"'),
+            runbook.index('hermes cron remove "$old_submit_job_id"'),
+        )
+        self.assertLess(
+            runbook.index('hermes cron pause "$archive_job_id"'),
+            runbook.index('hermes cron remove "$old_archive_job_id"'),
+        )
+        self.assertLess(
+            runbook.index("hermes cron create --name tradingagents-daily-report-submit"),
+            runbook.index('hermes cron remove "$old_submit_job_id"'),
+        )
 
 
 if __name__ == "__main__":
