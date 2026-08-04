@@ -218,6 +218,22 @@ class HermesMcpTests(unittest.TestCase):
         self.assertNotIn(str(loop), json.dumps(result))
         self.assertNotIn("Symlink loop", json.dumps(result))
 
+    def test_session_store_rejects_self_referential_link_without_resolve_error(self):
+        with TemporaryDirectory() as temp_dir:
+            loop = Path(temp_dir) / "loop"
+            loop.symlink_to(loop)
+            with patch.dict(
+                os.environ,
+                {"TRADINGAGENTS_RESULTS_DIR": str(loop)},
+                clear=True,
+            ), patch.object(
+                Path,
+                "resolve",
+                return_value=loop / "hermes" / "sessions",
+            ):
+                with self.assertRaises(RuntimeError):
+                    SessionStore.from_environment()
+
     def test_result_contains_session_store_resolution_errors(self):
         with TemporaryDirectory() as temp_dir:
             loop = Path(temp_dir) / "loop"

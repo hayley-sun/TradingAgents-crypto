@@ -86,11 +86,25 @@ def failure(error: ToolError) -> dict[str, Any]:
     return {"ok": False, "error": error.model_dump(mode="json")}
 
 
+def _reject_self_referential_symlinks(path: Path) -> None:
+    candidate = path.absolute()
+    while candidate != candidate.parent:
+        if candidate.is_symlink():
+            target = Path(os.readlink(candidate))
+            if not target.is_absolute():
+                target = candidate.parent / target
+            if target.absolute() == candidate:
+                raise RuntimeError("symbolic link loop")
+        candidate = candidate.parent
+
+
 class SessionStore:
     """Filesystem-backed storage for opaque Hermes analysis sessions."""
 
     def __init__(self, root: Path):
-        self.root = Path(root).expanduser().resolve()
+        configured_root = Path(root).expanduser()
+        _reject_self_referential_symlinks(configured_root)
+        self.root = configured_root.resolve()
 
     @classmethod
     def from_environment(cls) -> "SessionStore":
