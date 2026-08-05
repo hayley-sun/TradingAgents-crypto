@@ -1,6 +1,14 @@
 import time
 import json
 
+REPORT_LESSON_INSTRUCTION = (
+    "Treat report-level lessons as evidence-bounded historical hypotheses. Assess whether each lesson "
+    "applies to the current market context, explain any mismatch, and do not let historical outcomes "
+    "override current evidence or mechanically force BUY, SELL, or HOLD. In applying them, assess "
+    "whether each historical lesson applies to the current market context. Treat them as evidence-bounded "
+    "hypotheses rather than rules. Historical lessons must not override current evidence."
+)
+
 
 def create_risk_manager(llm, memory):
     def risk_manager_node(state) -> dict:
@@ -29,6 +37,8 @@ Guidelines for Decision-Making:
 2. **Provide Rationale**: Support your recommendation with direct quotes and counterarguments from the debate.
 3. **Refine the Trader's Plan**: Start with the trader's original plan, **{trader_plan}**, and adjust it based on the analysts' insights.
 4. **Learn from Past Mistakes**: Use lessons from **{past_memory_str}** to address prior misjudgments and improve the decision you are making now to make sure you don't make a wrong BUY/SELL/HOLD call that loses money.
+
+{REPORT_LESSON_INSTRUCTION}
 
 Deliverables:
 - A clear and actionable recommendation: Buy, Sell, or Hold.

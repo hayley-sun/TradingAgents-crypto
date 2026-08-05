@@ -1,6 +1,14 @@
 import time
 import json
 
+REPORT_LESSON_INSTRUCTION = (
+    "Treat report-level lessons as evidence-bounded historical hypotheses. Assess whether each lesson "
+    "applies to the current market context, explain any mismatch, and do not let historical outcomes "
+    "override current evidence or mechanically force BUY, SELL, or HOLD. In applying them, assess "
+    "whether each historical lesson applies to the current market context. Treat them as evidence-bounded "
+    "hypotheses rather than rules. Historical lessons must not override current evidence."
+)
+
 
 def create_research_manager(llm, memory):
     def research_manager_node(state) -> dict:
@@ -32,6 +40,8 @@ Take into account your past mistakes on similar situations. Use these insights t
 
 Here are your past reflections on mistakes:
 \"{past_memory_str}\"
+
+{REPORT_LESSON_INSTRUCTION}
 
 Here is the debate:
 Debate History:

@@ -614,7 +614,7 @@ def _resolve_review_price_references(
     return entry_price, review_price
 
 
-def _load_review_lessons(symbol: str) -> list[str]:
+def _load_learning_lessons(symbol: str) -> list[str]:
     try:
         return LearningStore.from_environment().lessons_for(symbol, limit=5)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as error:
@@ -809,7 +809,7 @@ def _run_analysis_session(
             session.session_id,
         )
         graph_config["log_graph_states"] = False
-        graph_config["hermes_review_lessons"] = _load_review_lessons(request.symbol)
+        graph_config["hermes_review_lessons"] = _load_learning_lessons(request.symbol)
         analysis_started = True
         graph = graph_factory(
             selected_analysts=request.analysts,

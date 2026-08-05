@@ -625,6 +625,21 @@ class HermesMcpTests(unittest.TestCase):
         provider_key.assert_called_once_with("openai")
         cleanup.assert_called_once()
 
+    @patch("tradingagents.integrations.hermes_mcp.LearningStore.from_environment")
+    def test_load_learning_lessons_returns_balanced_five_lessons(self, learning_store_factory):
+        learning_store_factory.return_value.lessons_for.return_value = [
+            "lesson 1",
+            "lesson 2",
+            "lesson 3",
+            "lesson 4",
+            "lesson 5",
+        ]
+
+        lessons = hermes_mcp._load_learning_lessons("BTC")
+
+        self.assertEqual(lessons, ["lesson 1", "lesson 2", "lesson 3", "lesson 4", "lesson 5"])
+        learning_store_factory.return_value.lessons_for.assert_called_once_with("BTC", limit=5)
+
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
     def test_execute_analysis_persists_completed_fake_graph_result(
