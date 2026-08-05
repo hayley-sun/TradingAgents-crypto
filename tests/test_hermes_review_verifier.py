@@ -421,6 +421,33 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("旧 v1", text)
         self.assertIn("只有一个 Hermes memory 条目", text)
 
+    def test_scheduled_skill_separates_legacy_retry_from_report_quarantine(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        safe_summary = skill[skill.index("## 4. Safety and reporting") :]
+
+        self.assertIn("leave the item in `memory_pending`", skill)
+        self.assertNotIn("quarantined by the project bootstrap", skill)
+        self.assertIn("REPORT_MEMORY_RESULT_AMBIGUOUS", skill)
+        self.assertIn("already persists `attention_required`", skill)
+        self.assertIn("Do not call `quarantine-report-memory` after", skill)
+        self.assertNotIn("horizon", safe_summary)
+
+    def test_runbook_retires_old_jobs_only_after_v2_acceptance(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        acceptance = text.index("全部旧 v1 与新 v2 验收通过后")
+
+        self.assertGreater(
+            text.index('hermes cron remove "$old_process_job_id"'), acceptance
+        )
+        self.assertGreater(
+            text.index('hermes cron remove "$old_memory_job_id"'), acceptance
+        )
+        self.assertIn("MEMORY_ERROR_CODES", text)
+        self.assertIn("已持久化 `attention_required`", text)
+        self.assertIn("不得再次调用 `quarantine-report-memory`", text)
+        self.assertIn("恢复旧 v1 job", text)
+        self.assertNotIn("SCHEDULED_REVIEW_RUNNER_FAILED", text)
+
 
 if __name__ == "__main__":
     unittest.main()

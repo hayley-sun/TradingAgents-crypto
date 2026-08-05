@@ -349,8 +349,9 @@ hermes memory status
 ```
 
 先用 `hermes cron list --all` 记录旧 v1 processor/Agent job ID，并确认它们均为
-paused。创建 replacement job 后立即暂停，再移除旧 job；创建或暂停失败时保留旧
-配置。两个 replacement job 固定使用本地投递、Asia/Shanghai 和项目目录：
+paused。创建 replacement job 后立即暂停；旧 job 继续保持 paused 并保留，直到
+replacement 08:15/08:30 pair 与新 v2 验收全部成功。创建或暂停失败时保留旧配置。
+两个 replacement job 固定使用本地投递、Asia/Shanghai 和项目目录：
 
 ```bash
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
@@ -365,8 +366,6 @@ scheduled_review_memory_job_id='<replace-with-memory-job-id>'
 hermes cron pause "$scheduled_review_process_job_id"
 hermes cron pause "$scheduled_review_memory_job_id"
 hermes cron list --all
-hermes cron remove "$old_process_job_id"
-hermes cron remove "$old_memory_job_id"
 ```
 
 processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载结果目录和价格
@@ -412,17 +411,23 @@ marker 只出现一次、目标 revision 的精确内容只出现一次、项目
 reflection，即每份报告 `只有一个 Hermes memory 条目`。验收输出只能包含 ID、symbol、
 revision、state、count 和安全错误码，不能包含 evidence 或 memory 正文。
 
-`unavailable_count` 及其最多 18 个 ID 样本不得触发 memory mutation。ambiguous
-memory result、marker 缺失/重复、index 不一致或确认失败必须使用 allowlisted code
-调用 `quarantine-report-memory` 并进入 `attention_required`；例如不明确的返回使用
-`REPORT_MEMORY_RESULT_AMBIGUOUS`。保留原始项目和 Hermes artifact 供人工恢复，
-不得用 shell 修复。若 `confirm-report-memory` 已把状态持久化为
-`verification_pending` 后进程崩溃，恢复时直接再次调用 `confirm-report-memory`，
-不得执行第二次 Hermes mutation。
+`unavailable_count` 及其最多 18 个 ID 样本不得触发 memory mutation。只有 Hermes
+memory tool 返回 ambiguous、unaccepted 或与 action 不匹配的结果时，才调用
+`quarantine-report-memory`；`--error-code` 必须来自代码中的 `MEMORY_ERROR_CODES`，
+不明确的返回使用 `REPORT_MEMORY_RESULT_AMBIGUOUS`。
 
-全部旧 v1 与新 v2 验收通过后恢复两个 replacement job：
+`confirm-report-memory` 的 verifier 若发现 marker 缺失/重复、精确内容或项目 index
+不一致，会先更新 revision；返回安全失败状态时已持久化 `attention_required`。此时
+只报告安全状态并由 operator 调查，不得再次调用 `quarantine-report-memory`，也
+不得用 shell 修复。若确认已把状态持久化为 `verification_pending` 后进程崩溃，
+恢复时直接再次调用 `confirm-report-memory`，不得执行第二次 Hermes mutation。
+
+全部旧 v1 与新 v2 验收通过后，才移除仍为 paused 的旧 job，然后恢复两个
+replacement job：
 
 ```bash
+hermes cron remove "$old_process_job_id"
+hermes cron remove "$old_memory_job_id"
 hermes cron resume "$scheduled_review_process_job_id"
 hermes cron resume "$scheduled_review_memory_job_id"
 hermes cron status
@@ -435,6 +440,10 @@ hermes cron pause "$scheduled_review_process_job_id"
 hermes cron pause "$scheduled_review_memory_job_id"
 hermes cron list --all
 ```
+
+若旧 job 尚未移除，确认 replacements 已暂停后可恢复旧 v1 job；若旧 job 已在验收
+成功后移除，则部署上一个已评审版本并重新创建其 paused jobs，验证后再恢复。不要
+同时运行旧、新两组 job，也不要通过删除 artifact 回滚。
 
 确认不再产生新 run 后，原样保留项目 sessions、reviews、learning indexes、
 `report_batches`、`report_memories/<session_id>.json`、reports、logs、schedules 和

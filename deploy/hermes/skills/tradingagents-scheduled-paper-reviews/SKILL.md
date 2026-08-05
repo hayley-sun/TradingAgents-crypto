@@ -29,10 +29,12 @@ added` or `Entry already exists` permits the matching read-only confirmation:
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap confirm-memory --review-id <review_id>
 ```
 
-Accept only confirmation JSON with `ok: true` and `state: completed`. Any other
-memory result or confirmation failure is quarantined by the project bootstrap;
-do not retry, repair, or process that item again in this run. Continue with
-independent later legacy items.
+Accept only confirmation JSON with `ok: true` and `state: completed`. For any
+other memory-tool response, do not call confirmation; leave the item in `memory_pending`.
+Report only the safe error, and let an operator or a later run handle it. A
+confirmation failure moves the project item to
+`attention_required`. Do not retry, repair, or process either failed item again
+in this run. Continue with independent later legacy items.
 
 ## 2. Reflect bounded report evidence (v2)
 
@@ -95,14 +97,16 @@ without printing content:
 
 After an accepted mutation, call the read-only
 `confirm-report-memory --session-id <session_id> --revision <revision>` command
-and accept only `ok: true`. A failed confirmation is quarantined with its
-allowlisted error code; never call a memory mutation again for that revision in
-the same run. Process later independent items.
+and accept only `ok: true`. On verification failure, confirmation already persists `attention_required`;
+report the safe status for operator investigation.
+Do not call `quarantine-report-memory` after a confirmation failure, and never
+call a memory mutation again for that revision in the same run. Process later
+independent items.
 
 ## 4. Safety and reporting
 
-Report only review/session IDs, symbols, revisions, horizons, states, counts,
-and allowlisted safe error codes. Never print packet fields, evidence excerpts,
+Report only review/session IDs, symbols, revisions, states, counts, and
+allowlisted safe error codes. Never print packet fields, evidence excerpts,
 memory content, credentials, or filesystem paths. Never invoke the Hermes memory
 tool to read or search long-term memory. Never edit Hermes `MEMORY.md` with a
 shell, editor, terminal, or file-writing command; only the Hermes built-in
