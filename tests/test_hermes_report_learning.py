@@ -242,7 +242,7 @@ def report_learning_record(
                 memory_state="add_pending" if position == 1 else "replace_pending",
                 source_fields=[
                     ReportSourceMetadata(
-                        name="market_report", sha256="a" * 64, truncated=False
+                        name="report.market", sha256="a" * 64, truncated=False
                     )
                 ],
                 reflection=reflection,
@@ -487,18 +487,25 @@ class HermesReportLearningTests(unittest.TestCase):
                 report_store, index_store, session = pending_report_fixture(
                     directory, verdict=verdict
                 )
+                payload = valid_reflection_payload()
+                if verdict == "flat":
+                    payload["mistakes_or_missed_opportunities"] = []
+                elif verdict == "not_scored":
+                    payload["reasoning_strengths"] = []
                 record = hermes_report_learning.submit_report_reflection(
                     report_store,
                     index_store,
                     session,
                     1,
-                    valid_reflection_payload(),
+                    payload,
                 )
                 self.assertEqual(record.reflected_revision, 1)
 
         required_sections = (
             ("correct", "reasoning_strengths"),
             ("incorrect", "mistakes_or_missed_opportunities"),
+            ("flat", "reasoning_strengths"),
+            ("not_scored", "mistakes_or_missed_opportunities"),
         )
         for verdict, section in required_sections:
             with self.subTest(
@@ -562,6 +569,115 @@ class HermesReportLearningTests(unittest.TestCase):
             len(first.hermes_memory_entry),
             hermes_report_learning.HERMES_REPORT_MEMORY_MAX_CHARS,
         )
+
+    def test_renderer_preserves_required_sections_when_reflection_is_maximal(self):
+        record = ready_record()
+        maximal = ReportReflection(
+            decision_thesis="d" * 600,
+            technical_context="t" * 600,
+            sentiment_context="s" * 600,
+            news_context="n" * 600,
+            fundamental_context="f" * 600,
+            overall_assessment="o" * 800,
+            outcome_assessments=[
+                ReportOutcomeAssessment(
+                    horizon_days=horizon,
+                    assessment="a" * 400,
+                )
+                for horizon in (1, 7, 15)
+            ],
+            reasoning_strengths=["r" * 400] * 3,
+            causal_hypotheses=[
+                ReportCausalHypothesis(
+                    statement="hypothesis " + "h" * 389,
+                    evidence=["report.market"],
+                    confidence="high",
+                )
+            ]
+            * 3,
+            mistakes_or_missed_opportunities=["m" * 400] * 3,
+            next_decision_checks=["c" * 400] * 5,
+        )
+        revision = record.revisions[2].model_copy(update={"reflection": maximal})
+        record = record.model_copy(
+            update={"revisions": [record.revisions[0], record.revisions[1], revision]}
+        )
+
+        rendered = hermes_report_learning.render_report_lesson(record, revision=3)
+
+        self.assertLessEqual(
+            len(rendered.lesson), hermes_report_learning.REPORT_LESSON_MAX_CHARS
+        )
+        for required in (
+            "T+1",
+            "T+7",
+            "T+15",
+            "Causal hypotheses:",
+            "confidence:",
+            "Next paper-decision checks:",
+            "Disclaimer:",
+        ):
+            self.assertIn(required, rendered.lesson)
+
+    def test_renderer_includes_maturity_and_archived_market_context_without_optional_context(self):
+        record = report_learning_record(horizons=(7,))
+        revision = record.revisions[0].model_copy(
+            update={
+                "reflection": record.revisions[0].reflection.model_copy(
+                    update={
+                        "technical_context": None,
+                        "sentiment_context": None,
+                        "news_context": None,
+                        "fundamental_context": None,
+                    }
+                )
+            }
+        )
+        record = record.model_copy(update={"revisions": [revision]})
+
+        rendered = hermes_report_learning.render_report_lesson(record, revision=1)
+
+        self.assertIn("Maturity: T+7", rendered.lesson)
+        self.assertIn("Archived market context:", rendered.lesson)
+        self.assertIn("report.market", rendered.lesson)
+
+    def test_index_failure_leaves_ready_report_and_identical_retry_repairs_index(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            payload = valid_reflection_payload()
+            original_upsert = index_store.upsert_report
+            state = {"failed": False}
+
+            def fail_once(record):
+                if not state["failed"]:
+                    state["failed"] = True
+                    raise ReportLearningError("simulated index outage")
+                return original_upsert(record)
+
+            index_store.upsert_report = fail_once
+            with self.assertRaises(ReportLearningError):
+                hermes_report_learning.submit_report_reflection(
+                    report_store, index_store, session, 1, payload
+                )
+            persisted = report_store.load(session.session_id)
+            self.assertEqual(persisted.reflected_revision, 1)
+            self.assertEqual(persisted.revisions[0].reflection_state, "ready")
+            index_store.upsert_report = original_upsert
+
+            repaired = hermes_report_learning.submit_report_reflection(
+                report_store, index_store, session, 1, payload
+            )
+            index_path = index_store.path_for("BTC")
+            index_bytes = index_path.read_bytes()
+            repeated = hermes_report_learning.submit_report_reflection(
+                report_store, index_store, session, 1, payload
+            )
+            repeated_index_bytes = index_path.read_bytes()
+            indexed_lesson = index_store.load("BTC").report_entries[0].lesson
+
+        self.assertEqual(repaired, repeated)
+        self.assertEqual(repeated_index_bytes, index_bytes)
+        self.assertEqual(indexed_lesson, repaired.revisions[0].lesson)
 
     def test_report_store_records_maps_invalid_filename_to_storage_error(self):
         invalid_filename = "hermes_not-a-valid-id.json"

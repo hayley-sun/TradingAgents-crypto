@@ -461,6 +461,10 @@ def _validated_reflection(
         and not reflection.reasoning_strengths
         or "incorrect" in verdicts
         and not reflection.mistakes_or_missed_opportunities
+        or "flat" in verdicts
+        and not reflection.reasoning_strengths
+        or "not_scored" in verdicts
+        and not reflection.mistakes_or_missed_opportunities
     ):
         raise ReportReflectionRejected("REFLECTION_VERDICT_SECTIONS_INVALID")
 
@@ -478,19 +482,39 @@ def _join_items(items: list[str]) -> str:
     return " | ".join(items) if items else "None recorded."
 
 
-def _bounded_lesson(lines: list[str]) -> str:
+def _clip_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 3:
+        return value[:max_chars]
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def _bounded_lesson(
+    required_lines: list[str], optional_lines: list[str]
+) -> str:
     disclaimer = (
         "Disclaimer: retrospective hypotheses from paper trading are uncertain; "
         "they are not proof of causation or instructions for real orders."
     )
-    body = "\n".join(lines)
-    combined = f"{body}\n\n{disclaimer}"
-    if len(combined) <= REPORT_LESSON_MAX_CHARS:
-        return combined
     available = REPORT_LESSON_MAX_CHARS - len(disclaimer) - 2
-    suffix = "..."
-    shortened = body[: available - len(suffix)].rstrip() + suffix
-    return f"{shortened}\n\n{disclaimer}"
+    body_lines = list(required_lines)
+    body = "\n".join(body_lines)
+    if len(body) > available:
+        raise ReportLearningError("required report lesson sections exceed limit")
+    for optional in optional_lines:
+        candidate = "\n".join([*body_lines, optional])
+        if len(candidate) <= available:
+            body_lines.append(optional)
+            body = candidate
+            continue
+        remaining = available - len(body) - 1
+        if remaining > 3:
+            clipped = _clip_text(optional, remaining)
+            if len(clipped) <= remaining:
+                body_lines.append(clipped)
+                body = "\n".join(body_lines)
+    return f"{body}\n\n{disclaimer}"
 
 
 def _render_reflection(
@@ -517,48 +541,66 @@ def _render_reflection(
         f"({format(outcome.raw_return_pct, '.10g')}%)"
         for outcome in outcomes
     )
-    lines = [
+    maturity_horizon = max(outcome.horizon_days for outcome in outcomes)
+    source_names = {field.name for field in snapshot.source_fields}
+    market_source = next(
+        (
+            name
+            for name in ("report.market", "market_report")
+            if name in source_names
+        ),
+        "report.market",
+    )
+    required_lines = [
         (
             f"{record.symbol} paper report lesson, {record.trade_date.isoformat()}, "
             f"revision {revision}, action {record.action}"
         ),
+        f"Maturity: T+{maturity_horizon}",
         f"Outcomes: {outcome_summary}",
-        f"Decision thesis: {reflection.decision_thesis}",
-        f"Overall assessment: {reflection.overall_assessment}",
+        f"Archived market context: {market_source} evidence captured at decision time.",
     ]
+    required_lines.append(
+        "Outcome assessments: "
+        + " | ".join(
+            f"T+{outcome.horizon_days}: "
+            f"{_clip_text(assessments[outcome.horizon_days], 120)}"
+            for outcome in outcomes
+        )
+    )
+    required_lines.append(
+        "Causal hypotheses: "
+        + " | ".join(
+            f"{_clip_text(item.statement, 100)} "
+            f"[evidence: {', '.join(item.evidence)}; confidence: {item.confidence}]"
+            for item in reflection.causal_hypotheses
+        )
+    )
+    required_lines.append(
+        "Next paper-decision checks: "
+        + " | ".join(
+            _clip_text(item, 120) for item in reflection.next_decision_checks
+        )
+    )
     contexts = (
+        ("Decision thesis", reflection.decision_thesis),
+        ("Overall assessment", reflection.overall_assessment),
         ("Technical context", reflection.technical_context),
         ("Sentiment context", reflection.sentiment_context),
         ("News context", reflection.news_context),
         ("Fundamental context", reflection.fundamental_context),
+        ("Reasoning strengths", _join_items(reflection.reasoning_strengths)),
+        (
+            "Mistakes or missed opportunities",
+            _join_items(reflection.mistakes_or_missed_opportunities),
+        ),
     )
-    lines.extend(f"{label}: {value}" for label, value in contexts if value is not None)
-    lines.append(
-        "Outcome assessments: "
-        + " | ".join(
-            f"T+{outcome.horizon_days}: {assessments[outcome.horizon_days]}"
-            for outcome in outcomes
-        )
-    )
-    lines.append(
-        "Reasoning strengths: " + _join_items(reflection.reasoning_strengths)
-    )
-    lines.append(
-        "Causal hypotheses: "
-        + " | ".join(
-            f"{item.statement} [evidence: {', '.join(item.evidence)}; "
-            f"confidence: {item.confidence}]"
-            for item in reflection.causal_hypotheses
-        )
-    )
-    lines.append(
-        "Mistakes or missed opportunities: "
-        + _join_items(reflection.mistakes_or_missed_opportunities)
-    )
-    lines.append(
-        "Next paper-decision checks: " + _join_items(reflection.next_decision_checks)
-    )
-    lesson = _bounded_lesson(lines)
+    optional_lines = [
+        f"{label}: {_clip_text(value, 280)}"
+        for label, value in contexts
+        if value is not None
+    ]
+    lesson = _bounded_lesson(required_lines, optional_lines)
     memory_entry = (
         f"{REPORT_MEMORY_MARKER.format(session_id=record.session_id)}\n"
         "Paper trading memory only; no real-order instruction.\n"
