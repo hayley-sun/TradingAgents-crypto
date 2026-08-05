@@ -89,6 +89,39 @@ def saved_review(results_root: Path) -> PaperDecisionReview:
 
 
 class HermesReviewVerifierTests(unittest.TestCase):
+    def test_verifier_accepts_legacy_entry_without_session_id(self):
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            saved_review(results_root)
+            learning_path = (
+                results_root / "hermes" / "memories" / "BTC.json"
+            )
+            payload = json.loads(learning_path.read_text(encoding="ascii"))
+            payload["entries"][0]["session_id"] = None
+            learning_path.write_text(json.dumps(payload), encoding="ascii")
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
+
+            result = verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
+        self.assertIs(result.learning_index_contains_review, True)
+
+    def test_verifier_rejects_legacy_entry_with_wrong_non_null_session_id(self):
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            saved_review(results_root)
+            learning_path = (
+                results_root / "hermes" / "memories" / "BTC.json"
+            )
+            payload = json.loads(learning_path.read_text(encoding="ascii"))
+            payload["entries"][0]["session_id"] = "hermes_ffffffffffffffff"
+            learning_path.write_text(json.dumps(payload), encoding="ascii")
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
+
+            with self.assertRaises(ReviewVerificationError):
+                verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
     def test_verifier_finds_legacy_review_after_v2_index_upgrade(self):
         from tests.test_hermes_report_learning import report_learning_record
 

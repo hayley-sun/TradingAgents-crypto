@@ -222,6 +222,37 @@ class LearningStore:
         )
         with self._exclusive_write_lock():
             current = self.load(record.symbol)
+            existing_entry = (
+                next(
+                    (
+                        item
+                        for item in current.report_entries
+                        if item.session_id == entry.session_id
+                    ),
+                    None,
+                )
+                if current is not None and current.schema_version == 2
+                else None
+            )
+            if existing_entry is not None:
+                if entry.reflected_revision < existing_entry.reflected_revision:
+                    return current
+                if entry.reflected_revision == existing_entry.reflected_revision:
+                    existing_content = (
+                        existing_entry.trade_date,
+                        existing_entry.maturity_days,
+                        existing_entry.lesson,
+                    )
+                    incoming_content = (
+                        entry.trade_date,
+                        entry.maturity_days,
+                        entry.lesson,
+                    )
+                    if incoming_content != existing_content:
+                        raise LearningStorageError(
+                            "report learning index conflicts"
+                        )
+                    return current
             legacy_entries = (
                 []
                 if current is None

@@ -64,6 +64,10 @@ def verify_review_consistency(
     learning_index_contains_review = len(matching_entries) == 1 and (
         matching_entries[0].review_date == review.review_date
         and matching_entries[0].lesson == review.hermes_memory_entry
+        and (
+            matching_entries[0].session_id is None
+            or matching_entries[0].session_id == review.session_id
+        )
     )
     hermes_memory_occurrences = memory_text.count(review.hermes_memory_entry)
     verification = ReviewVerification(

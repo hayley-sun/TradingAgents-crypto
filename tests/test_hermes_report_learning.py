@@ -1,10 +1,14 @@
+import multiprocessing
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tradingagents.integrations import hermes_learning
-from tradingagents.integrations.hermes_learning import LearningStore
+from tradingagents.integrations.hermes_learning import (
+    LearningStorageError,
+    LearningStore,
+)
 from tradingagents.integrations.schemas import (
     PaperDecisionReview,
     PriceReference,
@@ -129,6 +133,38 @@ def legacy_review(
     )
 
 
+def _controlled_report_upsert(root, record_payload, write_started, allow_write):
+    from tradingagents.integrations import hermes_learning as learning_module
+
+    original_write = learning_module._atomic_json_write
+
+    def controlled_write(destination, value):
+        write_started.put(True)
+        allow_write.wait(timeout=5)
+        original_write(destination, value)
+
+    learning_module._atomic_json_write = controlled_write
+    learning_module.LearningStore(Path(root)).upsert_report(
+        ReportLearningRecord.model_validate(record_payload)
+    )
+
+
+def _controlled_legacy_upsert(root, review_payload, write_started, allow_write):
+    from tradingagents.integrations import hermes_learning as learning_module
+
+    original_write = learning_module._atomic_json_write
+
+    def controlled_write(destination, value):
+        write_started.put(True)
+        allow_write.wait(timeout=5)
+        original_write(destination, value)
+
+    learning_module._atomic_json_write = controlled_write
+    learning_module.LearningStore(Path(root)).upsert(
+        PaperDecisionReview.model_validate(review_payload)
+    )
+
+
 class HermesReportLearningTests(unittest.TestCase):
     def test_report_learning_limits_are_explicit(self):
         self.assertEqual(getattr(hermes_learning, "REPORT_LESSON_LIMIT", None), 5)
@@ -143,10 +179,141 @@ class HermesReportLearningTests(unittest.TestCase):
             store = LearningStore(Path(directory))
             record = report_learning_record()
             first = store.upsert_report(record)
+            path = store.path_for("BTC")
+            first_bytes = path.read_bytes()
+            first_mtime = path.stat().st_mtime_ns
             second = store.upsert_report(record)
+            second_bytes = path.read_bytes()
+            second_mtime = path.stat().st_mtime_ns
 
         self.assertEqual(len(first.report_entries), 1)
-        self.assertEqual(second.report_entries, first.report_entries)
+        self.assertEqual(second, first)
+        self.assertEqual(second_bytes, first_bytes)
+        self.assertEqual(second_mtime, first_mtime)
+
+    def test_stale_report_revision_does_not_downgrade_or_rewrite_index(self):
+        revision_one = report_learning_record(session_number=110)
+        revision_two = report_learning_record(
+            session_number=110, horizons=(1, 7)
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            current = store.upsert_report(revision_two)
+            path = store.path_for("BTC")
+            current_bytes = path.read_bytes()
+            current_mtime = path.stat().st_mtime_ns
+
+            stale_result = store.upsert_report(revision_one)
+
+            self.assertEqual(stale_result, current)
+            self.assertEqual(path.read_bytes(), current_bytes)
+            self.assertEqual(path.stat().st_mtime_ns, current_mtime)
+            self.assertEqual(store.load("BTC").report_entries[0].reflected_revision, 2)
+
+    def test_equal_report_revision_with_changed_identity_or_content_conflicts(self):
+        current = report_learning_record(session_number=120)
+        conflicts = (
+            report_learning_record(
+                session_number=120, trade_date=date(2026, 7, 2)
+            ),
+            report_learning_record(session_number=120, horizons=(7,)),
+            report_learning_record(session_number=120, lesson="Conflicting lesson."),
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            store.upsert_report(current)
+            path = store.path_for("BTC")
+            current_bytes = path.read_bytes()
+            for conflict in conflicts:
+                with self.subTest(conflict=conflict), self.assertRaisesRegex(
+                    LearningStorageError, "^report learning index conflicts$"
+                ):
+                    store.upsert_report(conflict)
+                self.assertEqual(path.read_bytes(), current_bytes)
+
+    def test_concurrent_report_revisions_finish_at_highest_revision(self):
+        revision_one = report_learning_record(session_number=130)
+        revision_two = report_learning_record(
+            session_number=130, horizons=(1, 7)
+        )
+        context = multiprocessing.get_context("fork")
+        for first, second in (
+            (revision_one, revision_two),
+            (revision_two, revision_one),
+        ):
+            with self.subTest(
+                first_revision=first.reflected_revision
+            ), TemporaryDirectory() as directory:
+                write_started = context.Queue()
+                allow_write = context.Event()
+                processes = [
+                    context.Process(
+                        target=_controlled_report_upsert,
+                        args=(
+                            directory,
+                            record.model_dump(mode="json"),
+                            write_started,
+                            allow_write,
+                        ),
+                    )
+                    for record in (first, second)
+                ]
+                processes[0].start()
+                write_started.get(timeout=5)
+                processes[1].start()
+                allow_write.set()
+                for process in processes:
+                    process.join(timeout=5)
+                    self.assertEqual(process.exitcode, 0)
+
+                index = LearningStore(Path(directory)).load("BTC")
+
+            self.assertEqual(len(index.report_entries), 1)
+            self.assertEqual(index.report_entries[0].reflected_revision, 2)
+            self.assertEqual(index.report_entries[0].maturity_days, 7)
+
+    def test_concurrent_v1_legacy_upsert_and_first_report_migration_preserve_both(self):
+        context = multiprocessing.get_context("fork")
+        review = legacy_review(8, session_number=8)
+        record = report_learning_record(session_number=140)
+        with TemporaryDirectory() as directory:
+            write_started = context.Queue()
+            allow_write = context.Event()
+            legacy_process = context.Process(
+                target=_controlled_legacy_upsert,
+                args=(
+                    directory,
+                    review.model_dump(mode="json"),
+                    write_started,
+                    allow_write,
+                ),
+            )
+            report_process = context.Process(
+                target=_controlled_report_upsert,
+                args=(
+                    directory,
+                    record.model_dump(mode="json"),
+                    write_started,
+                    allow_write,
+                ),
+            )
+            legacy_process.start()
+            write_started.get(timeout=5)
+            report_process.start()
+            allow_write.set()
+            for process in (legacy_process, report_process):
+                process.join(timeout=5)
+                self.assertEqual(process.exitcode, 0)
+
+            index = LearningStore(Path(directory)).load("BTC")
+
+        self.assertEqual(index.schema_version, 2)
+        self.assertEqual(
+            [entry.review_id for entry in index.legacy_entries], [review.review_id]
+        )
+        self.assertEqual(
+            [entry.session_id for entry in index.report_entries], [record.session_id]
+        )
 
     def test_report_upsert_rejects_non_reflected_or_invalid_snapshot(self):
         valid = report_learning_record()
