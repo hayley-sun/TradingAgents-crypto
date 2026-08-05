@@ -1,11 +1,12 @@
 import hashlib
+import json
 import multiprocessing
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from tradingagents.integrations import hermes_learning
+from tradingagents.integrations import hermes_learning, hermes_report_learning
 from tradingagents.integrations.hermes_learning import (
     LearningStorageError,
     LearningStore,
@@ -48,7 +49,7 @@ def changed_result() -> AnalysisResult:
     )
 
 
-def completed_session() -> AnalysisSession:
+def completed_session(*, market_report: str = "Market report.") -> AnalysisSession:
     return AnalysisSession(
         session_id="hermes_0123456789abcdef",
         status="completed",
@@ -66,7 +67,7 @@ def completed_session() -> AnalysisSession:
         result=changed_result().model_copy(
             update={
                 "reports": {
-                    "market": "Market report.",
+                    "market": market_report,
                     "sentiment": "Sentiment report.",
                     "news": "News report.",
                     "fundamentals": "Fundamentals report.",
@@ -76,7 +77,9 @@ def completed_session() -> AnalysisSession:
     )
 
 
-def paper_review(horizon_days: int) -> PaperDecisionReview:
+def paper_review(
+    horizon_days: int, *, verdict: str = "correct"
+) -> PaperDecisionReview:
     trade_date = date(2026, 7, 1)
     review_date = trade_date + timedelta(days=horizon_days)
     return PaperDecisionReview(
@@ -94,10 +97,68 @@ def paper_review(horizon_days: int) -> PaperDecisionReview:
             date=review_date, usd_price=101.0, source="coinbase"
         ),
         raw_return_pct=1.0,
-        verdict="correct",
+        verdict=verdict,
         created_at=utc_now(),
         hermes_memory_entry=f"Legacy T+{horizon_days} lesson.",
     )
+
+
+def record_with_pending_revision(
+    session: AnalysisSession, *, horizons: tuple[int, ...] = (1,)
+) -> ReportLearningRecord:
+    with TemporaryDirectory() as directory:
+        store = ReportLearningStore(Path(directory))
+        record = None
+        for horizon in horizons:
+            record = record_review_fact(store, session, paper_review(horizon))
+    assert record is not None
+    return record
+
+
+def pending_report_fixture(directory: str, *, verdict: str = "correct"):
+    report_store = ReportLearningStore(Path(directory) / "reports")
+    index_store = LearningStore(Path(directory) / "index")
+    session = completed_session()
+    record_review_fact(report_store, session, paper_review(1, verdict=verdict))
+    return report_store, index_store, session
+
+
+def valid_reflection_payload(
+    *,
+    horizons: tuple[int, ...] = (1,),
+    evidence: list[str] | None = None,
+) -> dict:
+    return {
+        "decision_thesis": "Buy only after the archived confirmation signal.",
+        "technical_context": "The archived market report showed support holding.",
+        "sentiment_context": "Sentiment was constructive but mixed.",
+        "news_context": "News was treated as context rather than a trigger.",
+        "fundamental_context": "Fundamentals did not contradict the thesis.",
+        "overall_assessment": "The paper decision was disciplined but uncertain.",
+        "outcome_assessments": [
+            {
+                "horizon_days": horizon,
+                "assessment": f"T+{horizon} was assessed from the archived return.",
+            }
+            for horizon in horizons
+        ],
+        "reasoning_strengths": ["The paper entry condition was explicit."],
+        "causal_hypotheses": [
+            {
+                "statement": "Momentum may have persisted after confirmation.",
+                "evidence": evidence or ["report.market", "outcome.t1"],
+                "confidence": "medium",
+            }
+        ],
+        "mistakes_or_missed_opportunities": [
+            "The analysis could have specified an invalidation level."
+        ],
+        "next_decision_checks": ["Check confirmation volume in the next paper run."],
+    }
+
+
+def ready_record() -> ReportLearningRecord:
+    return report_learning_record(horizons=(1, 7, 15))
 
 
 def _concurrent_report_fact(
@@ -269,6 +330,239 @@ def _controlled_legacy_upsert(root, review_payload, write_started, allow_write):
 
 
 class HermesReportLearningTests(unittest.TestCase):
+    def test_evidence_packet_is_deterministic_bounded_and_marks_truncation(self):
+        session = completed_session(
+            market_report="start " + "x" * 9000 + " conclusion"
+        )
+        record = record_with_pending_revision(session)
+
+        first = hermes_report_learning.build_evidence_packet(
+            record, session, revision=1
+        )
+        second = hermes_report_learning.build_evidence_packet(
+            record, session, revision=1
+        )
+        encoded = json.dumps(
+            first.model_dump(mode="json"), ensure_ascii=True
+        ).encode("utf-8")
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(
+            len(encoded), hermes_report_learning.EVIDENCE_PACKET_MAX_BYTES
+        )
+        market = next(field for field in first.fields if field.name == "report.market")
+        self.assertTrue(market.truncated)
+        self.assertEqual(len(market.sha256), 64)
+        self.assertIn("start", market.excerpt)
+        self.assertIn("conclusion", market.excerpt)
+        self.assertIn("outcome.t1", [field.name for field in first.fields])
+        self.assertEqual(
+            record.revisions[0].source_fields,
+            [
+                ReportSourceMetadata(
+                    name=field.name,
+                    sha256=field.sha256,
+                    truncated=field.truncated,
+                )
+                for field in first.fields
+                if field.name in hermes_report_learning.EVIDENCE_FIELD_ORDER
+            ],
+        )
+
+    def test_evidence_packet_accounts_for_non_ascii_json_expansion(self):
+        session = completed_session(market_report="开头" + "上涨" * 5000 + "结论")
+        record = record_with_pending_revision(session)
+
+        packet = hermes_report_learning.build_evidence_packet(
+            record, session, revision=1
+        )
+        encoded = json.dumps(
+            packet.model_dump(mode="json"), ensure_ascii=True
+        ).encode("utf-8")
+
+        self.assertLessEqual(
+            len(encoded), hermes_report_learning.EVIDENCE_PACKET_MAX_BYTES
+        )
+        market = next(field for field in packet.fields if field.name == "report.market")
+        self.assertIn("开头", market.excerpt)
+        self.assertIn("结论", market.excerpt)
+
+    def test_submit_reflection_rejects_unknown_evidence_and_stale_revision(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            payload = valid_reflection_payload()
+            payload["causal_hypotheses"][0]["evidence"] = ["external.news"]
+            with self.assertRaises(hermes_report_learning.ReportReflectionRejected):
+                hermes_report_learning.submit_report_reflection(
+                    report_store, index_store, session, 1, payload
+                )
+            with self.assertRaises(ReportLearningConflict):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    0,
+                    valid_reflection_payload(),
+                )
+
+            persisted = report_store.load(session.session_id)
+
+        self.assertEqual(persisted.revisions[0].reflection_attempt_count, 1)
+        self.assertEqual(
+            persisted.revisions[0].last_error_code,
+            "REFLECTION_EVIDENCE_INVALID",
+        )
+
+    def test_rejected_reflection_is_quarantined_after_three_atomic_attempts(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            payload = valid_reflection_payload()
+            payload["overall_assessment"] = "This outcome was guaranteed."
+            for attempt in range(1, 4):
+                with self.assertRaises(
+                    hermes_report_learning.ReportReflectionRejected
+                ):
+                    hermes_report_learning.submit_report_reflection(
+                        report_store, index_store, session, 1, payload
+                    )
+                persisted = report_store.load(session.session_id)
+                self.assertEqual(
+                    persisted.revisions[0].reflection_attempt_count, attempt
+                )
+                self.assertEqual(
+                    persisted.revisions[0].reflection_state,
+                    "attention_required" if attempt == 3 else "pending",
+                )
+                self.assertEqual(
+                    persisted.revisions[0].last_error_code,
+                    "REFLECTION_UNSAFE_CONTENT",
+                )
+
+    def test_submit_reflection_is_idempotent_and_indexes_ready_lesson(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            first = hermes_report_learning.submit_report_reflection(
+                report_store,
+                index_store,
+                session,
+                1,
+                valid_reflection_payload(),
+            )
+            report_path = report_store.path_for(session.session_id)
+            original_bytes = report_path.read_bytes()
+            second = hermes_report_learning.submit_report_reflection(
+                report_store,
+                index_store,
+                session,
+                1,
+                valid_reflection_payload(),
+            )
+            replay_bytes = report_path.read_bytes()
+            with self.assertRaises(ReportLearningConflict):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session.model_copy(update={"result": changed_result()}),
+                    1,
+                    valid_reflection_payload(),
+                )
+            changed = valid_reflection_payload()
+            changed["decision_thesis"] = "A different archived thesis."
+            with self.assertRaises(ReportLearningConflict):
+                hermes_report_learning.submit_report_reflection(
+                    report_store, index_store, session, 1, changed
+                )
+            index = index_store.load("BTC")
+
+        self.assertEqual(first, second)
+        self.assertEqual(replay_bytes, original_bytes)
+        self.assertEqual(first.reflected_revision, 1)
+        self.assertEqual(first.revisions[0].reflection_state, "ready")
+        self.assertEqual(first.revisions[0].memory_state, "add_pending")
+        self.assertEqual(index.report_entries[0].lesson, first.revisions[0].lesson)
+
+    def test_reflection_verdict_sections_cover_all_outcomes(self):
+        for verdict in ("correct", "incorrect", "flat", "not_scored"):
+            with self.subTest(verdict=verdict), TemporaryDirectory() as directory:
+                report_store, index_store, session = pending_report_fixture(
+                    directory, verdict=verdict
+                )
+                record = hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    valid_reflection_payload(),
+                )
+                self.assertEqual(record.reflected_revision, 1)
+
+        required_sections = (
+            ("correct", "reasoning_strengths"),
+            ("incorrect", "mistakes_or_missed_opportunities"),
+        )
+        for verdict, section in required_sections:
+            with self.subTest(
+                verdict=verdict, missing_section=section
+            ), TemporaryDirectory() as directory:
+                report_store, index_store, session = pending_report_fixture(
+                    directory, verdict=verdict
+                )
+                payload = valid_reflection_payload()
+                payload[section] = []
+                with self.assertRaises(
+                    hermes_report_learning.ReportReflectionRejected
+                ):
+                    hermes_report_learning.submit_report_reflection(
+                        report_store, index_store, session, 1, payload
+                    )
+
+    def test_reflection_rejects_certainty_and_real_order_instructions(self):
+        unsafe_phrases = (
+            "The result was proved.",
+            "The headline caused the move.",
+            "Buy now with real funds.",
+            "Place a real order immediately.",
+            "立即买入并下单。",
+            "马上卖出真实仓位。",
+            "请立即执行下单。",
+        )
+        for phrase in unsafe_phrases:
+            with self.subTest(phrase=phrase), TemporaryDirectory() as directory:
+                report_store, index_store, session = pending_report_fixture(directory)
+                payload = valid_reflection_payload()
+                payload["overall_assessment"] = phrase
+                with self.assertRaises(
+                    hermes_report_learning.ReportReflectionRejected
+                ):
+                    hermes_report_learning.submit_report_reflection(
+                        report_store, index_store, session, 1, payload
+                    )
+
+    def test_renderer_is_stable_and_contains_all_outcomes_and_disclaimers(self):
+        first = hermes_report_learning.render_report_lesson(
+            ready_record(), revision=3
+        )
+        second = hermes_report_learning.render_report_lesson(
+            ready_record(), revision=3
+        )
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(
+            len(first.lesson), hermes_report_learning.REPORT_LESSON_MAX_CHARS
+        )
+        self.assertIn("T+1", first.lesson)
+        self.assertIn("T+7", first.lesson)
+        self.assertIn("T+15", first.lesson)
+        self.assertIn("hypotheses", first.lesson.lower())
+        self.assertTrue(
+            first.hermes_memory_entry.startswith("[TradingAgents paper report:")
+        )
+        self.assertIn("paper trading", first.hermes_memory_entry.lower())
+        self.assertLessEqual(
+            len(first.hermes_memory_entry),
+            hermes_report_learning.HERMES_REPORT_MEMORY_MAX_CHARS,
+        )
+
     def test_report_store_records_maps_invalid_filename_to_storage_error(self):
         invalid_filename = "hermes_not-a-valid-id.json"
         with TemporaryDirectory() as directory:
@@ -400,13 +694,13 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertEqual(repeated.model_dump(), records[-1].model_dump())
         self.assertEqual(repeated_bytes, final_bytes)
         expected_source_values = {
-            "market_report": "Market report.",
-            "sentiment_report": "Sentiment report.",
-            "news_report": "News report.",
-            "fundamentals_report": "Fundamentals report.",
+            "report.market": "Market report.",
+            "report.sentiment": "Sentiment report.",
+            "report.news": "News report.",
+            "report.fundamentals": "Fundamentals report.",
             "investment_plan": "Investment plan.",
-            "trader_investment_plan": "Trader investment plan.",
-            "final_trade_decision": "FINAL TRANSACTION PROPOSAL: **BUY**",
+            "trader_plan": "Trader investment plan.",
+            "final_decision": "FINAL TRANSACTION PROPOSAL: **BUY**",
             "processed_signal": "BUY",
         }
         source_fields = records[-1].revisions[-1].source_fields
@@ -558,7 +852,7 @@ class HermesReportLearningTests(unittest.TestCase):
 
                     self.assertEqual(path.read_bytes(), tampered_bytes)
 
-    def test_report_store_allows_packet_specific_truncation_metadata(self):
+    def test_report_store_rejects_packet_metadata_with_wrong_truncation_flag(self):
         with TemporaryDirectory() as directory:
             store = ReportLearningStore(Path(directory))
             session = completed_session()
@@ -583,12 +877,12 @@ class HermesReportLearningTests(unittest.TestCase):
             path = store.path_for(session.session_id)
             truncated_bytes = path.read_bytes()
 
-            repeated = record_review_fact(store, session, paper_review(1))
+            with self.assertRaises(ReportLearningConflict):
+                record_review_fact(store, session, paper_review(1))
 
-            repeated_bytes = path.read_bytes()
+            persisted_bytes = path.read_bytes()
 
-        self.assertEqual(repeated, truncated)
-        self.assertEqual(repeated_bytes, truncated_bytes)
+        self.assertEqual(persisted_bytes, truncated_bytes)
 
     def test_concurrent_report_facts_retain_outcomes_and_order_revisions(self):
         context = multiprocessing.get_context("fork")

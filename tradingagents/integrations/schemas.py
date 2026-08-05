@@ -458,6 +458,58 @@ class ReportSourceMetadata(_StrictModel):
         return normalized
 
 
+class ReportEvidenceField(_StrictModel):
+    name: _NonBlankText100
+    excerpt: str = Field(max_length=2000)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    truncated: bool
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("evidence field name must not be blank")
+        return normalized
+
+
+class ReportEvidencePacket(_StrictModel):
+    schema_version: Literal[1] = 1
+    session_id: str
+    revision: int = Field(ge=1, le=3)
+    source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome_review_ids: list[str] = Field(min_length=1, max_length=3)
+    fields: list[ReportEvidenceField] = Field(min_length=2, max_length=11)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        if not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
+
+    @field_validator("outcome_review_ids")
+    @classmethod
+    def validate_outcome_review_ids(cls, value: list[str]) -> list[str]:
+        if any(not is_valid_review_id(review_id) for review_id in value):
+            raise ValueError("invalid review id")
+        if len(value) != len(set(value)):
+            raise ValueError("outcome review ids must be unique")
+        return value
+
+    @field_validator("fields")
+    @classmethod
+    def validate_unique_field_names(
+        cls, value: list[ReportEvidenceField]
+    ) -> list[ReportEvidenceField]:
+        names = [field.name for field in value]
+        if len(names) != len(set(names)):
+            raise ValueError("evidence field names must be unique")
+        return value
+
+
 class ReportLearningOutcome(_StrictModel):
     review_id: str
     horizon_days: Literal[1, 7, 15]
