@@ -22,6 +22,7 @@ _SESSION_ID_PATTERN = re.compile(r"^hermes_[0-9a-f]{16,64}$")
 _REVIEW_ID_PATTERN = re.compile(r"^review_[0-9a-f]{16,64}$")
 _REPORT_BATCH_ID_PATTERN = re.compile(r"^report_[0-9a-f]{16,64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9]{2,20}$")
+_SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
 
 
 def is_valid_session_id(session_id: str) -> bool:
@@ -46,6 +47,28 @@ def utc_now() -> datetime:
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _require_nonblank_text(value: str, field_name: str) -> str:
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} must not be blank")
+    return normalized
+
+
+def _normalize_text_list(
+    value: list[str], field_name: str, *, max_item_length: int
+) -> list[str]:
+    if not isinstance(value, list):
+        return value
+    normalized = [_require_nonblank_text(item, field_name) for item in value]
+    if any(
+        isinstance(item, str) and len(item) > max_item_length for item in normalized
+    ):
+        raise ValueError(f"{field_name} must be at most {max_item_length} characters")
+    return normalized
 
 
 class AnalysisRequest(_StrictModel):
@@ -192,7 +215,7 @@ class DailyReportArchive(_StrictModel):
     state: Literal["ready", "degraded"]
     archived_at: datetime
     items: list["DailyReportArchiveItem"] = Field(min_length=1, max_length=5)
-    scheduled_review_version: Literal[1] | None = None
+    scheduled_review_version: Literal[1, 2] | None = None
 
 
 class DailyReportArchiveItem(_StrictModel):
@@ -289,6 +312,7 @@ class ScheduledReviewItem(_StrictModel):
 
 class ScheduledReviewPlan(_StrictModel):
     schema_version: Literal[1] = 1
+    workflow_version: Literal[1, 2] = 1
     batch_id: str
     trade_date: date
     created_at: datetime
@@ -403,6 +427,7 @@ class SymbolLearningEntry(_StrictModel):
     review_id: str
     review_date: date
     lesson: str = Field(min_length=1, max_length=1000)
+    session_id: str | None = None
 
     @field_validator("review_id")
     @classmethod
@@ -411,12 +436,206 @@ class SymbolLearningEntry(_StrictModel):
             raise ValueError("invalid review id")
         return value
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_optional_session_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
 
-class SymbolLearningIndex(_StrictModel):
-    schema_version: Literal[1] = 1
-    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+
+class ReportSourceMetadata(_StrictModel):
+    name: str = Field(max_length=100)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    truncated: bool
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("source name must not be blank")
+        return normalized
+
+
+class ReportLearningOutcome(_StrictModel):
+    review_id: str
+    horizon_days: Literal[1, 7, 15]
+    review_date: date
+    raw_return_pct: float
+    verdict: Literal["correct", "incorrect", "flat", "not_scored"]
+
+    @field_validator("review_id")
+    @classmethod
+    def validate_review_id(cls, value: str) -> str:
+        if not is_valid_review_id(value):
+            raise ValueError("invalid review id")
+        return value
+
+    @field_validator("raw_return_pct")
+    @classmethod
+    def validate_finite_return(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("return percentage must be finite")
+        return value
+
+
+class ReportCausalHypothesis(_StrictModel):
+    statement: str = Field(max_length=400)
+    evidence: list[str] = Field(min_length=1, max_length=4)
+    confidence: Literal["low", "medium", "high"]
+
+    @field_validator("statement", mode="before")
+    @classmethod
+    def normalize_statement(cls, value: str) -> str:
+        return _require_nonblank_text(value, "causal hypothesis statement")
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def normalize_evidence(cls, value: list[str]) -> list[str]:
+        return _normalize_text_list(
+            value, "causal hypothesis evidence", max_item_length=100
+        )
+
+
+class ReportOutcomeAssessment(_StrictModel):
+    horizon_days: Literal[1, 7, 15]
+    assessment: str = Field(max_length=400)
+
+    @field_validator("assessment", mode="before")
+    @classmethod
+    def normalize_assessment(cls, value: str) -> str:
+        return _require_nonblank_text(value, "outcome assessment")
+
+
+class ReportReflection(_StrictModel):
+    decision_thesis: str = Field(max_length=600)
+    technical_context: str | None = Field(default=None, max_length=600)
+    sentiment_context: str | None = Field(default=None, max_length=600)
+    news_context: str | None = Field(default=None, max_length=600)
+    fundamental_context: str | None = Field(default=None, max_length=600)
+    overall_assessment: str = Field(max_length=800)
+    outcome_assessments: list[ReportOutcomeAssessment] = Field(min_length=1, max_length=3)
+    reasoning_strengths: list[str] = Field(max_length=3)
+    causal_hypotheses: list[ReportCausalHypothesis] = Field(min_length=1, max_length=3)
+    mistakes_or_missed_opportunities: list[str] = Field(max_length=3)
+    next_decision_checks: list[str] = Field(min_length=1, max_length=5)
+
+    @field_validator(
+        "decision_thesis",
+        "overall_assessment",
+        "technical_context",
+        "sentiment_context",
+        "news_context",
+        "fundamental_context",
+        mode="before",
+    )
+    @classmethod
+    def normalize_reflection_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _require_nonblank_text(value, "reflection text")
+
+    @field_validator(
+        "reasoning_strengths",
+        "mistakes_or_missed_opportunities",
+        "next_decision_checks",
+        mode="before",
+    )
+    @classmethod
+    def normalize_reflection_lists(cls, value: list[str]) -> list[str]:
+        return _normalize_text_list(
+            value, "reflection list item", max_item_length=400
+        )
+
+    @model_validator(mode="after")
+    def require_unique_outcome_horizons(self) -> "ReportReflection":
+        horizons = [assessment.horizon_days for assessment in self.outcome_assessments]
+        if len(horizons) != len(set(horizons)):
+            raise ValueError("outcome assessment horizons must be unique")
+        return self
+
+
+class ReportLearningRevision(_StrictModel):
+    revision: int = Field(ge=1, le=3)
+    outcome_review_ids: list[str] = Field(min_length=1, max_length=3)
+    reflection_state: Literal["pending", "ready", "attention_required"]
+    memory_state: Literal[
+        "blocked",
+        "add_pending",
+        "replace_pending",
+        "memory_call_started",
+        "verification_pending",
+        "confirmed",
+        "attention_required",
+    ]
+    source_fields: list[ReportSourceMetadata] = Field(min_length=1, max_length=8)
+    reflection_attempt_count: int = Field(ge=0)
+    last_error_code: str | None = Field(default=None, max_length=100)
+    reflection: ReportReflection | None = None
+    lesson: str | None = Field(default=None, max_length=6000)
+    hermes_memory_entry: str | None = Field(default=None, max_length=6000)
+    created_at: datetime
     updated_at: datetime
-    entries: list[SymbolLearningEntry]
+    verified_at: datetime | None = None
+
+    @field_validator("outcome_review_ids")
+    @classmethod
+    def validate_outcome_review_ids(cls, value: list[str]) -> list[str]:
+        if any(not is_valid_review_id(review_id) for review_id in value):
+            raise ValueError("invalid review id")
+        if len(value) != len(set(value)):
+            raise ValueError("outcome review ids must be unique")
+        return value
+
+    @field_validator("source_fields")
+    @classmethod
+    def validate_unique_source_field_names(
+        cls, value: list[ReportSourceMetadata]
+    ) -> list[ReportSourceMetadata]:
+        names = [source.name for source in value]
+        if len(names) != len(set(names)):
+            raise ValueError("source field names must be unique")
+        return value
+
+    @field_validator("last_error_code", "lesson", "hermes_memory_entry", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _require_nonblank_text(value, "optional text")
+
+    @field_validator("last_error_code")
+    @classmethod
+    def validate_safe_error_code(cls, value: str | None) -> str | None:
+        if value is not None and not _SAFE_ERROR_CODE_PATTERN.fullmatch(value):
+            raise ValueError("invalid error code")
+        return value
+
+
+class ReportLearningRecord(_StrictModel):
+    schema_version: Literal[1] = 1
+    session_id: str
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    trade_date: date
+    action: Literal["BUY", "SELL", "HOLD", "UNPARSEABLE"]
+    source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    desired_revision: int = Field(ge=1, le=3)
+    reflected_revision: int = Field(ge=0, le=3)
+    confirmed_revision: int = Field(ge=0, le=3)
+    outcomes: list[ReportLearningOutcome] = Field(min_length=1, max_length=3)
+    revisions: list[ReportLearningRevision] = Field(min_length=1, max_length=3)
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        if not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
 
     @field_validator("symbol", mode="before")
     @classmethod
@@ -424,3 +643,67 @@ class SymbolLearningIndex(_StrictModel):
         if not isinstance(value, str):
             return value
         return value.strip().upper()
+
+    @model_validator(mode="after")
+    def require_coherent_snapshots(self) -> "ReportLearningRecord":
+        horizons = [outcome.horizon_days for outcome in self.outcomes]
+        if horizons != sorted(horizons) or len(horizons) != len(set(horizons)):
+            raise ValueError("outcome horizons must be unique and ordered")
+        expected_revisions = list(range(1, self.desired_revision + 1))
+        revisions = [revision.revision for revision in self.revisions]
+        if revisions != expected_revisions:
+            raise ValueError("revisions must run from 1 through desired revision")
+        outcome_ids = [outcome.review_id for outcome in self.outcomes]
+        for revision in self.revisions:
+            expected_ids = outcome_ids[: len(revision.outcome_review_ids)]
+            if revision.outcome_review_ids != expected_ids:
+                raise ValueError("revision outcomes must be a current outcome prefix")
+        if not 0 <= self.confirmed_revision <= self.reflected_revision <= self.desired_revision:
+            raise ValueError("revision state must be ordered")
+        return self
+
+
+class ReportLearningIndexEntry(_StrictModel):
+    session_id: str
+    trade_date: date
+    maturity_days: Literal[1, 7, 15]
+    reflected_revision: int = Field(ge=1, le=3)
+    updated_at: datetime
+    lesson: str = Field(max_length=6000)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        if not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
+
+    @field_validator("lesson", mode="before")
+    @classmethod
+    def normalize_lesson(cls, value: str) -> str:
+        return _require_nonblank_text(value, "lesson")
+
+
+class SymbolLearningIndex(_StrictModel):
+    schema_version: Literal[1, 2] = 1
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    updated_at: datetime
+    entries: list[SymbolLearningEntry] = Field(default_factory=list)
+    report_entries: list[ReportLearningIndexEntry] = Field(default_factory=list)
+    legacy_entries: list[SymbolLearningEntry] = Field(default_factory=list)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
+
+    @model_validator(mode="after")
+    def require_versioned_entries(self) -> "SymbolLearningIndex":
+        if self.schema_version == 1:
+            if self.report_entries or self.legacy_entries:
+                raise ValueError("v1 indexes permit only entries")
+        elif self.entries:
+            raise ValueError("v2 indexes require empty entries")
+        return self
