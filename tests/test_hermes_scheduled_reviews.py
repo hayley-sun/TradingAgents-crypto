@@ -5,7 +5,10 @@ from tempfile import TemporaryDirectory
 
 from pydantic import ValidationError
 
-from tradingagents.integrations.hermes_scheduled_reviews import ScheduledReviewStore
+from tradingagents.integrations.hermes_scheduled_reviews import (
+    ScheduledReviewStore,
+    process_due_reviews,
+)
 from tradingagents.integrations.schemas import (
     DailyReportArchive,
     DailyReportArchiveItem,
@@ -110,6 +113,73 @@ class HermesScheduledReviewTests(unittest.TestCase):
         self.assertEqual(
             [item.skip_reason for item in eth_items], ["ANALYSIS_FAILED"] * 3
         )
+
+    def test_review_date_must_be_fully_elapsed(self):
+        calls = []
+
+        def reviewer(session_id, review_date):
+            calls.append((session_id, review_date))
+            plan = store.load(date(2026, 8, 5))
+            item = next(
+                candidate
+                for candidate in plan.items
+                if candidate.session_id == session_id
+                and candidate.review_date == review_date
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "review": {
+                        "review_id": item.review_id,
+                        "session_id": session_id,
+                        "review_date": review_date.isoformat(),
+                    }
+                },
+            }
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            store.create_or_load(archived_batch())
+
+            same_day = process_due_reviews(store, date(2026, 8, 6), reviewer)
+            next_day = process_due_reviews(store, date(2026, 8, 7), reviewer)
+            plan = store.load(date(2026, 8, 5))
+
+        self.assertEqual(same_day.reviewed_count, 0)
+        self.assertEqual(next_day.reviewed_count, 3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [item.state for item in plan.items if item.horizon_days == 1],
+            ["memory_pending"] * 3,
+        )
+        self.assertTrue(
+            all(
+                item.state == "review_pending"
+                for item in plan.items
+                if item.horizon_days != 1
+            )
+        )
+
+    def test_price_failure_remains_retryable(self):
+        def failing_reviewer(_session_id, _review_date):
+            return {
+                "ok": False,
+                "error": {"code": "PRICE_DATA_UNAVAILABLE"},
+            }
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            store.create_or_load(archived_batch())
+
+            report = process_due_reviews(
+                store, date(2026, 8, 7), failing_reviewer
+            )
+            item = store.load(date(2026, 8, 5)).items[0]
+
+        self.assertEqual(report.retryable_count, 3)
+        self.assertEqual(item.state, "review_pending")
+        self.assertEqual(item.attempt_count, 1)
+        self.assertEqual(item.last_error_code, "PRICE_DATA_UNAVAILABLE")
 
 
 if __name__ == "__main__":

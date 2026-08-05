@@ -361,6 +361,7 @@ class PaperDecisionReview(_StrictModel):
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     trade_date: date
     review_date: date
+    horizon_days: int | None = Field(default=None, gt=0)
     action: Literal["BUY", "SELL", "HOLD", "UNPARSEABLE"]
     entry_price: PriceReference
     review_price: PriceReference

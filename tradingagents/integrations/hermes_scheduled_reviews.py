@@ -2,10 +2,14 @@
 
 import json
 import os
+import re
 import tempfile
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import fcntl
 from pydantic import ValidationError
@@ -25,6 +29,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 class ScheduledReviewStorageError(RuntimeError):
     """Raised when a scheduled-review plan cannot be persisted safely."""
+
+
+@dataclass(frozen=True)
+class ScheduledReviewProcessReport:
+    due_count: int
+    reviewed_count: int
+    retryable_count: int
+    skipped_count: int
 
 
 def _atomic_json_write(destination: Path, value: dict) -> None:
@@ -93,6 +105,18 @@ class ScheduledReviewStore:
     def _exclusive_lock(self):
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / ".scheduled-reviews.lock").open(
+            "a", encoding="ascii"
+        ) as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def processing_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".scheduled-review-processing.lock").open(
             "a", encoding="ascii"
         ) as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -182,3 +206,118 @@ class ScheduledReviewStore:
                 "scheduled review plans unavailable"
             ) from error
         return plans
+
+    def update_item(self, review_id: str, **updates: Any) -> ScheduledReviewItem:
+        with self._exclusive_lock():
+            for plan in self.plans():
+                for index, item in enumerate(plan.items):
+                    if item.review_id != review_id:
+                        continue
+                    updated_item = ScheduledReviewItem.model_validate(
+                        {**item.model_dump(mode="python"), **updates}
+                    )
+                    items = list(plan.items)
+                    items[index] = updated_item
+                    self.save(plan.model_copy(update={"items": items}))
+                    return updated_item
+        raise ScheduledReviewStorageError("scheduled review item unavailable")
+
+
+_SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
+_SKIPPED_REVIEW_ERRORS = {
+    "SESSION_NOT_FOUND",
+    "SESSION_NOT_COMPLETED",
+    "SESSION_UNREADABLE",
+}
+
+
+def _error_code(result: dict[str, Any]) -> str:
+    error = result.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and _SAFE_ERROR_CODE.fullmatch(code) else "SCHEDULED_REVIEW_FAILED"
+
+
+def _successful_review_matches(
+    result: dict[str, Any], item: ScheduledReviewItem
+) -> bool:
+    try:
+        review = result["data"]["review"]
+        return (
+            result.get("ok") is True
+            and review["review_id"] == item.review_id
+            and review["session_id"] == item.session_id
+            and review["review_date"] == item.review_date.isoformat()
+        )
+    except (KeyError, TypeError):
+        return False
+
+
+def process_due_reviews(
+    store: ScheduledReviewStore,
+    current_utc_date: date,
+    reviewer: Callable[[str, date], dict[str, Any]],
+) -> ScheduledReviewProcessReport:
+    """Process only review dates whose UTC calendar day has fully elapsed."""
+    if not isinstance(current_utc_date, date):
+        raise ValueError("invalid current UTC date")
+    due_count = 0
+    reviewed_count = 0
+    retryable_count = 0
+    skipped_count = 0
+    with store.processing_lock():
+        due_items = sorted(
+            (
+                item
+                for plan in store.plans()
+                for item in plan.items
+                if item.state == "review_pending"
+                and item.review_date < current_utc_date
+            ),
+            key=lambda item: (item.review_date, item.symbol, item.horizon_days),
+        )
+        for item in due_items:
+            due_count += 1
+            try:
+                result = reviewer(item.session_id, item.review_date)
+            except Exception:
+                result = {
+                    "ok": False,
+                    "error": {"code": "SCHEDULED_REVIEW_FAILED"},
+                }
+            attempts = item.attempt_count + 1
+            if _successful_review_matches(result, item):
+                store.update_item(
+                    item.review_id,
+                    state="memory_pending",
+                    attempt_count=attempts,
+                    last_error_code=None,
+                    updated_at=utc_now(),
+                )
+                reviewed_count += 1
+                continue
+
+            code = _error_code(result)
+            if code in _SKIPPED_REVIEW_ERRORS:
+                store.update_item(
+                    item.review_id,
+                    state="skipped",
+                    attempt_count=attempts,
+                    last_error_code=code,
+                    skip_reason=code,
+                    updated_at=utc_now(),
+                )
+                skipped_count += 1
+            else:
+                store.update_item(
+                    item.review_id,
+                    attempt_count=attempts,
+                    last_error_code=code,
+                    updated_at=utc_now(),
+                )
+                retryable_count += 1
+    return ScheduledReviewProcessReport(
+        due_count=due_count,
+        reviewed_count=reviewed_count,
+        retryable_count=retryable_count,
+        skipped_count=skipped_count,
+    )

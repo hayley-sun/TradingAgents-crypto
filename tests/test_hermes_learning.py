@@ -165,8 +165,10 @@ class HermesLearningTests(unittest.TestCase):
         self.assertEqual(review.verdict, "correct")
         self.assertEqual(review.raw_return_pct, 10.0)
         self.assertEqual(repeated.review_id, review.review_id)
+        self.assertEqual(review.horizon_days, 1)
         self.assertEqual(calls, [(date(2026, 7, 28), date(2026, 7, 29))])
         self.assertIn("paper-trading", review.hermes_memory_entry.lower())
+        self.assertIn("T+1", review.hermes_memory_entry)
         self.assertNotIn("coingecko", review.hermes_memory_entry.lower())
 
     def test_sell_hold_and_unparseable_actions_have_deterministic_verdicts(self):
