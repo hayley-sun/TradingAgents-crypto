@@ -1,7 +1,7 @@
 """Ordered promotion of reflected report lessons through Hermes memory."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Callable, Literal
@@ -45,6 +45,7 @@ class ReportMemoryWork:
     revision: int
     maturity_days: int
     action: Literal["add", "replace"]
+    memory_state: str = field(default="add_pending", kw_only=True, compare=False)
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ def _work(record: ReportLearningRecord, revision: ReportLearningRevision) -> Rep
         revision=revision.revision,
         maturity_days=record.outcomes[revision.revision - 1].horizon_days,
         action="add" if revision.revision == 1 else "replace",
+        memory_state=revision.memory_state,
     )
 
 

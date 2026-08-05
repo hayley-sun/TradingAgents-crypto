@@ -217,6 +217,30 @@ class HermesReportMemoryTests(unittest.TestCase):
         self.assertEqual(first, restarted)
         self.assertEqual(confirmed.confirmed_revision, 1)
 
+    def test_runner_exposes_verification_pending_without_memory_mutation_payload(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            first = begin_report_memory(store, SESSION_ID, 1)
+
+            def mark_verification_pending(current):
+                snapshot = current.revisions[0].model_copy(update={"memory_state": "verification_pending"})
+                return current.model_copy(update={"revisions": [snapshot]})
+
+            store.update(SESSION_ID, mark_verification_pending)
+            code, listing = runner.run_report_memory_pending(
+                18, lambda limit: list_pending_report_memory(store, limit)
+            )
+            begin_code, begin_payload = runner.run_begin_report_memory(
+                SESSION_ID, 1, lambda session_id, revision: begin_report_memory(store, session_id, revision)
+            )
+        self.assertEqual(first.memory_state, "memory_call_started")
+        self.assertEqual(code, 0)
+        self.assertEqual(listing["items"][0]["memory_state"], "verification_pending")
+        self.assertEqual(begin_code, 0)
+        self.assertEqual(begin_payload["memory_state"], "verification_pending")
+        self.assertNotIn("content", begin_payload)
+        self.assertNotIn("old_text", begin_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

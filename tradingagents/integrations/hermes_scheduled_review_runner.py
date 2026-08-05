@@ -261,6 +261,7 @@ def run_report_memory_pending(
                 "revision": item.revision,
                 "maturity_days": item.maturity_days,
                 "action": item.action,
+                "memory_state": item.memory_state,
             }
             for item in work
         ],
@@ -288,8 +289,15 @@ def run_begin_report_memory(
         "revision": operation.revision,
         "maturity_days": operation.maturity_days,
         "action": operation.action,
-        "content": operation.content,
-        "old_text": operation.old_text,
+        **(
+            {
+                "content": operation.content,
+                "old_text": operation.old_text,
+            }
+            if operation.memory_state != "verification_pending"
+            else {}
+        ),
+        "memory_state": operation.memory_state,
     }
 
 
