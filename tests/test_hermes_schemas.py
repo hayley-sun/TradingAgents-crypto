@@ -752,6 +752,41 @@ class HermesSchemaTests(unittest.TestCase):
             with self.subTest(scenario=scenario), self.assertRaises(ValidationError):
                 ReportLearningRecord(**{**values, "revisions": invalid_revisions})
 
+        pending_revisions = [
+            {
+                **revisions[0].model_dump(),
+                "memory_state": "add_pending",
+                "verified_at": None,
+            },
+            {**revisions[1].model_dump(), "memory_state": "replace_pending"},
+            revisions[2],
+        ]
+        pending_values = {
+            **values,
+            "confirmed_revision": 0,
+            "revisions": pending_revisions,
+        }
+        self.assertEqual(ReportLearningRecord(**pending_values).confirmed_revision, 0)
+        invalid_pending_states = (
+            [
+                {**pending_revisions[0], "memory_state": "replace_pending"},
+                pending_revisions[1],
+                pending_revisions[2],
+            ],
+            [
+                pending_revisions[0],
+                {**pending_revisions[1], "memory_state": "add_pending"},
+                pending_revisions[2],
+            ],
+        )
+        for invalid_revisions in invalid_pending_states:
+            with self.subTest(invalid_revisions=invalid_revisions), self.assertRaises(
+                ValidationError
+            ):
+                ReportLearningRecord(
+                    **{**pending_values, "revisions": invalid_revisions}
+                )
+
         with self.assertRaises(ValidationError):
             ReportLearningRecord(
                 **{
@@ -792,8 +827,28 @@ class HermesSchemaTests(unittest.TestCase):
         self.assertEqual(index.symbol, "BTC")
         with self.assertRaises(ValidationError):
             SymbolLearningIndex(symbol="BTC", updated_at=utc_now())
+        try:
+            v2_without_entries = SymbolLearningIndex(
+                schema_version=2,
+                symbol="BTC",
+                updated_at=utc_now(),
+                report_entries=[report_entry],
+                legacy_entries=[legacy_entry],
+            )
+        except ValidationError as exc:
+            self.fail(f"v2 index without entries was rejected: {exc}")
+        self.assertEqual(v2_without_entries.entries, [])
+
+        index_schema = SymbolLearningIndex.model_json_schema()
+        self.assertNotIn("entries", index_schema.get("required", []))
         self.assertIn(
-            "entries", SymbolLearningIndex.model_json_schema()["required"]
+            {
+                "if": {
+                    "properties": {"schema_version": {"const": 1}},
+                },
+                "then": {"required": ["entries"]},
+            },
+            index_schema["allOf"],
         )
         legacy_json = SymbolLearningIndex(
             symbol="BTC",

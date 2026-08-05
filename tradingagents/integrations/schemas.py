@@ -679,6 +679,13 @@ class ReportLearningRecord(_StrictModel):
                 and revision.memory_state not in unconfirmed_memory_states
             ):
                 raise ValueError("reflected revisions require an active memory state")
+            elif (
+                revision.revision <= self.reflected_revision
+                and revision.memory_state in {"add_pending", "replace_pending"}
+                and revision.memory_state
+                != ("add_pending" if revision.revision == 1 else "replace_pending")
+            ):
+                raise ValueError("initial memory state must match the revision operation")
         return self
 
 
@@ -704,12 +711,35 @@ class ReportLearningIndexEntry(_StrictModel):
 
 
 class SymbolLearningIndex(_StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"schema_version": {"const": 1}},
+                    },
+                    "then": {"required": ["entries"]},
+                }
+            ]
+        },
+    )
+
     schema_version: Literal[1, 2] = 1
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     updated_at: datetime
-    entries: list[SymbolLearningEntry]
+    entries: list[SymbolLearningEntry] = Field(default_factory=list)
     report_entries: list[ReportLearningIndexEntry] = Field(default_factory=list)
     legacy_entries: list[SymbolLearningEntry] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_v1_entries(cls, value: object) -> object:
+        if isinstance(value, dict):
+            schema_version = value.get("schema_version", 1)
+            if schema_version in (1, "1") and "entries" not in value:
+                raise ValueError("v1 indexes require entries")
+        return value
 
     @field_validator("symbol", mode="before")
     @classmethod
