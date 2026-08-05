@@ -76,7 +76,12 @@ def _earliest(record: ReportLearningRecord) -> ReportLearningRevision | None:
     revision = record.revisions[number - 1]
     if revision.reflection_state != "ready":
         return None
-    if revision.memory_state not in {"add_pending", "replace_pending", "memory_call_started"}:
+    if revision.memory_state not in {
+        "add_pending",
+        "replace_pending",
+        "memory_call_started",
+        "verification_pending",
+    }:
         return None
     return revision
 
@@ -120,7 +125,7 @@ def begin_report_memory(
         snapshot = record.revisions[revision - 1]
         if snapshot.reflection_state != "ready":
             raise ValueError("report memory revision is not ready")
-        if snapshot.memory_state == "memory_call_started":
+        if snapshot.memory_state in {"memory_call_started", "verification_pending"}:
             return _operation(record, snapshot)
         expected = "add_pending" if revision == 1 else "replace_pending"
         if snapshot.memory_state != expected:

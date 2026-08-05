@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from tradingagents.integrations.hermes_report_memory import (
     list_pending_report_memory,
     quarantine_report_memory,
 )
+from tradingagents.integrations.hermes_report_learning import REPORT_MEMORY_MARKER
 from tradingagents.integrations import hermes_scheduled_review_runner as runner
 from tradingagents.integrations.hermes_report_memory_verifier import (
     verify_report_memory_consistency,
@@ -159,6 +161,61 @@ class HermesReportMemoryTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
         self.assertEqual(called, [])
+
+    def test_verifier_rejects_tampered_index_symbol(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            record = store.load(SESSION_ID)
+            results = Path(directory)
+            index_store = LearningStore(results / "hermes" / "memories")
+            index_store.upsert_report(record)
+            index_path = index_store.path_for(record.symbol)
+            payload = json.loads(index_path.read_text(encoding="ascii"))
+            payload["symbol"] = "ETH"
+            index_path.write_text(json.dumps(payload), encoding="ascii")
+            memory_path = results / "MEMORY.md"
+            memory_path.write_text(record.revisions[0].hermes_memory_entry, encoding="utf-8")
+            result = verify_report_memory_consistency(SESSION_ID, 1, results, memory_path)
+        self.assertFalse(result.index_matches_latest_reflection)
+        self.assertFalse(result.ok)
+
+    def test_verifier_requires_exact_marker_segment_and_allows_unrelated_entries(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            record = store.load(SESSION_ID)
+            results = Path(directory)
+            LearningStore(results / "hermes" / "memories").upsert_report(record)
+            entry = record.revisions[0].hermes_memory_entry
+            other_marker = REPORT_MEMORY_MARKER.format(session_id="hermes_abcdef0123456789")
+            memory_path = results / "MEMORY.md"
+            memory_path.write_text(
+                f"{other_marker}\nUnrelated report entry.\n\n{entry}", encoding="utf-8"
+            )
+            self.assertTrue(verify_report_memory_consistency(SESSION_ID, 1, results, memory_path).ok)
+            target_marker = REPORT_MEMORY_MARKER.format(session_id=SESSION_ID)
+            for tampered in (entry + " forged suffix", entry.replace(target_marker, target_marker + " forged prefix")):
+                memory_path.write_text(tampered, encoding="utf-8")
+                self.assertFalse(verify_report_memory_consistency(SESSION_ID, 1, results, memory_path).ok)
+
+    def test_verification_pending_is_listable_and_begin_is_idempotent_after_crash(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            first = begin_report_memory(store, SESSION_ID, 1)
+
+            def mark_verification_pending(current):
+                snapshot = current.revisions[0].model_copy(update={"memory_state": "verification_pending"})
+                return current.model_copy(update={"revisions": [snapshot]})
+
+            store.update(SESSION_ID, mark_verification_pending)
+            code, listing = runner.run_report_memory_pending(
+                18, lambda limit: list_pending_report_memory(store, limit)
+            )
+            restarted = begin_report_memory(store, SESSION_ID, 1)
+            confirmed = confirm_report_memory(store, SESSION_ID, 1, verifier=lambda *_args: True)
+        self.assertEqual(code, 0)
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(first, restarted)
+        self.assertEqual(confirmed.confirmed_revision, 1)
 
 
 if __name__ == "__main__":

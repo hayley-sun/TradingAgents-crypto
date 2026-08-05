@@ -1,6 +1,7 @@
 """Read-only verification for ordered Hermes report-memory promotions."""
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,9 @@ from tradingagents.integrations.hermes_report_learning import (
     REPORT_MEMORY_MARKER,
     ReportLearningStore,
 )
+
+
+_REPORT_MARKER_RE = re.compile(r"\[TradingAgents paper report: [^\]\r\n]+\]")
 
 
 @dataclass(frozen=True)
@@ -70,13 +74,25 @@ def verify_report_memory_consistency(
         marker = REPORT_MEMORY_MARKER.format(session_id=session_id)
         marker_occurrences = memory_text.count(marker)
         if snapshot.hermes_memory_entry is not None:
-            exact_content_occurrences = memory_text.count(snapshot.hermes_memory_entry)
+            markers = list(_REPORT_MARKER_RE.finditer(memory_text))
+            segments = [
+                memory_text[match.start() : markers[index + 1].start() if index + 1 < len(markers) else len(memory_text)]
+                for index, match in enumerate(markers)
+            ]
+            desired = snapshot.hermes_memory_entry.strip("\r\n")
+            exact_content_occurrences = sum(
+                segment.strip("\r\n") == desired for segment in segments
+            )
 
         index = LearningStore(Path(results_root) / "hermes" / "memories").load(record.symbol)
         index_exists = index is not None and index.schema_version == 2
         if index_exists:
             matches = [entry for entry in index.report_entries if entry.session_id == session_id]
-            if len(matches) == 1 and 1 <= record.reflected_revision <= len(record.revisions):
+            if (
+                index.symbol == record.symbol
+                and len(matches) == 1
+                and 1 <= record.reflected_revision <= len(record.revisions)
+            ):
                 latest = record.revisions[record.reflected_revision - 1]
                 index_matches_latest_reflection = (
                     matches[0].reflected_revision == record.reflected_revision
