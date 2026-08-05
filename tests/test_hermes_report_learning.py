@@ -24,6 +24,7 @@ from tradingagents.integrations.schemas import (
     PaperDecisionReview,
     PriceReference,
     ReportCausalHypothesis,
+    ReportEvidencePacket,
     ReportLearningOutcome,
     ReportLearningRecord,
     ReportLearningRevision,
@@ -480,6 +481,12 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertEqual(first.revisions[0].reflection_state, "ready")
         self.assertEqual(first.revisions[0].memory_state, "add_pending")
         self.assertEqual(index.report_entries[0].lesson, first.revisions[0].lesson)
+        self.assertEqual(
+            first.revisions[0].hermes_memory_entry.count(
+                hermes_report_learning.REPORT_MEMORY_MARKER.split("{session_id}")[0]
+            ),
+            1,
+        )
 
     def test_reflection_verdict_sections_cover_all_outcomes(self):
         for verdict in ("correct", "incorrect", "flat", "not_scored"):
@@ -640,6 +647,99 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertIn("Maturity: T+7", rendered.lesson)
         self.assertIn("Archived market context:", rendered.lesson)
         self.assertIn("report.market", rendered.lesson)
+
+    def test_renderer_preserves_actual_decision_time_market_context(self):
+        record = report_learning_record(horizons=(7,))
+        reflection = record.revisions[0].reflection.model_copy(
+            update={"technical_context": "Archived support held at 100; 支撑位保持。"}
+        )
+        record = record.model_copy(
+            update={
+                "revisions": [
+                    record.revisions[0].model_copy(update={"reflection": reflection})
+                ]
+            }
+        )
+
+        rendered = hermes_report_learning.render_report_lesson(record, revision=1)
+
+        self.assertIn("Decision-time market context:", rendered.lesson)
+        self.assertIn("支撑位保持", rendered.lesson)
+
+    def test_evidence_packet_requires_identity_and_canonical_fields(self):
+        session = completed_session()
+        record = record_with_pending_revision(session)
+        packet = hermes_report_learning.build_evidence_packet(record, session, 1)
+        packet_data = packet.model_dump(mode="json")
+
+        invalid_packets = (
+            {
+                **packet_data,
+                "fields": [
+                    {**packet_data["fields"][0], "name": "x"},
+                    *packet_data["fields"][1:],
+                ],
+            },
+            {**packet_data, "fields": packet_data["fields"][1:]},
+            {key: value for key, value in packet_data.items() if key != "symbol"},
+        )
+        for invalid in invalid_packets:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    ReportEvidencePacket.model_validate(invalid)
+
+    def test_maximal_chinese_rendering_is_bounded_in_chars_and_utf8_bytes(self):
+        record = ready_record()
+        reflection = ReportReflection(
+            decision_thesis="决策" * 300,
+            technical_context="技术信号" * 150,
+            sentiment_context="情绪" * 300,
+            news_context="新闻" * 300,
+            fundamental_context="基本面" * 200,
+            overall_assessment="总体评估" * 200,
+            outcome_assessments=[
+                ReportOutcomeAssessment(
+                    horizon_days=horizon,
+                    assessment="结果评估" * 100,
+                )
+                for horizon in (1, 7, 15)
+            ],
+            reasoning_strengths=["优势" * 200] * 3,
+            causal_hypotheses=[
+                ReportCausalHypothesis(
+                    statement="因果假设" * 50,
+                    evidence=["report.market"],
+                    confidence="high",
+                )
+            ]
+            * 3,
+            mistakes_or_missed_opportunities=["遗漏机会" * 50] * 3,
+            next_decision_checks=["下一步检查" * 50] * 5,
+        )
+        revision = record.revisions[2].model_copy(update={"reflection": reflection})
+        record = record.model_copy(
+            update={"revisions": [record.revisions[0], record.revisions[1], revision]}
+        )
+
+        rendered = hermes_report_learning.render_report_lesson(record, revision=3)
+
+        self.assertLessEqual(
+            len(rendered.lesson), hermes_report_learning.REPORT_LESSON_MAX_CHARS
+        )
+        self.assertLessEqual(
+            len(rendered.lesson.encode("utf-8")),
+            hermes_report_learning.REPORT_LESSON_MAX_CHARS,
+        )
+        self.assertLessEqual(
+            len(rendered.hermes_memory_entry),
+            hermes_report_learning.HERMES_REPORT_MEMORY_MAX_CHARS,
+        )
+        self.assertLessEqual(
+            len(rendered.hermes_memory_entry.encode("utf-8")),
+            hermes_report_learning.HERMES_REPORT_MEMORY_MAX_CHARS,
+        )
+        self.assertIn("Causal hypotheses:", rendered.lesson)
+        self.assertIn("Next paper-decision checks:", rendered.lesson)
 
     def test_index_failure_leaves_ready_report_and_identical_retry_repairs_index(self):
         with TemporaryDirectory() as directory:

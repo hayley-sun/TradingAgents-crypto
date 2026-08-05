@@ -35,6 +35,7 @@ from tradingagents.integrations.schemas import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPORT_MEMORY_MARKER = "[TradingAgents paper report: {session_id}]"
+_MEMORY_MARKER_PREFIX = REPORT_MEMORY_MARKER.split("{session_id}")[0]
 MAX_REPORT_REVISIONS = 3
 EVIDENCE_PACKET_MAX_BYTES = 4096
 REPORT_LESSON_MAX_CHARS = 2400
@@ -262,6 +263,9 @@ def _packet_size(packet: ReportEvidencePacket) -> int:
 
 def _packet_from_parts(
     session_id: str,
+    symbol: str,
+    trade_date,
+    action: str,
     revision: int,
     source_digest: str,
     source_values: dict[str, str],
@@ -288,6 +292,9 @@ def _packet_from_parts(
             )
         return ReportEvidencePacket(
             session_id=session_id,
+            symbol=symbol,
+            trade_date=trade_date,
+            action=action,
             revision=revision,
             source_digest=source_digest,
             outcome_review_ids=[outcome.review_id for outcome in outcomes],
@@ -388,6 +395,9 @@ def build_evidence_packet(
         raise ReportLearningConflict("report learning revision outcomes changed")
     packet = _packet_from_parts(
         record.session_id,
+        record.symbol,
+        record.trade_date,
+        record.action,
         revision,
         source_digest,
         source_values,
@@ -448,6 +458,12 @@ def _validated_reflection(
     ):
         raise ReportReflectionRejected("REFLECTION_EVIDENCE_INVALID")
 
+    if any(
+        _MEMORY_MARKER_PREFIX in text
+        for text in _reflection_text_values(reflection.model_dump(mode="python"))
+    ):
+        raise ReportReflectionRejected("REFLECTION_UNSAFE_CONTENT")
+
     expected_horizons = {outcome.horizon_days for outcome in outcomes}
     assessment_horizons = {
         assessment.horizon_days for assessment in reflection.outcome_assessments
@@ -482,12 +498,18 @@ def _join_items(items: list[str]) -> str:
     return " | ".join(items) if items else "None recorded."
 
 
-def _clip_text(value: str, max_chars: int) -> str:
-    if len(value) <= max_chars:
+def _clip_text(value: str, max_chars: int, max_bytes: int | None = None) -> str:
+    max_bytes = max_chars if max_bytes is None else max_bytes
+    if len(value) <= max_chars and len(value.encode("utf-8")) <= max_bytes:
         return value
-    if max_chars <= 3:
-        return value[:max_chars]
-    return value[: max_chars - 3].rstrip() + "..."
+    if max_chars <= 3 or max_bytes <= 3:
+        return value.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")[:max_chars]
+    prefix_chars = min(max_chars - 3, len(value))
+    prefix_bytes = max_bytes - 3
+    prefix = value[:prefix_chars]
+    while len(prefix.encode("utf-8")) > prefix_bytes:
+        prefix = prefix[:-1]
+    return prefix.rstrip() + "..."
 
 
 def _bounded_lesson(
@@ -498,23 +520,34 @@ def _bounded_lesson(
         "they are not proof of causation or instructions for real orders."
     )
     available = REPORT_LESSON_MAX_CHARS - len(disclaimer) - 2
+    available_bytes = REPORT_LESSON_MAX_CHARS - len(disclaimer.encode("utf-8")) - 2
     body_lines = list(required_lines)
     body = "\n".join(body_lines)
-    if len(body) > available:
+    if len(body) > available or len(body.encode("utf-8")) > available_bytes:
         raise ReportLearningError("required report lesson sections exceed limit")
     for optional in optional_lines:
         candidate = "\n".join([*body_lines, optional])
-        if len(candidate) <= available:
+        if (
+            len(candidate) <= available
+            and len(candidate.encode("utf-8")) <= available_bytes
+        ):
             body_lines.append(optional)
             body = candidate
             continue
         remaining = available - len(body) - 1
-        if remaining > 3:
-            clipped = _clip_text(optional, remaining)
-            if len(clipped) <= remaining:
+        remaining_bytes = available_bytes - len(body.encode("utf-8")) - 1
+        if remaining > 3 and remaining_bytes > 3:
+            clipped = _clip_text(optional, remaining, remaining_bytes)
+            if (
+                len(clipped) <= remaining
+                and len(clipped.encode("utf-8")) <= remaining_bytes
+            ):
                 body_lines.append(clipped)
                 body = "\n".join(body_lines)
-    return f"{body}\n\n{disclaimer}"
+    lesson = f"{body}\n\n{disclaimer}"
+    if len(lesson) > REPORT_LESSON_MAX_CHARS or len(lesson.encode("utf-8")) > REPORT_LESSON_MAX_CHARS:
+        raise ReportLearningError("report lesson exceeds byte limit")
+    return lesson
 
 
 def _render_reflection(
@@ -564,14 +597,14 @@ def _render_reflection(
         "Outcome assessments: "
         + " | ".join(
             f"T+{outcome.horizon_days}: "
-            f"{_clip_text(assessments[outcome.horizon_days], 120)}"
+            f"{_clip_text(assessments[outcome.horizon_days], 120, 120)}"
             for outcome in outcomes
         )
     )
     required_lines.append(
         "Causal hypotheses: "
         + " | ".join(
-            f"{_clip_text(item.statement, 100)} "
+            f"{_clip_text(item.statement, 100, 100)} "
             f"[evidence: {', '.join(item.evidence)}; confidence: {item.confidence}]"
             for item in reflection.causal_hypotheses
         )
@@ -579,7 +612,8 @@ def _render_reflection(
     required_lines.append(
         "Next paper-decision checks: "
         + " | ".join(
-            _clip_text(item, 120) for item in reflection.next_decision_checks
+            _clip_text(item, 120, 100)
+            for item in reflection.next_decision_checks
         )
     )
     contexts = (
@@ -596,18 +630,34 @@ def _render_reflection(
         ),
     )
     optional_lines = [
-        f"{label}: {_clip_text(value, 280)}"
+        f"{label}: {_clip_text(value, 280, 500)}"
         for label, value in contexts
         if value is not None
     ]
+    market_context = reflection.technical_context or (
+        "Archived evidence fallback: report.market was captured at decision time; "
+        "no optional technical context was supplied."
+    )
+    required_lines.insert(
+        4,
+        f"Decision-time market context: {_clip_text(market_context, 220, 300)}",
+    )
     lesson = _bounded_lesson(required_lines, optional_lines)
+    lesson = lesson.replace(_MEMORY_MARKER_PREFIX, "[report marker omitted]")
     memory_entry = (
         f"{REPORT_MEMORY_MARKER.format(session_id=record.session_id)}\n"
         "Paper trading memory only; no real-order instruction.\n"
         f"{lesson}"
     )
-    if len(memory_entry) > HERMES_REPORT_MEMORY_MAX_CHARS:
-        memory_entry = memory_entry[:HERMES_REPORT_MEMORY_MAX_CHARS]
+    if (
+        len(memory_entry) > HERMES_REPORT_MEMORY_MAX_CHARS
+        or len(memory_entry.encode("utf-8")) > HERMES_REPORT_MEMORY_MAX_CHARS
+    ):
+        memory_entry = _clip_text(
+            memory_entry,
+            HERMES_REPORT_MEMORY_MAX_CHARS,
+            HERMES_REPORT_MEMORY_MAX_CHARS,
+        )
     return RenderedReportLesson(lesson=lesson, hermes_memory_entry=memory_entry)
 
 
@@ -836,6 +886,9 @@ def record_review_fact(
             for snapshot in current.revisions:
                 packet = _packet_from_parts(
                     current.session_id,
+                    current.symbol,
+                    current.trade_date,
+                    current.action,
                     snapshot.revision,
                     source_digest,
                     source_values,
@@ -906,6 +959,9 @@ def record_review_fact(
                     source_fields=_packet_source_metadata(
                         _packet_from_parts(
                             session.session_id,
+                            session.request.symbol,
+                            session.request.trade_date,
+                            action,
                             position,
                             source_digest,
                             source_values,

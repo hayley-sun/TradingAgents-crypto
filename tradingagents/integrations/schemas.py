@@ -478,10 +478,13 @@ class ReportEvidenceField(_StrictModel):
 class ReportEvidencePacket(_StrictModel):
     schema_version: Literal[1] = 1
     session_id: str
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    trade_date: date
+    action: Literal["BUY", "SELL", "HOLD", "UNPARSEABLE"]
     revision: int = Field(ge=1, le=3)
     source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     outcome_review_ids: list[str] = Field(min_length=1, max_length=3)
-    fields: list[ReportEvidenceField] = Field(min_length=2, max_length=11)
+    fields: list[ReportEvidenceField] = Field(min_length=9, max_length=11)
 
     @field_validator("session_id")
     @classmethod
@@ -507,7 +510,31 @@ class ReportEvidencePacket(_StrictModel):
         names = [field.name for field in value]
         if len(names) != len(set(names)):
             raise ValueError("evidence field names must be unique")
+        source_names = {
+            "report.market",
+            "report.sentiment",
+            "report.news",
+            "report.fundamentals",
+            "investment_plan",
+            "trader_plan",
+            "final_decision",
+            "processed_signal",
+        }
+        outcome_names = {f"outcome.t{horizon}" for horizon in (1, 7, 15)}
+        if not source_names.issubset(names):
+            raise ValueError("evidence packet must include all source fields")
+        packet_outcomes = [name for name in names if name in outcome_names]
+        if len(packet_outcomes) != len(value) - len(source_names):
+            raise ValueError("evidence packet contains invalid field names")
         return value
+
+    @model_validator(mode="after")
+    def require_outcome_field_coherence(self) -> "ReportEvidencePacket":
+        names = {field.name for field in self.fields}
+        outcome_names = {name for name in names if name.startswith("outcome.t")}
+        if len(outcome_names) != len(self.outcome_review_ids):
+            raise ValueError("evidence packet outcomes must match review ids")
+        return self
 
 
 class ReportLearningOutcome(_StrictModel):
