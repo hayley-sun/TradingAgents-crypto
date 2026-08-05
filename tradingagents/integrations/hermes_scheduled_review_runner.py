@@ -21,6 +21,7 @@ from tradingagents.integrations.hermes_report_learning import (
     record_review_fact,
 )
 from tradingagents.integrations.hermes_report_memory import (
+    MEMORY_ERROR_CODES,
     begin_report_memory,
     confirm_report_memory,
     list_pending_report_memory,
@@ -332,6 +333,8 @@ def run_quarantine_report_memory(
 ) -> tuple[int, dict[str, Any]]:
     """Quarantine a report-memory operation using an allowlisted code."""
     if not is_valid_session_id(session_id) or isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= 3:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "quarantine-report-memory")
+    if not isinstance(error_code, str) or error_code not in MEMORY_ERROR_CODES:
         return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "quarantine-report-memory")
     if quarantiner is None:
         store = ReportLearningStore.from_environment()

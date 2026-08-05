@@ -1,16 +1,18 @@
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tradingagents.integrations.hermes_learning import LearningStore
 from tradingagents.integrations.hermes_report_learning import ReportLearningStore
 from tradingagents.integrations.hermes_report_memory import (
+    MEMORY_ERROR_CODES,
     begin_report_memory,
     confirm_report_memory,
     list_pending_report_memory,
     quarantine_report_memory,
 )
+from tradingagents.integrations import hermes_scheduled_review_runner as runner
 from tradingagents.integrations.hermes_report_memory_verifier import (
     verify_report_memory_consistency,
 )
@@ -18,6 +20,7 @@ from tests.test_hermes_report_learning import (
     completed_session,
     paper_review,
     valid_reflection_payload,
+    report_learning_record,
 )
 
 
@@ -123,6 +126,39 @@ class HermesReportMemoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 confirm_report_memory(store, SESSION_ID, 1, verifier=lambda *_args: object())
             self.assertEqual(store.load(SESSION_ID).revisions[0].memory_state, "attention_required")
+
+    def test_pending_memory_orders_by_earliest_revision_creation_time(self):
+        first = report_learning_record(session_number=101)
+        second = report_learning_record(session_number=202)
+        first_revision = first.revisions[0].model_copy(
+            update={"created_at": datetime(2026, 7, 3, tzinfo=timezone.utc)}
+        )
+        second_revision = second.revisions[0].model_copy(
+            update={"created_at": datetime(2026, 7, 1, tzinfo=timezone.utc)}
+        )
+        first = first.model_copy(update={"revisions": [first_revision, *first.revisions[1:]]})
+        second = second.model_copy(update={"revisions": [second_revision, *second.revisions[1:]]})
+
+        class Store:
+            def records(self):
+                return [first, second]
+
+        work = list_pending_report_memory(Store(), limit=18)
+        self.assertEqual([item.session_id for item in work], [second.session_id, first.session_id])
+
+    def test_runner_rejects_unallowlisted_quarantine_code_before_store_call(self):
+        called = []
+
+        def sentinel(*args):
+            called.append(args)
+            raise AssertionError("store must not be called")
+
+        code, payload = runner.run_quarantine_report_memory(
+            SESSION_ID, 1, "NOT_ALLOWLISTED", sentinel
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+        self.assertEqual(called, [])
 
 
 if __name__ == "__main__":

@@ -88,12 +88,21 @@ def list_pending_report_memory(
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 18:
         raise ValueError("invalid report memory limit")
     items: list[ReportMemoryWork] = []
-    for record in sorted(store.records(), key=lambda item: (item.trade_date, item.session_id)):
+    records_with_work = []
+    for record in store.records():
         revision = _earliest(record)
         if revision is not None:
-            items.append(_work(record, revision))
-            if len(items) >= limit:
-                break
+            records_with_work.append((record, revision))
+    for record, revision in sorted(
+        records_with_work,
+        key=lambda pair: (
+            pair[1].created_at,
+            pair[0].trade_date,
+            pair[0].symbol,
+            pair[0].session_id,
+        ),
+    )[:limit]:
+        items.append(_work(record, revision))
     return items
 
 
