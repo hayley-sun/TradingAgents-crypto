@@ -13,6 +13,7 @@ from chromadb.config import Settings
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
+from tradingagents.integrations.hermes_report_learning import ReportLearningStore
 from tradingagents.integrations.hermes_reports import ReportBatchStore
 from tradingagents.integrations.hermes_scheduled_reviews import ScheduledReviewStore
 from tradingagents.integrations.schemas import (
@@ -35,6 +36,7 @@ from tradingagents.integrations.hermes_mcp import (
     run_queued_analysis,
     start_daily_report_batch_impl,
     start_analysis,
+    submit_report_reflection_impl,
 )
 
 
@@ -79,6 +81,26 @@ def paired_price_references(entry_price=100.0, review_price=90.0, source="coinge
 
 
 class HermesMcpTests(unittest.TestCase):
+    def valid_reflection_payload(self):
+        return {
+            "decision_thesis": "Buy only after the archived confirmation signal.",
+            "overall_assessment": "The paper decision was disciplined but uncertain.",
+            "outcome_assessments": [{"horizon_days": 1, "assessment": "T+1 was assessed."}],
+            "reasoning_strengths": ["The entry condition was explicit."],
+            "causal_hypotheses": [{"statement": "Momentum may have persisted.", "evidence": ["report.market", "outcome.t1"], "confidence": "medium"}],
+            "mistakes_or_missed_opportunities": ["The analysis lacked an invalidation level."],
+            "next_decision_checks": ["Check confirmation volume."],
+        }
+
+    def test_submit_report_reflection_tool_rejects_unknown_fields(self):
+        tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        self.assertIs(tool.parameters["additionalProperties"], False)
+        _, result = asyncio.run(MCP.call_tool(
+            "submit_report_reflection",
+            {"session_id":"hermes_0123456789abcdef","expected_revision":1,"reflection":self.valid_reflection_payload(),"unexpected":True},
+        ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
     def make_request(self):
         return AnalysisRequest(
             symbol="BTCUSDT",

@@ -15,13 +15,14 @@ from tradingagents.integrations.hermes_mcp import (
     SessionStore,
     review_paper_decision_impl as real_review_paper_decision_impl,
 )
-from tradingagents.integrations.hermes_report_learning import ReportLearningStore
+from tradingagents.integrations.hermes_report_learning import ReportLearningStore, record_review_fact
 from tradingagents.integrations.hermes_scheduled_reviews import (
     ScheduledReviewProcessReport,
     ScheduledReviewStore,
 )
 from tradingagents.integrations.schemas import AnalysisResult, AnalysisSession, PriceReference, utc_now
 from tests.test_hermes_scheduled_reviews import archived_batch
+from tests.test_hermes_report_learning import completed_session, paper_review
 
 
 class HermesScheduledReviewRunnerTests(unittest.TestCase):
@@ -266,6 +267,83 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             "INVALID_SCHEDULED_REVIEW_REQUEST",
         )
         pending.assert_not_called()
+
+    def test_report_reflection_pending_is_metadata_only_and_bounded(self):
+        with TemporaryDirectory() as directory:
+            report_store = ReportLearningStore(Path(directory) / "reports")
+            session = completed_session()
+            record_review_fact(report_store, session, paper_review(1))
+            with patch.object(runner.ReportLearningStore, "from_environment", return_value=report_store):
+                code, payload = runner.run_report_reflection_pending(18)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(
+            set(payload["items"][0]),
+            {"session_id", "symbol", "trade_date", "revision", "maturity_days"},
+        )
+        self.assertNotIn("Market report.", json.dumps(payload))
+
+    def test_report_reflection_evidence_returns_one_selected_packet(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_store = ReportLearningStore(root / "reports")
+            session_store = SessionStore(root / "sessions")
+            session = completed_session()
+            session_store.save(session)
+            record_review_fact(report_store, session, paper_review(1))
+            with patch.object(runner.ReportLearningStore, "from_environment", return_value=report_store), patch.object(runner.SessionStore, "from_environment", return_value=session_store):
+                code, payload = runner.run_report_reflection_evidence(session.session_id, 1)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["mode"], "report-reflection-evidence")
+        self.assertEqual(payload["packet"]["session_id"], session.session_id)
+        self.assertEqual(payload["packet"]["revision"], 1)
+        self.assertIn("fields", payload["packet"])
+
+    def test_report_reflection_evidence_rejects_invalid_id_and_revision_before_store_access(self):
+        loader = lambda: (_ for _ in ()).throw(AssertionError("store accessed"))
+        code, payload = runner.run_report_reflection_evidence("../bad", 1, loader=loader)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+        code, payload = runner.run_report_reflection_evidence("hermes_0123456789abcdef", 4, loader=loader)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+
+    def test_report_reflection_pending_rejects_non_integral_limits_before_lister(self):
+        def sentinel(_limit):
+            raise AssertionError("lister accessed")
+
+        for invalid_limit in (True, 1.0):
+            with self.subTest(invalid_limit=invalid_limit):
+                code, payload = runner.run_report_reflection_pending(invalid_limit, sentinel)
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+
+    def test_report_reflection_evidence_rejects_bool_revision_before_loader(self):
+        def sentinel():
+            raise AssertionError("loader accessed")
+
+        code, payload = runner.run_report_reflection_evidence(
+            "hermes_0123456789abcdef", True, loader=sentinel
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+
+    def test_main_rejects_report_reflection_limit_above_bound(self):
+        stdout = io.StringIO()
+        with patch.object(runner, "run_report_reflection_pending") as pending, redirect_stdout(stdout):
+            code = runner.main(["report-reflection-pending", "--limit", "19"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+        pending.assert_not_called()
+
+    def test_report_reflection_pending_redacts_unexpected_failure(self):
+        stdout = io.StringIO()
+        with patch.object(runner, "run_report_reflection_pending", side_effect=OSError("/private/raw")), redirect_stdout(stdout):
+            code = runner.main(["report-reflection-pending", "--limit", "1"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("/private/raw", stdout.getvalue())
 
     def test_bootstrap_loads_only_scheduled_review_environment(self):
         bootstrap = importlib.import_module(

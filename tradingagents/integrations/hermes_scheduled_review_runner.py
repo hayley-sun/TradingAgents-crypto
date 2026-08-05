@@ -17,6 +17,7 @@ from tradingagents.integrations.hermes_mcp import (
 )
 from tradingagents.integrations.hermes_report_learning import (
     ReportLearningStore,
+    build_evidence_packet,
     record_review_fact,
 )
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
@@ -28,10 +29,11 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
     inspect_pending_memory,
     process_due_reviews,
 )
-from tradingagents.integrations.schemas import is_valid_review_id
+from tradingagents.integrations.schemas import is_valid_review_id, is_valid_session_id
 
 
 DEFAULT_MEMORY_LIMIT = MAX_MEMORY_ITEMS
+MAX_REPORT_ITEMS = 18
 
 
 def _results_root() -> Path:
@@ -157,6 +159,75 @@ def run_confirm_memory(
     }
 
 
+def run_report_reflection_pending(
+    limit: int,
+    lister: Callable[[int], list[Any]] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """List bounded report-reflection work as metadata without source content."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REPORT_ITEMS:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "report-reflection-pending")
+    if lister is None:
+        store = ReportLearningStore.from_environment()
+        lister = lambda selected_limit: store.records()
+    records = list(lister(limit))
+    items: list[dict[str, Any]] = []
+    for record in sorted(records, key=lambda item: (item.session_id, item.trade_date)):
+        for revision in record.revisions:
+            if revision.reflection_state != "pending":
+                continue
+            if len(items) >= limit:
+                break
+            maturity_days = record.outcomes[revision.revision - 1].horizon_days
+            items.append(
+                {
+                    "session_id": record.session_id,
+                    "symbol": record.symbol,
+                    "trade_date": record.trade_date.isoformat(),
+                    "revision": revision.revision,
+                    "maturity_days": maturity_days,
+                }
+            )
+    return 0, {
+        "ok": True,
+        "mode": "report-reflection-pending",
+        "count": len(items),
+        "items": items,
+    }
+
+
+def run_report_reflection_evidence(
+    session_id: str,
+    revision: int,
+    loader: Callable[[], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return exactly one bounded evidence packet for a completed report revision."""
+    if (
+        not is_valid_session_id(session_id)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or not 1 <= revision <= 3
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "report-reflection-evidence")
+    if loader is not None:
+        loaded = loader()
+        session, record = loaded
+    else:
+        session_store = SessionStore.from_environment()
+        report_store = ReportLearningStore.from_environment()
+        session = session_store.load(session_id)
+        if session is None:
+            raise LookupError("session not found")
+        record = report_store.load(session_id)
+        if record is None:
+            raise LookupError("report learning record not found")
+    packet = build_evidence_packet(record, session, revision)
+    return 0, {
+        "ok": True,
+        "mode": "report-reflection-evidence",
+        "packet": packet.model_dump(mode="json"),
+    }
+
+
 def _error(code: str, mode: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -199,6 +270,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
     )
+    report_pending_parser = subparsers.add_parser("report-reflection-pending", add_help=False)
+    report_pending_parser.add_argument("--limit", type=int, default=MAX_REPORT_ITEMS)
+    report_evidence_parser = subparsers.add_parser("report-reflection-evidence", add_help=False)
+    report_evidence_parser.add_argument("--session-id", required=True)
+    report_evidence_parser.add_argument("--revision", type=int, required=True)
     try:
         parsed = parser.parse_args(arguments)
         if parsed.mode == "process-due":
@@ -207,12 +283,22 @@ def main(argv: list[str] | None = None) -> int:
             if not 1 <= parsed.limit <= MAX_MEMORY_ITEMS:
                 raise ValueError("invalid memory limit")
             code, payload = run_memory_pending(parsed.limit)
-        else:
+        elif parsed.mode == "confirm-memory":
             if not is_valid_review_id(parsed.review_id):
                 raise ValueError("invalid review id")
             code, payload = run_confirm_memory(
                 parsed.review_id, parsed.hermes_memory_path.expanduser().resolve()
             )
+        elif parsed.mode == "report-reflection-pending":
+            if not 1 <= parsed.limit <= MAX_REPORT_ITEMS:
+                raise ValueError("invalid report reflection limit")
+            code, payload = run_report_reflection_pending(parsed.limit)
+        elif parsed.mode == "report-reflection-evidence":
+            if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
+                raise ValueError("invalid report reflection evidence request")
+            code, payload = run_report_reflection_evidence(parsed.session_id, parsed.revision)
+        else:
+            raise ValueError("invalid scheduled review mode")
     except (TypeError, ValueError):
         code, payload = 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
     except Exception:
