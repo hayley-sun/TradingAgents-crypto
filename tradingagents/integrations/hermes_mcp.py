@@ -1431,7 +1431,9 @@ def _configure_submit_report_reflection_tool() -> None:
 
     tool.fn_metadata.arg_model = _SubmitReportReflectionArguments
     tool.parameters = _SubmitReportReflectionArguments.model_json_schema()
-    tool.parameters["properties"]["reflection"] = ReportReflection.model_json_schema()
+    reflection_schema = ReportReflection.model_json_schema()
+    tool.parameters.setdefault("$defs", {}).update(reflection_schema.pop("$defs", {}))
+    tool.parameters["properties"]["reflection"] = reflection_schema
     tool.parameters["properties"]["expected_revision"] = {"type": "integer"}
     tool.parameters["additionalProperties"] = False
 

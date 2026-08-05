@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import chromadb
+from jsonschema import Draft202012Validator
 from chromadb.config import Settings
 import tradingagents.integrations.hermes_mcp as hermes_mcp
 
@@ -120,6 +121,22 @@ class HermesMcpTests(unittest.TestCase):
         ))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_submit_report_reflection_schema_resolves_nested_refs(self):
+        tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        arguments = {
+            "session_id": "hermes_0123456789abcdef",
+            "expected_revision": 1,
+            "reflection": self.valid_reflection_payload(),
+        }
+        validator = Draft202012Validator(tool.parameters)
+        self.assertEqual(list(validator.iter_errors(arguments)), [])
+        invalid = dict(arguments)
+        invalid["reflection"] = {
+            **arguments["reflection"],
+            "unexpected_nested": True,
+        }
+        self.assertTrue(list(validator.iter_errors(invalid)))
 
     def test_submit_report_reflection_tool_rejects_non_strict_revisions_before_storage(self):
         for revision in (True, 1.0, "1"):
