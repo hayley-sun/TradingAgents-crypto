@@ -315,6 +315,11 @@ class HermesSchemaTests(unittest.TestCase):
         }
         self.assertIsNone(DailyReportArchive(**archive_values).scheduled_review_version)
         self.assertEqual(
+            DailyReportArchive(**archive_values, scheduled_review_version=1)
+            .scheduled_review_version,
+            1,
+        )
+        self.assertEqual(
             DailyReportArchive(**archive_values, scheduled_review_version=2)
             .scheduled_review_version,
             2,
@@ -401,7 +406,6 @@ class HermesSchemaTests(unittest.TestCase):
             {**revision.model_dump(), "outcome_review_ids": ["../review"]},
             {**revision.model_dump(), "source_fields": []},
             {**revision.model_dump(), "reflection_attempt_count": -1},
-            {**revision.model_dump(), "last_error_code": "../unsafe"},
         )
         for invalid_revision in invalid_revisions:
             with self.subTest(invalid_revision=invalid_revision), self.assertRaises(ValidationError):
@@ -412,6 +416,142 @@ class HermesSchemaTests(unittest.TestCase):
             ReportLearningRecord.model_validate(
                 {**record.model_dump(), "revisions": [revision.model_dump()] * 4}
             )
+
+    def test_report_learning_defaults_and_optional_text_are_backward_compatible(self):
+        outcome = ReportLearningOutcome(
+            review_id="review_0123456789abcdef",
+            horizon_days=1,
+            review_date="2026-08-06",
+            raw_return_pct=0.0,
+            verdict="flat",
+        )
+        try:
+            reflection = ReportReflection(
+                decision_thesis="Wait for confirmation.",
+                technical_context=" ",
+                sentiment_context="",
+                news_context=" ",
+                fundamental_context="",
+                overall_assessment="The decision was appropriately cautious.",
+                outcome_assessments=[
+                    {"horizon_days": 1, "assessment": "The first outcome was flat."}
+                ],
+                reasoning_strengths=[],
+                causal_hypotheses=[
+                    {
+                        "statement": "The market lacked a catalyst.",
+                        "evidence": ["Volume remained muted."],
+                        "confidence": "low",
+                    }
+                ],
+                mistakes_or_missed_opportunities=[],
+                next_decision_checks=["Check volume."],
+            )
+            revision = ReportLearningRevision(
+                revision=1,
+                outcome_review_ids=[outcome.review_id],
+                reflection_state="pending",
+                memory_state="blocked",
+                source_fields=[
+                    ReportSourceMetadata(
+                        name="report", sha256="f" * 64, truncated=False
+                    )
+                ],
+                last_error_code="../diagnostic detail",
+                reflection=reflection,
+                lesson="",
+                hermes_memory_entry=" ",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            record = ReportLearningRecord(
+                session_id="hermes_0123456789abcdef",
+                symbol="BTC",
+                trade_date="2026-08-05",
+                action="HOLD",
+                source_digest="a" * 64,
+                desired_revision=1,
+                outcomes=[outcome],
+                revisions=[revision],
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+        except ValidationError as exc:
+            self.fail(f"compatible report-learning payload was rejected: {exc}")
+
+        self.assertEqual(revision.reflection_attempt_count, 0)
+        self.assertEqual(record.reflected_revision, 0)
+        self.assertEqual(record.confirmed_revision, 0)
+        self.assertEqual(revision.last_error_code, "../diagnostic detail")
+        self.assertEqual(revision.lesson, "")
+        self.assertEqual(revision.hermes_memory_entry, " ")
+        self.assertEqual(reflection.technical_context, " ")
+
+    def test_report_learning_json_schema_exposes_string_bounds(self):
+        source_name = ReportSourceMetadata.model_json_schema()["properties"]["name"]
+        self.assertEqual(
+            (source_name.get("minLength"), source_name.get("maxLength")), (1, 100)
+        )
+
+        hypothesis = ReportCausalHypothesis.model_json_schema()["properties"]
+        self.assertEqual(
+            (hypothesis["statement"]["minLength"], hypothesis["statement"]["maxLength"]),
+            (1, 400),
+        )
+        self.assertEqual(
+            (
+                hypothesis["evidence"]["items"]["minLength"],
+                hypothesis["evidence"]["items"]["maxLength"],
+            ),
+            (1, 100),
+        )
+
+        assessment = ReportOutcomeAssessment.model_json_schema()["properties"]["assessment"]
+        self.assertEqual(
+            (assessment["minLength"], assessment["maxLength"]), (1, 400)
+        )
+
+        reflection = ReportReflection.model_json_schema()["properties"]
+        for field_name, maximum in (
+            ("decision_thesis", 600),
+            ("overall_assessment", 800),
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertEqual(reflection[field_name]["minLength"], 1)
+                self.assertEqual(reflection[field_name]["maxLength"], maximum)
+        for field_name in (
+            "technical_context",
+            "sentiment_context",
+            "news_context",
+            "fundamental_context",
+        ):
+            with self.subTest(field_name=field_name):
+                text_schema = reflection[field_name]["anyOf"][0]
+                self.assertNotIn("minLength", text_schema)
+                self.assertEqual(text_schema["maxLength"], 600)
+        for field_name in (
+            "reasoning_strengths",
+            "mistakes_or_missed_opportunities",
+            "next_decision_checks",
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertEqual(reflection[field_name]["items"]["minLength"], 1)
+                self.assertEqual(reflection[field_name]["items"]["maxLength"], 400)
+
+        lesson = ReportLearningIndexEntry.model_json_schema()["properties"]["lesson"]
+        self.assertEqual((lesson["minLength"], lesson["maxLength"]), (1, 6000))
+
+        revision = ReportLearningRevision.model_json_schema()["properties"]
+        for field_name, maximum in (
+            ("last_error_code", 100),
+            ("lesson", 6000),
+            ("hermes_memory_entry", 6000),
+        ):
+            with self.subTest(field_name=field_name):
+                text_schema = revision[field_name]["anyOf"][0]
+                self.assertNotIn("minLength", text_schema)
+                self.assertNotIn("pattern", text_schema)
+                self.assertEqual(text_schema["maxLength"], maximum)
 
     def test_report_reflection_rejects_oversized_list_items(self):
         with self.assertRaises(ValidationError):

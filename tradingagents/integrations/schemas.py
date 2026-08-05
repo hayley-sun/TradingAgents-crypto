@@ -3,7 +3,7 @@
 import math
 import re
 from datetime import date, datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -22,7 +22,12 @@ _SESSION_ID_PATTERN = re.compile(r"^hermes_[0-9a-f]{16,64}$")
 _REVIEW_ID_PATTERN = re.compile(r"^review_[0-9a-f]{16,64}$")
 _REPORT_BATCH_ID_PATTERN = re.compile(r"^report_[0-9a-f]{16,64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9]{2,20}$")
-_SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
+
+_NonBlankText100 = Annotated[str, Field(min_length=1, max_length=100)]
+_NonBlankText400 = Annotated[str, Field(min_length=1, max_length=400)]
+_NonBlankText600 = Annotated[str, Field(min_length=1, max_length=600)]
+_NonBlankText800 = Annotated[str, Field(min_length=1, max_length=800)]
+_NonBlankText6000 = Annotated[str, Field(min_length=1, max_length=6000)]
 
 
 def is_valid_session_id(session_id: str) -> bool:
@@ -58,17 +63,10 @@ def _require_nonblank_text(value: str, field_name: str) -> str:
     return normalized
 
 
-def _normalize_text_list(
-    value: list[str], field_name: str, *, max_item_length: int
-) -> list[str]:
+def _normalize_text_list(value: list[str], field_name: str) -> list[str]:
     if not isinstance(value, list):
         return value
-    normalized = [_require_nonblank_text(item, field_name) for item in value]
-    if any(
-        isinstance(item, str) and len(item) > max_item_length for item in normalized
-    ):
-        raise ValueError(f"{field_name} must be at most {max_item_length} characters")
-    return normalized
+    return [_require_nonblank_text(item, field_name) for item in value]
 
 
 class AnalysisRequest(_StrictModel):
@@ -445,7 +443,7 @@ class SymbolLearningEntry(_StrictModel):
 
 
 class ReportSourceMetadata(_StrictModel):
-    name: str = Field(max_length=100)
+    name: _NonBlankText100
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     truncated: bool
 
@@ -483,8 +481,8 @@ class ReportLearningOutcome(_StrictModel):
 
 
 class ReportCausalHypothesis(_StrictModel):
-    statement: str = Field(max_length=400)
-    evidence: list[str] = Field(min_length=1, max_length=4)
+    statement: _NonBlankText400
+    evidence: list[_NonBlankText100] = Field(min_length=1, max_length=4)
     confidence: Literal["low", "medium", "high"]
 
     @field_validator("statement", mode="before")
@@ -495,14 +493,12 @@ class ReportCausalHypothesis(_StrictModel):
     @field_validator("evidence", mode="before")
     @classmethod
     def normalize_evidence(cls, value: list[str]) -> list[str]:
-        return _normalize_text_list(
-            value, "causal hypothesis evidence", max_item_length=100
-        )
+        return _normalize_text_list(value, "causal hypothesis evidence")
 
 
 class ReportOutcomeAssessment(_StrictModel):
     horizon_days: Literal[1, 7, 15]
-    assessment: str = Field(max_length=400)
+    assessment: _NonBlankText400
 
     @field_validator("assessment", mode="before")
     @classmethod
@@ -511,31 +507,25 @@ class ReportOutcomeAssessment(_StrictModel):
 
 
 class ReportReflection(_StrictModel):
-    decision_thesis: str = Field(max_length=600)
+    decision_thesis: _NonBlankText600
     technical_context: str | None = Field(default=None, max_length=600)
     sentiment_context: str | None = Field(default=None, max_length=600)
     news_context: str | None = Field(default=None, max_length=600)
     fundamental_context: str | None = Field(default=None, max_length=600)
-    overall_assessment: str = Field(max_length=800)
+    overall_assessment: _NonBlankText800
     outcome_assessments: list[ReportOutcomeAssessment] = Field(min_length=1, max_length=3)
-    reasoning_strengths: list[str] = Field(max_length=3)
+    reasoning_strengths: list[_NonBlankText400] = Field(max_length=3)
     causal_hypotheses: list[ReportCausalHypothesis] = Field(min_length=1, max_length=3)
-    mistakes_or_missed_opportunities: list[str] = Field(max_length=3)
-    next_decision_checks: list[str] = Field(min_length=1, max_length=5)
+    mistakes_or_missed_opportunities: list[_NonBlankText400] = Field(max_length=3)
+    next_decision_checks: list[_NonBlankText400] = Field(min_length=1, max_length=5)
 
     @field_validator(
         "decision_thesis",
         "overall_assessment",
-        "technical_context",
-        "sentiment_context",
-        "news_context",
-        "fundamental_context",
         mode="before",
     )
     @classmethod
-    def normalize_reflection_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
+    def normalize_reflection_text(cls, value: str) -> str:
         return _require_nonblank_text(value, "reflection text")
 
     @field_validator(
@@ -546,9 +536,7 @@ class ReportReflection(_StrictModel):
     )
     @classmethod
     def normalize_reflection_lists(cls, value: list[str]) -> list[str]:
-        return _normalize_text_list(
-            value, "reflection list item", max_item_length=400
-        )
+        return _normalize_text_list(value, "reflection list item")
 
     @model_validator(mode="after")
     def require_unique_outcome_horizons(self) -> "ReportReflection":
@@ -572,7 +560,7 @@ class ReportLearningRevision(_StrictModel):
         "attention_required",
     ]
     source_fields: list[ReportSourceMetadata] = Field(min_length=1, max_length=8)
-    reflection_attempt_count: int = Field(ge=0)
+    reflection_attempt_count: int = Field(default=0, ge=0)
     last_error_code: str | None = Field(default=None, max_length=100)
     reflection: ReportReflection | None = None
     lesson: str | None = Field(default=None, max_length=6000)
@@ -600,20 +588,6 @@ class ReportLearningRevision(_StrictModel):
             raise ValueError("source field names must be unique")
         return value
 
-    @field_validator("last_error_code", "lesson", "hermes_memory_entry", mode="before")
-    @classmethod
-    def normalize_optional_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        return _require_nonblank_text(value, "optional text")
-
-    @field_validator("last_error_code")
-    @classmethod
-    def validate_safe_error_code(cls, value: str | None) -> str | None:
-        if value is not None and not _SAFE_ERROR_CODE_PATTERN.fullmatch(value):
-            raise ValueError("invalid error code")
-        return value
-
 
 class ReportLearningRecord(_StrictModel):
     schema_version: Literal[1] = 1
@@ -623,8 +597,8 @@ class ReportLearningRecord(_StrictModel):
     action: Literal["BUY", "SELL", "HOLD", "UNPARSEABLE"]
     source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     desired_revision: int = Field(ge=1, le=3)
-    reflected_revision: int = Field(ge=0, le=3)
-    confirmed_revision: int = Field(ge=0, le=3)
+    reflected_revision: int = Field(default=0, ge=0, le=3)
+    confirmed_revision: int = Field(default=0, ge=0, le=3)
     outcomes: list[ReportLearningOutcome] = Field(min_length=1, max_length=3)
     revisions: list[ReportLearningRevision] = Field(min_length=1, max_length=3)
     created_at: datetime
@@ -669,7 +643,7 @@ class ReportLearningIndexEntry(_StrictModel):
     maturity_days: Literal[1, 7, 15]
     reflected_revision: int = Field(ge=1, le=3)
     updated_at: datetime
-    lesson: str = Field(max_length=6000)
+    lesson: _NonBlankText6000
 
     @field_validator("session_id")
     @classmethod
