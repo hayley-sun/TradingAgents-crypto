@@ -264,6 +264,97 @@ def _controlled_legacy_upsert(root, review_payload, write_started, allow_write):
 
 
 class HermesReportLearningTests(unittest.TestCase):
+    def test_report_store_sorts_reverse_arrival_and_rebuilds_pending_snapshots(self):
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            first = record_review_fact(store, session, paper_review(7))
+
+            try:
+                record = record_review_fact(store, session, paper_review(1))
+            except ReportLearningConflict as error:
+                self.fail(f"reverse arrival was rejected: {error}")
+
+        self.assertEqual(record.created_at, first.created_at)
+        self.assertEqual([outcome.horizon_days for outcome in record.outcomes], [1, 7])
+        self.assertEqual([revision.revision for revision in record.revisions], [1, 2])
+        self.assertEqual(
+            [revision.outcome_review_ids for revision in record.revisions],
+            [
+                [paper_review(1).review_id],
+                [paper_review(1).review_id, paper_review(7).review_id],
+            ],
+        )
+        self.assertTrue(
+            all(
+                revision.reflection_state == "pending"
+                and revision.memory_state == "blocked"
+                for revision in record.revisions
+            )
+        )
+        self.assertIsNot(
+            record.revisions[0].source_fields,
+            record.revisions[1].source_fields,
+        )
+        for first_source, second_source in zip(
+            record.revisions[0].source_fields,
+            record.revisions[1].source_fields,
+        ):
+            self.assertIsNot(first_source, second_source)
+
+    def test_report_store_does_not_rebuild_reflected_snapshots(self):
+        reflection = ReportReflection(
+            decision_thesis="Buy after confirmation.",
+            overall_assessment="The decision used the available evidence.",
+            outcome_assessments=[
+                ReportOutcomeAssessment(
+                    horizon_days=7,
+                    assessment="T+7 outcome assessment.",
+                )
+            ],
+            reasoning_strengths=["The entry condition was explicit."],
+            causal_hypotheses=[
+                ReportCausalHypothesis(
+                    statement="Momentum persisted.",
+                    evidence=["Price held above support."],
+                    confidence="medium",
+                )
+            ],
+            mistakes_or_missed_opportunities=[],
+            next_decision_checks=["Confirm volume."],
+        )
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            pending = record_review_fact(store, session, paper_review(7))
+            lesson = "Reflected T+7 lesson."
+            reflected_revision = pending.revisions[0].model_copy(
+                update={
+                    "reflection_state": "ready",
+                    "memory_state": "add_pending",
+                    "reflection": reflection,
+                    "lesson": lesson,
+                    "hermes_memory_entry": lesson,
+                }
+            )
+            reflected = ReportLearningRecord.model_validate(
+                {
+                    **pending.model_dump(),
+                    "reflected_revision": 1,
+                    "revisions": [reflected_revision],
+                }
+            )
+            store.save(reflected)
+            path = store.path_for(session.session_id)
+            original_bytes = path.read_bytes()
+
+            with self.assertRaises(ReportLearningConflict):
+                record_review_fact(store, session, paper_review(1))
+
+            persisted_bytes = path.read_bytes()
+
+        self.assertEqual(persisted_bytes, original_bytes)
+
     def test_report_store_progressively_aggregates_three_reviews(self):
         with TemporaryDirectory() as directory:
             store = ReportLearningStore(Path(directory))
@@ -329,45 +420,89 @@ class HermesReportLearningTests(unittest.TestCase):
 
         self.assertEqual(persisted, original)
 
+    def test_report_store_rejects_changed_outcome_for_repeated_review_id(self):
+        original_review = paper_review(1)
+        changed_reviews = {
+            "horizon_days": original_review.model_copy(
+                update={"horizon_days": 7}
+            ),
+            "review_date": original_review.model_copy(
+                update={"review_date": original_review.review_date + timedelta(days=1)}
+            ),
+            "raw_return_pct": original_review.model_copy(
+                update={"raw_return_pct": 2.0}
+            ),
+            "verdict": original_review.model_copy(
+                update={"verdict": "incorrect"}
+            ),
+        }
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            record_review_fact(store, session, original_review)
+            path = store.path_for(session.session_id)
+            original_bytes = path.read_bytes()
+
+            for changed_field, changed_review in changed_reviews.items():
+                with self.subTest(changed_field=changed_field):
+                    try:
+                        record_review_fact(store, session, changed_review)
+                    except ReportLearningConflict:
+                        pass
+                    except Exception as error:
+                        self.fail(
+                            f"same-ID {changed_field} raised {type(error).__name__}"
+                        )
+                    else:
+                        self.fail(f"same-ID {changed_field} was accepted")
+                    self.assertEqual(path.read_bytes(), original_bytes)
+
     def test_concurrent_report_facts_retain_outcomes_and_order_revisions(self):
         context = multiprocessing.get_context("fork")
         session = completed_session()
-        with TemporaryDirectory() as directory:
-            write_started = context.Queue()
-            allow_write = context.Event()
-            processes = [
-                context.Process(
-                    target=_concurrent_report_fact,
-                    args=(
-                        directory,
-                        session.model_dump(mode="json"),
-                        paper_review(horizon).model_dump(mode="json"),
-                        write_started,
-                        allow_write,
-                    ),
-                )
-                for horizon in (1, 7)
-            ]
-            processes[0].start()
-            write_started.get(timeout=5)
-            processes[1].start()
-            allow_write.set()
-            for process in processes:
-                process.join(timeout=5)
-                self.assertEqual(process.exitcode, 0)
+        for arrival_order in ((1, 7), (7, 1)):
+            with self.subTest(
+                arrival_order=arrival_order
+            ), TemporaryDirectory() as directory:
+                write_started = context.Queue()
+                allow_write = context.Event()
+                processes = [
+                    context.Process(
+                        target=_concurrent_report_fact,
+                        args=(
+                            directory,
+                            session.model_dump(mode="json"),
+                            paper_review(horizon).model_dump(mode="json"),
+                            write_started,
+                            allow_write,
+                        ),
+                    )
+                    for horizon in arrival_order
+                ]
+                processes[0].start()
+                write_started.get(timeout=5)
+                processes[1].start()
+                allow_write.set()
+                for process in processes:
+                    process.join(timeout=5)
+                    self.assertEqual(process.exitcode, 0)
 
-            record = ReportLearningStore(Path(directory)).load(session.session_id)
+                record = ReportLearningStore(Path(directory)).load(session.session_id)
 
-        self.assertIsNotNone(record)
-        self.assertEqual([outcome.horizon_days for outcome in record.outcomes], [1, 7])
-        self.assertEqual([revision.revision for revision in record.revisions], [1, 2])
-        self.assertEqual(
-            [revision.outcome_review_ids for revision in record.revisions],
-            [
-                [paper_review(1).review_id],
-                [paper_review(1).review_id, paper_review(7).review_id],
-            ],
-        )
+            self.assertIsNotNone(record)
+            self.assertEqual(
+                [outcome.horizon_days for outcome in record.outcomes], [1, 7]
+            )
+            self.assertEqual(
+                [revision.revision for revision in record.revisions], [1, 2]
+            )
+            self.assertEqual(
+                [revision.outcome_review_ids for revision in record.revisions],
+                [
+                    [paper_review(1).review_id],
+                    [paper_review(1).review_id, paper_review(7).review_id],
+                ],
+            )
 
     def test_report_learning_limits_are_explicit(self):
         self.assertEqual(getattr(hermes_learning, "REPORT_LESSON_LIMIT", None), 5)

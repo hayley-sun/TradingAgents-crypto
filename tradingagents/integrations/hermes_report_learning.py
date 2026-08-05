@@ -220,6 +220,9 @@ def _validate_review_identity(
         raise ReportLearningConflict("review identity conflicts with report")
     if review.horizon_days not in _ALLOWED_HORIZONS:
         raise ValueError("review horizon is not supported")
+
+
+def _validate_review_dates(review: PaperDecisionReview) -> None:
     expected_review_date = review.trade_date + timedelta(days=review.horizon_days)
     if (
         review.review_date != expected_review_date
@@ -227,6 +230,19 @@ def _validate_review_identity(
         or review.review_price.date != review.review_date
     ):
         raise ValueError("review date does not match its horizon")
+
+
+def _is_pristine_pending_revision(revision: ReportLearningRevision) -> bool:
+    return (
+        revision.reflection_state == "pending"
+        and revision.memory_state == "blocked"
+        and revision.reflection_attempt_count == 0
+        and revision.last_error_code is None
+        and revision.reflection is None
+        and revision.lesson is None
+        and revision.hermes_memory_entry is None
+        and revision.verified_at is None
+    )
 
 
 def record_review_fact(
@@ -240,6 +256,13 @@ def record_review_fact(
     source_digest = _source_digest(source_values)
     source_fields = _source_metadata(source_values)
     action = extract_paper_action(session)
+    outcome = ReportLearningOutcome(
+        review_id=review.review_id,
+        horizon_days=review.horizon_days,
+        review_date=review.review_date,
+        raw_return_pct=review.raw_return_pct,
+        verdict=review.verdict,
+    )
 
     def aggregate(current: ReportLearningRecord | None) -> ReportLearningRecord:
         if current is not None:
@@ -259,9 +282,19 @@ def record_review_fact(
                 raise ReportLearningConflict("report learning identity changed")
             if current.source_digest != source_digest:
                 raise ReportLearningConflict("report learning source changed")
-            if any(
-                outcome.review_id == review.review_id for outcome in current.outcomes
-            ):
+            existing_outcome = next(
+                (
+                    item
+                    for item in current.outcomes
+                    if item.review_id == review.review_id
+                ),
+                None,
+            )
+            if existing_outcome is not None:
+                if existing_outcome != outcome:
+                    raise ReportLearningConflict(
+                        "report learning review outcome changed"
+                    )
                 return current
             if len(current.outcomes) >= MAX_REPORT_REVISIONS:
                 raise ReportLearningConflict("report learning outcome limit reached")
@@ -271,33 +304,48 @@ def record_review_fact(
             ):
                 raise ReportLearningConflict("report learning horizon already recorded")
 
-        outcome = ReportLearningOutcome(
-            review_id=review.review_id,
-            horizon_days=review.horizon_days,
-            review_date=review.review_date,
-            raw_return_pct=review.raw_return_pct,
-            verdict=review.verdict,
-        )
+        _validate_review_dates(review)
         outcomes = sorted(
             [*(current.outcomes if current is not None else []), outcome],
             key=lambda item: item.horizon_days,
         )
-        if current is not None and outcomes[:-1] != current.outcomes:
-            raise ReportLearningConflict(
-                "report learning outcomes arrived out of order"
+        now = utc_now()
+        existing_revisions = current.revisions if current is not None else []
+        revisions: list[ReportLearningRevision] = []
+        for position in range(1, len(outcomes) + 1):
+            outcome_review_ids = [
+                item.review_id for item in outcomes[:position]
+            ]
+            existing = (
+                existing_revisions[position - 1]
+                if position <= len(existing_revisions)
+                else None
+            )
+            if (
+                existing is not None
+                and existing.outcome_review_ids == outcome_review_ids
+            ):
+                revisions.append(existing)
+                continue
+            if existing is not None and not _is_pristine_pending_revision(existing):
+                raise ReportLearningConflict(
+                    "processed report learning revision cannot be rebuilt"
+                )
+            revisions.append(
+                ReportLearningRevision(
+                    revision=position,
+                    outcome_review_ids=outcome_review_ids,
+                    reflection_state="pending",
+                    memory_state="blocked",
+                    source_fields=[
+                        field.model_copy(deep=True) for field in source_fields
+                    ],
+                    created_at=now,
+                    updated_at=now,
+                )
             )
 
-        now = utc_now()
         revision_number = len(outcomes)
-        revision = ReportLearningRevision(
-            revision=revision_number,
-            outcome_review_ids=[item.review_id for item in outcomes],
-            reflection_state="pending",
-            memory_state="blocked",
-            source_fields=[field.model_copy() for field in source_fields],
-            created_at=now,
-            updated_at=now,
-        )
         return ReportLearningRecord(
             session_id=session.session_id,
             symbol=session.request.symbol,
@@ -308,7 +356,7 @@ def record_review_fact(
             reflected_revision=(current.reflected_revision if current else 0),
             confirmed_revision=(current.confirmed_revision if current else 0),
             outcomes=outcomes,
-            revisions=[*(current.revisions if current is not None else []), revision],
+            revisions=revisions,
             created_at=current.created_at if current is not None else now,
             updated_at=now,
         )
