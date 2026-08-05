@@ -1,4 +1,6 @@
+import hashlib
 import multiprocessing
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -9,7 +11,15 @@ from tradingagents.integrations.hermes_learning import (
     LearningStorageError,
     LearningStore,
 )
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningConflict,
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.schemas import (
+    AnalysisRequest,
+    AnalysisResult,
+    AnalysisSession,
     PaperDecisionReview,
     PriceReference,
     ReportCausalHypothesis,
@@ -21,6 +31,94 @@ from tradingagents.integrations.schemas import (
     ReportSourceMetadata,
     utc_now,
 )
+
+
+def changed_result() -> AnalysisResult:
+    return AnalysisResult(
+        reports={
+            "market": "Changed market report.",
+            "sentiment": "Sentiment report.",
+            "news": "News report.",
+            "fundamentals": "Fundamentals report.",
+        },
+        investment_plan="Investment plan.",
+        trader_investment_plan="Trader investment plan.",
+        final_trade_decision="FINAL TRANSACTION PROPOSAL: **BUY**",
+        processed_signal="BUY",
+    )
+
+
+def completed_session() -> AnalysisSession:
+    return AnalysisSession(
+        session_id="hermes_0123456789abcdef",
+        status="completed",
+        created_at=utc_now(),
+        completed_at=utc_now(),
+        request=AnalysisRequest(
+            symbol="BTC",
+            trade_date=date(2026, 7, 1),
+            analysts=["market", "social", "news", "fundamentals"],
+            research_depth=1,
+            llm_provider="deepseek",
+            quick_model="quick",
+            deep_model="deep",
+        ),
+        result=changed_result().model_copy(
+            update={
+                "reports": {
+                    "market": "Market report.",
+                    "sentiment": "Sentiment report.",
+                    "news": "News report.",
+                    "fundamentals": "Fundamentals report.",
+                }
+            }
+        ),
+    )
+
+
+def paper_review(horizon_days: int) -> PaperDecisionReview:
+    trade_date = date(2026, 7, 1)
+    review_date = trade_date + timedelta(days=horizon_days)
+    return PaperDecisionReview(
+        review_id=f"review_{horizon_days:032x}",
+        session_id="hermes_0123456789abcdef",
+        symbol="BTC",
+        trade_date=trade_date,
+        review_date=review_date,
+        horizon_days=horizon_days,
+        action="BUY",
+        entry_price=PriceReference(
+            date=trade_date, usd_price=100.0, source="coinbase"
+        ),
+        review_price=PriceReference(
+            date=review_date, usd_price=101.0, source="coinbase"
+        ),
+        raw_return_pct=1.0,
+        verdict="correct",
+        created_at=utc_now(),
+        hermes_memory_entry=f"Legacy T+{horizon_days} lesson.",
+    )
+
+
+def _concurrent_report_fact(
+    root, session_payload, review_payload, write_started, allow_write
+):
+    from tradingagents.integrations import hermes_report_learning as report_module
+
+    original_write = report_module._atomic_json_write
+
+    def delayed_write(destination, value):
+        write_started.put(True)
+        allow_write.wait(timeout=5)
+        time.sleep(0.1)
+        original_write(destination, value)
+
+    report_module._atomic_json_write = delayed_write
+    report_module.record_review_fact(
+        report_module.ReportLearningStore(Path(root)),
+        AnalysisSession.model_validate(session_payload),
+        PaperDecisionReview.model_validate(review_payload),
+    )
 
 
 def report_learning_record(
@@ -166,6 +264,111 @@ def _controlled_legacy_upsert(root, review_payload, write_started, allow_write):
 
 
 class HermesReportLearningTests(unittest.TestCase):
+    def test_report_store_progressively_aggregates_three_reviews(self):
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            records = [
+                record_review_fact(store, session, paper_review(horizon))
+                for horizon in (1, 7, 15)
+            ]
+            path = store.path_for(session.session_id)
+            final_bytes = path.read_bytes()
+            repeated = record_review_fact(store, session, paper_review(15))
+            repeated_bytes = path.read_bytes()
+
+        self.assertEqual([record.desired_revision for record in records], [1, 2, 3])
+        self.assertEqual(
+            [item.horizon_days for item in records[-1].outcomes], [1, 7, 15]
+        )
+        self.assertEqual(len(records[-1].revisions), 3)
+        self.assertEqual(repeated.model_dump(), records[-1].model_dump())
+        self.assertEqual(repeated_bytes, final_bytes)
+        expected_source_values = {
+            "market_report": "Market report.",
+            "sentiment_report": "Sentiment report.",
+            "news_report": "News report.",
+            "fundamentals_report": "Fundamentals report.",
+            "investment_plan": "Investment plan.",
+            "trader_investment_plan": "Trader investment plan.",
+            "final_trade_decision": "FINAL TRANSACTION PROPOSAL: **BUY**",
+            "processed_signal": "BUY",
+        }
+        source_fields = records[-1].revisions[-1].source_fields
+        self.assertEqual(
+            {source.name: source.sha256 for source in source_fields},
+            {
+                name: hashlib.sha256(value.encode("utf-8")).hexdigest()
+                for name, value in expected_source_values.items()
+            },
+        )
+        self.assertEqual(
+            [revision.source_fields for revision in records[-1].revisions],
+            [source_fields, source_fields, source_fields],
+        )
+        self.assertTrue(
+            all(not source.truncated for source in source_fields)
+        )
+
+    def test_report_store_rejects_review_identity_or_source_change(self):
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            original = record_review_fact(store, session, paper_review(1))
+            with self.assertRaises(ReportLearningConflict):
+                record_review_fact(
+                    store,
+                    session.model_copy(update={"result": changed_result()}),
+                    paper_review(7),
+                )
+
+            mismatched_review = paper_review(7).model_copy(update={"symbol": "ETH"})
+            with self.assertRaises(ReportLearningConflict):
+                record_review_fact(store, session, mismatched_review)
+            persisted = store.load(session.session_id)
+
+        self.assertEqual(persisted, original)
+
+    def test_concurrent_report_facts_retain_outcomes_and_order_revisions(self):
+        context = multiprocessing.get_context("fork")
+        session = completed_session()
+        with TemporaryDirectory() as directory:
+            write_started = context.Queue()
+            allow_write = context.Event()
+            processes = [
+                context.Process(
+                    target=_concurrent_report_fact,
+                    args=(
+                        directory,
+                        session.model_dump(mode="json"),
+                        paper_review(horizon).model_dump(mode="json"),
+                        write_started,
+                        allow_write,
+                    ),
+                )
+                for horizon in (1, 7)
+            ]
+            processes[0].start()
+            write_started.get(timeout=5)
+            processes[1].start()
+            allow_write.set()
+            for process in processes:
+                process.join(timeout=5)
+                self.assertEqual(process.exitcode, 0)
+
+            record = ReportLearningStore(Path(directory)).load(session.session_id)
+
+        self.assertIsNotNone(record)
+        self.assertEqual([outcome.horizon_days for outcome in record.outcomes], [1, 7])
+        self.assertEqual([revision.revision for revision in record.revisions], [1, 2])
+        self.assertEqual(
+            [revision.outcome_review_ids for revision in record.revisions],
+            [
+                [paper_review(1).review_id],
+                [paper_review(1).review_id, paper_review(7).review_id],
+            ],
+        )
+
     def test_report_learning_limits_are_explicit(self):
         self.assertEqual(getattr(hermes_learning, "REPORT_LESSON_LIMIT", None), 5)
         self.assertEqual(getattr(hermes_learning, "RECENT_REPORT_LIMIT", None), 3)
