@@ -17,6 +17,8 @@ from tradingagents.integrations.schemas import (
     AnalysisSession,
     PaperDecisionReview,
     PriceReference,
+    ReportLearningIndexEntry,
+    ReportLearningRecord,
     SymbolLearningEntry,
     SymbolLearningIndex,
     is_valid_review_id,
@@ -25,7 +27,11 @@ from tradingagents.integrations.schemas import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GRAPH_LESSON_LIMIT = 5
+REPORT_LESSON_LIMIT = 5
+RECENT_REPORT_LIMIT = 3
+MATURE_REPORT_LIMIT = 2
+GRAPH_LESSON_TOTAL_MAX_CHARS = 12000
+GRAPH_LESSON_LIMIT = REPORT_LESSON_LIMIT
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
 _FINAL_ACTION_PATTERN = re.compile(
     r"FINAL\s+TRANSACTION\s+PROPOSAL\s*:\s*\**\s*(BUY|SELL|HOLD)\b",
@@ -136,36 +142,182 @@ class LearningStore:
     def upsert(self, review: PaperDecisionReview) -> SymbolLearningIndex:
         with self._exclusive_write_lock():
             current = self.load(review.symbol)
-            entry = SymbolLearningEntry(
-                review_id=review.review_id,
-                review_date=review.review_date,
-                lesson=review.hermes_memory_entry,
+            entry = self._legacy_entry(review)
+            existing_entries = (
+                []
+                if current is None
+                else (
+                    current.entries
+                    if current.schema_version == 1
+                    else current.legacy_entries
+                )
             )
-            existing_entries = current.entries if current is not None else []
             by_review_id = {item.review_id: item for item in existing_entries}
             by_review_id[entry.review_id] = entry
-            entries = sorted(
+            legacy_entries = sorted(
                 by_review_id.values(),
                 key=lambda item: (item.review_date, item.review_id),
                 reverse=True,
             )
-            index = SymbolLearningIndex(
-                symbol=review.symbol,
-                updated_at=utc_now(),
-                entries=entries,
+            index = (
+                SymbolLearningIndex(
+                    symbol=review.symbol,
+                    updated_at=utc_now(),
+                    entries=legacy_entries,
+                )
+                if current is None or current.schema_version == 1
+                else SymbolLearningIndex(
+                    schema_version=2,
+                    symbol=review.symbol,
+                    updated_at=utc_now(),
+                    entries=[],
+                    report_entries=current.report_entries,
+                    legacy_entries=legacy_entries,
+                )
             )
             _atomic_json_write(
                 self.path_for(index.symbol), index.model_dump(mode="json")
             )
             return index
 
-    def lessons_for(self, symbol: str, limit: int = GRAPH_LESSON_LIMIT) -> list[str]:
+    @staticmethod
+    def _legacy_entry(review: PaperDecisionReview) -> SymbolLearningEntry:
+        return SymbolLearningEntry(
+            review_id=review.review_id,
+            review_date=review.review_date,
+            lesson=review.hermes_memory_entry,
+            session_id=review.session_id,
+        )
+
+    def upsert_report(self, record: ReportLearningRecord) -> SymbolLearningIndex:
+        reflected_revision = record.reflected_revision
+        if reflected_revision < 1 or reflected_revision > len(record.revisions):
+            raise ValueError("report has no reflected revision")
+        snapshot = record.revisions[reflected_revision - 1]
+        if snapshot.revision != reflected_revision:
+            raise ValueError("reflected snapshot is out of range")
+        if snapshot.reflection_state != "ready":
+            raise ValueError("reflected snapshot is not ready")
+        if snapshot.lesson is None:
+            raise ValueError("reflected snapshot has no lesson")
+
+        horizons_by_review_id = {
+            outcome.review_id: outcome.horizon_days for outcome in record.outcomes
+        }
+        try:
+            maturity_days = max(
+                horizons_by_review_id[review_id]
+                for review_id in snapshot.outcome_review_ids
+            )
+        except (KeyError, ValueError) as error:
+            raise ValueError("reflected snapshot outcomes are invalid") from error
+
+        entry = ReportLearningIndexEntry(
+            session_id=record.session_id,
+            trade_date=record.trade_date,
+            maturity_days=maturity_days,
+            reflected_revision=reflected_revision,
+            updated_at=snapshot.updated_at,
+            lesson=snapshot.lesson,
+        )
+        with self._exclusive_write_lock():
+            current = self.load(record.symbol)
+            legacy_entries = (
+                []
+                if current is None
+                else (
+                    current.entries
+                    if current.schema_version == 1
+                    else current.legacy_entries
+                )
+            )
+            report_entries = (
+                []
+                if current is None or current.schema_version == 1
+                else current.report_entries
+            )
+            by_session_id = {item.session_id: item for item in report_entries}
+            by_session_id[entry.session_id] = entry
+            sorted_reports = sorted(
+                by_session_id.values(),
+                key=lambda item: (item.trade_date, item.session_id),
+                reverse=True,
+            )
+            index = SymbolLearningIndex(
+                schema_version=2,
+                symbol=record.symbol,
+                updated_at=utc_now(),
+                entries=[],
+                report_entries=sorted_reports,
+                legacy_entries=legacy_entries,
+            )
+            _atomic_json_write(
+                self.path_for(index.symbol), index.model_dump(mode="json")
+            )
+            return index
+
+    @staticmethod
+    def _legacy_lessons(entries: list[SymbolLearningEntry]) -> list[str]:
+        lessons = []
+        seen_session_ids: set[str] = set()
+        included_unknown_session = False
+        for entry in entries:
+            if entry.session_id is None:
+                if included_unknown_session:
+                    continue
+                included_unknown_session = True
+            elif entry.session_id in seen_session_ids:
+                continue
+            else:
+                seen_session_ids.add(entry.session_id)
+            lessons.append(entry.lesson)
+        return lessons
+
+    def lessons_for(self, symbol: str, limit: int = REPORT_LESSON_LIMIT) -> list[str]:
         if limit < 1:
             return []
         index = self.load(symbol)
         if index is None:
             return []
-        return [entry.lesson for entry in index.entries[:limit]]
+
+        candidates: list[str] = []
+        if index.schema_version == 2:
+            reports = sorted(
+                index.report_entries,
+                key=lambda item: (item.trade_date, item.session_id),
+                reverse=True,
+            )
+            selected_session_ids: set[str] = set()
+            for report in reports[:RECENT_REPORT_LIMIT]:
+                candidates.append(report.lesson)
+                selected_session_ids.add(report.session_id)
+            mature_reports = [
+                report for report in reports if report.maturity_days == 15
+            ][:MATURE_REPORT_LIMIT]
+            for report in mature_reports:
+                if report.session_id not in selected_session_ids:
+                    candidates.append(report.lesson)
+                    selected_session_ids.add(report.session_id)
+            candidates.extend(
+                report.lesson
+                for report in reports
+                if report.session_id not in selected_session_ids
+            )
+            legacy_entries = index.legacy_entries
+        else:
+            legacy_entries = index.entries
+        candidates.extend(self._legacy_lessons(legacy_entries))
+
+        lessons = []
+        total_chars = 0
+        for lesson in candidates:
+            if len(lessons) >= limit:
+                break
+            if total_chars + len(lesson) > GRAPH_LESSON_TOTAL_MAX_CHARS:
+                break
+            lessons.append(lesson)
+            total_chars += len(lesson)
+        return lessons
 
 
 def make_review_id(session_id: str, review_date: date) -> str:

@@ -89,6 +89,39 @@ def saved_review(results_root: Path) -> PaperDecisionReview:
 
 
 class HermesReviewVerifierTests(unittest.TestCase):
+    def test_verifier_finds_legacy_review_after_v2_index_upgrade(self):
+        from tests.test_hermes_report_learning import report_learning_record
+
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            saved_review(results_root)
+            LearningStore(results_root / "hermes" / "memories").upsert_report(
+                report_learning_record()
+            )
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
+
+            result = verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
+        self.assertIs(result.learning_index_contains_review, True)
+
+    def test_verifier_rejects_wrong_legacy_lesson_after_v2_index_upgrade(self):
+        from tests.test_hermes_report_learning import report_learning_record
+
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            review = saved_review(results_root)
+            learning_store = LearningStore(results_root / "hermes" / "memories")
+            learning_store.upsert_report(report_learning_record())
+            learning_store.upsert(
+                review.model_copy(update={"hermes_memory_entry": "Wrong v2 lesson."})
+            )
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
+
+            with self.assertRaises(ReviewVerificationError):
+                verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
     def test_verifier_requires_review_index_and_one_memory_entry(self):
         with TemporaryDirectory() as directory:
             results_root = Path(directory) / "results"

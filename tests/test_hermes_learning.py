@@ -77,7 +77,71 @@ def _concurrent_learning_upsert(root, review_payload, ready_queue, start_event):
     )
 
 
+def _review_for_index(offset: int, review_date: date) -> PaperDecisionReview:
+    trade_date = date(2026, 7, 28)
+    return PaperDecisionReview(
+        review_id=f"review_{offset:032x}",
+        session_id=f"hermes_{offset:032x}",
+        symbol="BTC",
+        trade_date=trade_date,
+        review_date=review_date,
+        horizon_days=(review_date - trade_date).days,
+        action="BUY",
+        entry_price=PriceReference(
+            date=trade_date, usd_price=100.0, source="coinbase"
+        ),
+        review_price=PriceReference(
+            date=review_date, usd_price=110.0, source="coinbase"
+        ),
+        raw_return_pct=10.0,
+        verdict="correct",
+        created_at=utc_now(),
+        hermes_memory_entry=f"Legacy lesson {offset}.",
+    )
+
+
 class HermesLearningTests(unittest.TestCase):
+    def test_first_report_upsert_migrates_v1_reviews_without_loss(self):
+        from tests.test_hermes_report_learning import report_learning_record
+
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            first = _review_for_index(1, date(2026, 7, 29))
+            second = _review_for_index(2, date(2026, 7, 30))
+            store.upsert(first)
+            store.upsert(second)
+
+            index = store.upsert_report(report_learning_record())
+
+        self.assertEqual(index.schema_version, 2)
+        self.assertEqual(index.entries, [])
+        self.assertEqual(
+            {entry.review_id for entry in index.legacy_entries},
+            {first.review_id, second.review_id},
+        )
+        self.assertEqual(len(index.report_entries), 1)
+
+    def test_legacy_upsert_after_v2_upgrade_preserves_report_entry(self):
+        from tests.test_hermes_report_learning import report_learning_record
+
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            record = report_learning_record()
+            upgraded = store.upsert_report(record)
+            review = _review_for_index(3, date(2026, 7, 31))
+
+            index = store.upsert(review)
+            repaired = store.upsert(
+                review.model_copy(update={"hermes_memory_entry": "Repaired legacy lesson."})
+            )
+
+        self.assertEqual(index.schema_version, 2)
+        self.assertEqual(repaired.report_entries, upgraded.report_entries)
+        self.assertEqual(repaired.entries, [])
+        self.assertEqual(len(repaired.legacy_entries), 1)
+        self.assertEqual(repaired.legacy_entries[0].session_id, review.session_id)
+        self.assertEqual(repaired.legacy_entries[0].lesson, "Repaired legacy lesson.")
+
     def test_learning_index_retains_backlog_beyond_twenty_reviews(self):
         trade_date = date(2026, 7, 1)
         with TemporaryDirectory() as directory:
