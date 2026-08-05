@@ -99,14 +99,17 @@ concurrency-protected `ReportLearningRecord`. Its schema-version-1 fields are:
 - outcomes: unique canonical review projections ordered by T+1, T+7, and T+15;
 - source metadata: allowed archived source-field names, field digests, and
   truncation flags;
-- market context: decision thesis plus technical, sentiment, news, and
-  fundamental context;
-- reflection: overall assessment, reasoning strengths, bounded causal
-  hypotheses, mistakes or missed opportunities, and next-decision checks;
-- rendered lesson: deterministic project lesson and deterministic Hermes memory
-  content for the reflected revision;
+- revisions: at most three immutable derived snapshots, one for each distinct
+  outcome set produced at T+1, T+7, and T+15;
 - reflection state and memory promotion state; and
 - safe attempt metadata, timestamps, and error codes.
+
+Each revision snapshot contains its revision number, included outcome review
+IDs, market context, reflection, deterministic project lesson, deterministic
+Hermes memory content, and its own reflection and memory-promotion state. The
+record-level desired, reflected, and confirmed revision counters point into this
+bounded snapshot list. This preserves an earlier memory payload when a later
+reflection becomes ready before the earlier Hermes mutation is confirmed.
 
 Each outcome projection contains only its review ID, horizon, review date,
 return, and verdict. The canonical review remains the authority for prices and
