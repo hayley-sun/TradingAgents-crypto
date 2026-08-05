@@ -198,6 +198,45 @@ class HermesScheduledReviewTests(unittest.TestCase):
         self.assertEqual(report.retryable_count, 1)
         self.assertEqual(report.report_fact_count, 0)
 
+    def test_state_conflict_does_not_overwrite_external_transition(self):
+        def reviewer(_session_id, _review_date, _version):
+            item = plan.items[0]
+            store.transition_item(
+                item.review_id,
+                "review_pending",
+                state="attention_required",
+                last_error_code="EXTERNAL_REVIEW",
+                updated_at=utc_now(),
+            )
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
+                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="legacy lesson",
+            )
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(
+                archived_batch(session_ids={"BTC": SESSION_IDS["BTC"]})
+            )
+            report = process_due_reviews(store, date(2026, 8, 7), reviewer)
+            item = store.find_item(plan.items[0].review_id)[1]
+
+        self.assertEqual(item.state, "attention_required")
+        self.assertEqual(item.last_error_code, "EXTERNAL_REVIEW")
+        self.assertEqual(report.retryable_count, 1)
+
     def test_non_skipped_item_requires_session_and_review_ids(self):
         with self.assertRaises(ValidationError):
             ScheduledReviewItem(

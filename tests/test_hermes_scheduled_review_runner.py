@@ -10,12 +10,78 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tradingagents.integrations import hermes_scheduled_review_runner as runner
+from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
+from tradingagents.integrations.hermes_mcp import (
+    SessionStore,
+    review_paper_decision_impl as real_review_paper_decision_impl,
+)
+from tradingagents.integrations.hermes_report_learning import ReportLearningStore
 from tradingagents.integrations.hermes_scheduled_reviews import (
     ScheduledReviewProcessReport,
+    ScheduledReviewStore,
 )
+from tradingagents.integrations.schemas import AnalysisResult, AnalysisSession, PriceReference, utc_now
+from tests.test_hermes_scheduled_reviews import archived_batch
 
 
 class HermesScheduledReviewRunnerTests(unittest.TestCase):
+    def test_v2_runner_writes_report_facts_without_legacy_learning(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "hermes"
+            schedule_store = ScheduledReviewStore(root / "review_schedules")
+            session_store = SessionStore(root / "sessions")
+            review_store = ReviewStore(root / "reviews")
+            report_store = ReportLearningStore(root / "report_memories")
+            learning_store = LearningStore(root / "memories")
+            batch = archived_batch(workflow_version=2)
+            for batch_item in batch.items:
+                session_store.save(
+                    AnalysisSession(
+                        session_id=batch_item.session_id,
+                        status="completed",
+                        created_at=utc_now(),
+                        completed_at=utc_now(),
+                        request=batch.request.for_symbol(batch_item.symbol),
+                        result=AnalysisResult(
+                            reports={},
+                            investment_plan="plan",
+                            trader_investment_plan="trader plan",
+                            final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                            processed_signal="BUY",
+                        ),
+                    )
+                )
+            schedule_store.create_or_load(batch)
+            legacy_flags = []
+
+            def review_spy(request_data, **kwargs):
+                legacy_flags.append(kwargs["write_legacy_learning"])
+                return real_review_paper_decision_impl(
+                    request_data,
+                    price_reference_resolver=lambda _symbol, trade_date, review_date: (
+                        PriceReference(date=trade_date, usd_price=100.0, source="coinbase"),
+                        PriceReference(date=review_date, usd_price=110.0, source="coinbase"),
+                    ),
+                    **kwargs,
+                )
+
+            with patch.object(
+                runner.ScheduledReviewStore, "from_environment", return_value=schedule_store
+            ), patch.object(
+                runner.SessionStore, "from_environment", return_value=session_store
+            ), patch.object(
+                runner.ReviewStore, "from_environment", return_value=review_store
+            ), patch.object(
+                runner.ReportLearningStore, "from_environment", return_value=report_store
+            ), patch.object(runner, "review_paper_decision_impl", side_effect=review_spy):
+                code, payload = runner.run_process_due(date(2026, 8, 7))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["report_fact_count"], 3)
+            self.assertEqual(legacy_flags, [False, False, False])
+            self.assertFalse(learning_store.root.exists())
+            self.assertEqual(len(report_store.records()), 3)
+
     def test_default_processor_routes_v2_review_to_report_fact(self):
         schedule_store = object()
         review_store = object()

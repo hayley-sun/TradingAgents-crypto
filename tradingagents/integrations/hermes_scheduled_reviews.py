@@ -336,6 +336,14 @@ def process_due_reviews(
     skipped_count = 0
     attention_required_count = 0
     report_fact_count = 0
+
+    def transition_pending(review_id: str, **updates: Any) -> bool:
+        try:
+            store.transition_item(review_id, "review_pending", **updates)
+        except ScheduledReviewStateConflict:
+            return False
+        return True
+
     with store.processing_lock():
         due_items = sorted(
             (
@@ -378,64 +386,76 @@ def process_due_reviews(
                             raise RuntimeError("report fact recorder unavailable")
                         fact_recorder(review)
                     except Exception:
-                        store.update_item(
+                        if not transition_pending(
                             item.review_id,
                             attempt_count=attempts,
                             last_error_code="REPORT_FACT_WRITE_FAILED",
                             updated_at=utc_now(),
-                        )
+                        ):
+                            retryable_count += 1
+                            continue
                         retryable_count += 1
                         continue
-                    store.update_item(
+                    if not transition_pending(
                         item.review_id,
                         state="completed",
                         attempt_count=attempts,
                         last_error_code=None,
                         verified_at=utc_now(),
                         updated_at=utc_now(),
-                    )
+                    ):
+                        retryable_count += 1
+                        continue
                     report_fact_count += 1
                     reviewed_count += 1
                     continue
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     state="memory_pending",
                     attempt_count=attempts,
                     last_error_code=None,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 reviewed_count += 1
                 continue
 
             if result.get("ok") is True:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     state="attention_required",
                     attempt_count=attempts,
                     last_error_code="REVIEW_IDENTITY_MISMATCH",
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 attention_required_count += 1
                 continue
 
             code = _error_code(result)
             if code in _SKIPPED_REVIEW_ERRORS:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     state="skipped",
                     attempt_count=attempts,
                     last_error_code=code,
                     skip_reason=code,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 skipped_count += 1
             else:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     attempt_count=attempts,
                     last_error_code=code,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 retryable_count += 1
     return ScheduledReviewProcessReport(
         due_count=due_count,
