@@ -396,6 +396,31 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("最近 5 条", runbook)
         self.assertIn("MEMORY.md", runbook)
 
+    def test_scheduled_skill_promotes_legacy_then_report_memory(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+
+        self.assertIn("memory-pending --limit 18", skill)
+        self.assertIn("report-reflection-pending --limit 18", skill)
+        self.assertIn("report-reflection-evidence", skill)
+        self.assertIn("submit_report_reflection", skill)
+        self.assertIn("begin-report-memory", skill)
+        self.assertIn("action=add", skill)
+        self.assertIn("action=replace", skill)
+        self.assertIn("confirm-report-memory", skill)
+        self.assertIn("quarantine-report-memory", skill)
+        self.assertNotIn("memory(action=read", skill)
+        self.assertNotIn("edit MEMORY.md", skill)
+
+    def test_runbook_documents_v2_cutover_and_single_entry_acceptance(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("scheduled_review_version: 2", text)
+        self.assertIn("report_memories/<session_id>.json", text)
+        self.assertIn("T+1 add", text)
+        self.assertIn("T+7/T+15 replace", text)
+        self.assertIn("旧 v1", text)
+        self.assertIn("只有一个 Hermes memory 条目", text)
+
 
 if __name__ == "__main__":
     unittest.main()
