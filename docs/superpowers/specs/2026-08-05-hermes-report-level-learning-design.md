@@ -97,16 +97,16 @@ concurrency-protected `ReportLearningRecord`. Its schema-version-1 fields are:
 - revision: monotonically increasing desired, reflected, and confirmed memory
   revisions;
 - outcomes: unique canonical review projections ordered by T+1, T+7, and T+15;
-- source metadata: allowed archived source-field names, field digests, and
-  truncation flags;
 - revisions: at most three immutable derived snapshots, one for each distinct
   outcome set produced at T+1, T+7, and T+15;
 - reflection state and memory promotion state; and
 - safe attempt metadata, timestamps, and error codes.
 
 Each revision snapshot contains its revision number, included outcome review
-IDs, market context, reflection, deterministic project lesson, deterministic
-Hermes memory content, and its own reflection and memory-promotion state. The
+IDs, allowed source-field names, field digests and packet-specific truncation
+flags, market context, one structured assessment per included outcome,
+reflection, deterministic project lesson, deterministic Hermes memory content,
+and its own reflection and memory-promotion state. The
 record-level desired, reflected, and confirmed revision counters point into this
 bounded snapshot list. This preserves an earlier memory payload when a later
 reflection becomes ready before the earlier Hermes mutation is confirmed.
@@ -120,7 +120,7 @@ Each causal hypothesis contains:
 ```json
 {
   "statement": "Short-term momentum may have been treated as persistent.",
-  "evidence": ["market_report", "outcome_t7"],
+  "evidence": ["report.market", "outcome.t7"],
   "confidence": "medium"
 }
 ```
@@ -191,10 +191,17 @@ entry. A deterministic project renderer owns both texts after validating:
 - list counts, item lengths, and total lengths are bounded;
 - no real-order instruction, exchange credential, or unsupported source appears;
   and
-- submitted expected revision still equals the record's desired revision.
+- the submitted revision is the next pending reflection snapshot, its source
+  digest still matches the archived session, and its outcome review IDs exactly
+  match that immutable snapshot.
 
-A stale payload is rejected without changing the record or index. Repeated
-submission of the identical reflection for the same revision is idempotent.
+A report may accumulate later facts while an older reflection is pending. The
+Agent submits pending snapshots in ascending revision order, so a missed T+1 run
+can still prepare revision 1 before revision 2. A payload is stale when it skips
+an earlier pending snapshot, targets an absent revision, or conflicts with an
+already-ready snapshot. It is rejected without changing the record or index.
+Repeated submission of the identical reflection for the same revision is
+idempotent.
 
 Market context and reflection are regenerated from the original evidence plus
 all outcomes at every horizon. T+7 and T+15 are not appended mechanically to the
