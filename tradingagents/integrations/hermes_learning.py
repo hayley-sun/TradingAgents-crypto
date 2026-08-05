@@ -25,7 +25,6 @@ from tradingagents.integrations.schemas import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAX_SYMBOL_LESSONS = 20
 GRAPH_LESSON_LIMIT = 5
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
 _FINAL_ACTION_PATTERN = re.compile(
@@ -105,7 +104,7 @@ class ReviewStore:
 
 
 class LearningStore:
-    """Filesystem-backed, bounded learning indexes isolated by symbol."""
+    """Filesystem-backed, durable learning indexes isolated by symbol."""
 
     def __init__(self, root: Path):
         self.root = Path(root).expanduser().resolve()
@@ -149,7 +148,7 @@ class LearningStore:
                 by_review_id.values(),
                 key=lambda item: (item.review_date, item.review_id),
                 reverse=True,
-            )[:MAX_SYMBOL_LESSONS]
+            )
             index = SymbolLearningIndex(
                 symbol=review.symbol,
                 updated_at=utc_now(),

@@ -25,11 +25,16 @@ from tradingagents.integrations.schemas import (
 
 
 HORIZON_DAYS = (1, 7, 15)
+MAX_MEMORY_ITEMS = 18
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduledReviewStorageError(RuntimeError):
     """Raised when a scheduled-review plan cannot be persisted safely."""
+
+
+class ScheduledReviewStateConflict(ScheduledReviewStorageError):
+    """Raised when a scheduled-review state changed before an atomic transition."""
 
 
 class ScheduledReviewConfirmationError(RuntimeError):
@@ -42,6 +47,7 @@ class ScheduledReviewProcessReport:
     reviewed_count: int
     retryable_count: int
     skipped_count: int
+    attention_required_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,13 @@ class ScheduledMemoryWork:
     horizon_days: int
     review_id: str
     hermes_memory_entry: str
+
+
+@dataclass(frozen=True)
+class ScheduledMemoryListing:
+    items: tuple[ScheduledMemoryWork, ...]
+    unavailable_count: int
+    unavailable_review_ids: tuple[str, ...]
 
 
 def _atomic_json_write(destination: Path, value: dict) -> None:
@@ -223,11 +236,28 @@ class ScheduledReviewStore:
         return plans
 
     def update_item(self, review_id: str, **updates: Any) -> ScheduledReviewItem:
+        return self._update_item(review_id, None, updates)
+
+    def transition_item(
+        self, review_id: str, expected_state: str, **updates: Any
+    ) -> ScheduledReviewItem:
+        return self._update_item(review_id, expected_state, updates)
+
+    def _update_item(
+        self,
+        review_id: str,
+        expected_state: str | None,
+        updates: dict[str, Any],
+    ) -> ScheduledReviewItem:
         with self._exclusive_lock():
             for plan in self.plans():
                 for index, item in enumerate(plan.items):
                     if item.review_id != review_id:
                         continue
+                    if expected_state is not None and item.state != expected_state:
+                        raise ScheduledReviewStateConflict(
+                            "scheduled review state changed"
+                        )
                     updated_item = ScheduledReviewItem.model_validate(
                         {**item.model_dump(mode="python"), **updates}
                     )
@@ -259,19 +289,34 @@ def _error_code(result: dict[str, Any]) -> str:
     return code if isinstance(code, str) and _SAFE_ERROR_CODE.fullmatch(code) else "SCHEDULED_REVIEW_FAILED"
 
 
+def _review_matches_schedule(
+    review: PaperDecisionReview,
+    trade_date: date,
+    item: ScheduledReviewItem,
+) -> bool:
+    return (
+        review.review_id == item.review_id
+        and review.session_id == item.session_id
+        and review.symbol == item.symbol
+        and review.trade_date == trade_date
+        and review.review_date == item.review_date
+        and review.horizon_days == item.horizon_days
+        and review.entry_price.date == trade_date
+        and review.review_price.date == item.review_date
+        and (item.review_date - trade_date).days == item.horizon_days
+    )
+
+
 def _successful_review_matches(
-    result: dict[str, Any], item: ScheduledReviewItem
+    result: dict[str, Any], trade_date: date, item: ScheduledReviewItem
 ) -> bool:
     try:
-        review = result["data"]["review"]
-        return (
-            result.get("ok") is True
-            and review["review_id"] == item.review_id
-            and review["session_id"] == item.session_id
-            and review["review_date"] == item.review_date.isoformat()
-        )
-    except (KeyError, TypeError):
+        review = PaperDecisionReview.model_validate(result["data"]["review"])
+    except (KeyError, TypeError, ValidationError):
         return False
+    return result.get("ok") is True and _review_matches_schedule(
+        review, trade_date, item
+    )
 
 
 def process_due_reviews(
@@ -286,18 +331,24 @@ def process_due_reviews(
     reviewed_count = 0
     retryable_count = 0
     skipped_count = 0
+    attention_required_count = 0
     with store.processing_lock():
         due_items = sorted(
             (
-                item
+                (plan.trade_date, item)
                 for plan in store.plans()
                 for item in plan.items
                 if item.state == "review_pending"
                 and item.review_date < current_utc_date
             ),
-            key=lambda item: (item.review_date, item.symbol, item.horizon_days),
+            key=lambda candidate: (
+                candidate[1].review_date,
+                candidate[0],
+                candidate[1].symbol,
+                candidate[1].horizon_days,
+            ),
         )
-        for item in due_items:
+        for trade_date, item in due_items:
             due_count += 1
             try:
                 result = reviewer(item.session_id, item.review_date)
@@ -307,7 +358,7 @@ def process_due_reviews(
                     "error": {"code": "SCHEDULED_REVIEW_FAILED"},
                 }
             attempts = item.attempt_count + 1
-            if _successful_review_matches(result, item):
+            if _successful_review_matches(result, trade_date, item):
                 store.update_item(
                     item.review_id,
                     state="memory_pending",
@@ -316,6 +367,17 @@ def process_due_reviews(
                     updated_at=utc_now(),
                 )
                 reviewed_count += 1
+                continue
+
+            if result.get("ok") is True:
+                store.update_item(
+                    item.review_id,
+                    state="attention_required",
+                    attempt_count=attempts,
+                    last_error_code="REVIEW_IDENTITY_MISMATCH",
+                    updated_at=utc_now(),
+                )
+                attention_required_count += 1
                 continue
 
             code = _error_code(result)
@@ -342,16 +404,21 @@ def process_due_reviews(
         reviewed_count=reviewed_count,
         retryable_count=retryable_count,
         skipped_count=skipped_count,
+        attention_required_count=attention_required_count,
     )
 
 
-def list_pending_memory(
+def inspect_pending_memory(
     store: ScheduledReviewStore,
     review_loader: Callable[[str], PaperDecisionReview | None],
     limit: int = 18,
-) -> list[ScheduledMemoryWork]:
-    """Return bounded canonical lessons without reading or changing Hermes memory."""
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+) -> ScheduledMemoryListing:
+    """Inspect bounded canonical lessons without reading or changing Hermes memory."""
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= MAX_MEMORY_ITEMS
+    ):
         raise ValueError("invalid pending memory limit")
     candidates = sorted(
         (
@@ -366,25 +433,27 @@ def list_pending_memory(
             pair[1].symbol,
             pair[1].horizon_days,
         ),
-    )[:limit]
+    )
     work = []
+    unavailable_count = 0
+    unavailable_review_ids = []
     for plan, item in candidates:
+        if len(work) >= limit:
+            break
         try:
             review = review_loader(item.review_id)
-        except Exception as error:
-            raise ScheduledReviewStorageError(
-                "scheduled review memory work unavailable"
-            ) from error
-        if (
-            review is None
-            or review.review_id != item.review_id
-            or review.session_id != item.session_id
-            or review.review_date != item.review_date
-            or review.symbol != item.symbol
+        except Exception:
+            unavailable_count += 1
+            if len(unavailable_review_ids) < MAX_MEMORY_ITEMS:
+                unavailable_review_ids.append(item.review_id)
+            continue
+        if review is None or not _review_matches_schedule(
+            review, plan.trade_date, item
         ):
-            raise ScheduledReviewStorageError(
-                "scheduled review memory work unavailable"
-            )
+            unavailable_count += 1
+            if len(unavailable_review_ids) < MAX_MEMORY_ITEMS:
+                unavailable_review_ids.append(item.review_id)
+            continue
         work.append(
             ScheduledMemoryWork(
                 trade_date=plan.trade_date,
@@ -395,7 +464,20 @@ def list_pending_memory(
                 hermes_memory_entry=review.hermes_memory_entry,
             )
         )
-    return work
+    return ScheduledMemoryListing(
+        items=tuple(work),
+        unavailable_count=unavailable_count,
+        unavailable_review_ids=tuple(unavailable_review_ids),
+    )
+
+
+def list_pending_memory(
+    store: ScheduledReviewStore,
+    review_loader: Callable[[str], PaperDecisionReview | None],
+    limit: int = 18,
+) -> list[ScheduledMemoryWork]:
+    """Return bounded canonical lessons without reading or changing Hermes memory."""
+    return list(inspect_pending_memory(store, review_loader, limit).items)
 
 
 def confirm_scheduled_memory(
@@ -416,20 +498,33 @@ def confirm_scheduled_memory(
         if verification is None or verification is False:
             raise ValueError("review verification failed")
     except Exception as error:
-        store.update_item(
-            review_id,
-            state="attention_required",
-            last_error_code="REVIEW_CONSISTENCY_FAILED",
-            updated_at=utc_now(),
-        )
+        try:
+            store.transition_item(
+                review_id,
+                "memory_pending",
+                state="attention_required",
+                last_error_code="REVIEW_CONSISTENCY_FAILED",
+                updated_at=utc_now(),
+            )
+        except ScheduledReviewStateConflict:
+            pass
         raise ScheduledReviewConfirmationError(
             "scheduled review confirmation failed"
         ) from error
     now = utc_now()
-    return store.update_item(
-        review_id,
-        state="completed",
-        last_error_code=None,
-        updated_at=now,
-        verified_at=now,
-    )
+    try:
+        return store.transition_item(
+            review_id,
+            "memory_pending",
+            state="completed",
+            last_error_code=None,
+            updated_at=now,
+            verified_at=now,
+        )
+    except ScheduledReviewStateConflict as error:
+        current = store.find_item(review_id)[1]
+        if current.state == "completed":
+            return current
+        raise ScheduledReviewConfirmationError(
+            "scheduled review confirmation failed"
+        ) from error

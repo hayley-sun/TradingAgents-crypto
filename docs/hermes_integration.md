@@ -333,7 +333,7 @@ hermes cron list --all
 
 新版本归档的每个 BTC、ETH、SOL completed session 会注册 T+1、T+7、T+15 三个复盘项，计划保存在 `results/hermes/review_schedules/<trade_date>.json`。T+N 表示精确 UTC 复盘价格日期；只有该 UTC 日期完整结束，即 `review_date` 严格早于当前 UTC 日期后才会执行。旧归档没有复盘版本标记，因此上线后不会自动回填旧报告。
 
-自动化分成两个持久化阶段。08:15 无 agent processor 只调用项目确定性复盘代码，写入 `results/hermes/reviews` 并更新 `results/hermes/memories/<SYMBOL>.json`，绝不读取或写入 Hermes 长期 memory。08:30 Hermes Agent job 只加载专用 skill，通过内置 memory tool 写入精确的 `hermes_memory_entry`，随后运行项目一致性确认。任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
+自动化分成两个持久化阶段。08:15 无 agent processor 只调用项目确定性复盘代码，写入 `results/hermes/reviews` 并更新 `results/hermes/memories/<SYMBOL>.json`，该索引持久保留全部复盘索引项，供积压恢复和一致性验证；后续分析仍只注入最近 5 条 lesson。processor 绝不读取或写入 Hermes 长期 memory。08:30 Hermes Agent job 只加载专用 skill，通过内置 memory tool 写入精确的 `hermes_memory_entry`，随后运行项目一致性确认。任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
 
 安装 owner-only wrapper 和 skill：
 
@@ -346,7 +346,7 @@ install -m 600 deploy/hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.
 hermes memory status
 ```
 
-预期 memory tool 和 memory injection 均为 enabled。processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载 `TRADINGAGENTS_RESULTS_DIR`、CoinGecko 与 CryptoCompare 白名单值，不加载 DeepSeek key、不创建 `.env` 或第二份密钥文件。
+预期 memory tool 和 memory injection 均为 enabled。processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载 `TRADINGAGENTS_RESULTS_DIR`、CoinGecko 与 CryptoCompare 白名单值，不加载 DeepSeek key、不创建 `.env` 或第二份密钥文件。私有配置缺失、格式错误或没有非空 `TRADINGAGENTS_RESULTS_DIR` 时会在导入 runner 前安全失败，不会回退到其它结果目录。
 
 创建两个 local job 后立即暂停，完成人工验收前不得让它们按计划执行：
 
@@ -383,7 +383,7 @@ hermes cron pause "$scheduled_review_memory_job_id"
 hermes cron runs "$scheduled_review_memory_job_id" --limit 1
 ```
 
-成功项必须为 `completed` 且 verifier 确认 review、币种 learning index 和 Hermes memory 中精确条目只出现一次。`PRICE_DATA_UNAVAILABLE` 等安全错误保持 `review_pending` 并在次日重试；memory 或三处一致性异常进入 `attention_required`，不得自动重试或用 shell 修复。经批准的 memory 修复只能使用 Hermes memory tool 的目标 `replace` 或 `remove` 操作。
+成功项必须为 `completed` 且 verifier 确认 review、币种 learning index 和 Hermes memory 中精确条目只出现一次。`memory-pending` 输出中的 `unavailable_count` 是不可用项总数，`unavailable_review_ids` 是最多 18 个安全 ID 样本，表示对应规范 review 缺失、不可读或身份不一致；Agent 不对它们执行 memory add 或确认，并继续处理 `items` 中的有效项。`PRICE_DATA_UNAVAILABLE` 等安全错误保持 `review_pending` 并在次日重试；memory 或三处一致性异常进入 `attention_required`，不得自动重试或用 shell 修复。经批准的 memory 修复只能使用 Hermes memory tool 的目标 `replace` 或 `remove` 操作。
 
 验收全部通过后恢复两个 job：
 
@@ -397,7 +397,7 @@ hermes cron status
 
 ## 会话存储和故障处理
 
-所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`，其中 `.log` 文件由 `tradingagents-hermes-maintenance.timer` 按 14 天保留期清理。确定性复盘记录保存在 `results/hermes/reviews`，每个币种最近 20 条学习项保存在 `results/hermes/memories/<SYMBOL>.json`；后续同币种分析最多加载最近 5 条。会话、复盘、学习索引和 Hermes 长期 memory 永不由维护任务删除。
+所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`，其中 `.log` 文件由 `tradingagents-hermes-maintenance.timer` 按 14 天保留期清理。确定性复盘记录保存在 `results/hermes/reviews`，每个币种的全部复盘学习项持久化到 `results/hermes/memories/<SYMBOL>.json`，后续同币种分析最多加载最近 5 条。会话、复盘、学习索引和 Hermes 长期 memory 永不由维护任务删除。
 
 | 错误代码 | 操作员处理 |
 | --- | --- |

@@ -13,16 +13,17 @@ from tradingagents.integrations.hermes_learning import ReviewStore
 from tradingagents.integrations.hermes_mcp import PROJECT_ROOT, review_paper_decision_impl
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
 from tradingagents.integrations.hermes_scheduled_reviews import (
+    MAX_MEMORY_ITEMS,
     ScheduledReviewProcessReport,
     ScheduledReviewStore,
     confirm_scheduled_memory,
-    list_pending_memory,
+    inspect_pending_memory,
     process_due_reviews,
 )
 from tradingagents.integrations.schemas import is_valid_review_id
 
 
-DEFAULT_MEMORY_LIMIT = 18
+DEFAULT_MEMORY_LIMIT = MAX_MEMORY_ITEMS
 
 
 def _results_root() -> Path:
@@ -61,6 +62,7 @@ def run_process_due(
         "reviewed_count": report.reviewed_count,
         "retryable_count": report.retryable_count,
         "skipped_count": report.skipped_count,
+        "attention_required_count": report.attention_required_count,
     }
 
 
@@ -72,14 +74,26 @@ def run_memory_pending(
     if lister is None:
         store = ScheduledReviewStore.from_environment()
         review_store = ReviewStore.from_environment()
-        lister = lambda selected_limit: list_pending_memory(
+        lister = lambda selected_limit: inspect_pending_memory(
             store, review_store.load, selected_limit
         )
-    work = lister(limit)
+    listing = lister(limit)
+    if isinstance(listing, list):
+        work = listing
+        unavailable_count = 0
+        unavailable_review_ids = []
+    else:
+        work = list(listing.items)
+        unavailable_count = listing.unavailable_count
+        unavailable_review_ids = list(
+            listing.unavailable_review_ids[:MAX_MEMORY_ITEMS]
+        )
     return 0, {
         "ok": True,
         "mode": "memory-pending",
         "count": len(work),
+        "unavailable_count": unavailable_count,
+        "unavailable_review_ids": unavailable_review_ids,
         "items": [
             {
                 "trade_date": item.trade_date.isoformat(),
@@ -170,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         if parsed.mode == "process-due":
             code, payload = run_process_due(_parse_date(parsed.current_utc_date))
         elif parsed.mode == "memory-pending":
-            if not 1 <= parsed.limit <= 100:
+            if not 1 <= parsed.limit <= MAX_MEMORY_ITEMS:
                 raise ValueError("invalid memory limit")
             code, payload = run_memory_pending(parsed.limit)
         else:

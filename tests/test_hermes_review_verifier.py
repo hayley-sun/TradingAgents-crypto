@@ -115,6 +115,21 @@ class HermesReviewVerifierTests(unittest.TestCase):
             with self.assertRaises(ReviewVerificationError):
                 verify_review_consistency(REVIEW_ID, results_root, memory_path)
 
+    def test_verifier_rejects_learning_entry_with_wrong_lesson(self):
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            review = saved_review(results_root)
+            LearningStore(results_root / "hermes" / "memories").upsert(
+                review.model_copy(
+                    update={"hermes_memory_entry": "Different indexed lesson."}
+                )
+            )
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
+
+            with self.assertRaises(ReviewVerificationError):
+                verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
     def test_cli_outputs_only_safe_status_fields_and_failure_exit_code(self):
         with TemporaryDirectory() as directory:
             results_root = Path(directory) / "results"
@@ -295,6 +310,9 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("Entry added", skill)
         self.assertIn("Entry already exists", skill)
         self.assertIn("confirm-memory", skill)
+        self.assertIn("unavailable_count", skill)
+        self.assertIn("unavailable_review_ids", skill)
+        self.assertIn("Continue with the valid items", skill)
         self.assertIn("Never edit", skill)
         self.assertIn("MEMORY.md", skill)
         self.assertIn("never a real order", normalized_skill)
@@ -308,6 +326,8 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("--skill tradingagents-scheduled-paper-reviews", runbook)
         self.assertIn("不会自动回填旧报告", runbook)
         self.assertIn("不得通过脚本直接修改", runbook)
+        self.assertIn("持久保留全部复盘索引项", runbook)
+        self.assertIn("最近 5 条", runbook)
         self.assertIn("MEMORY.md", runbook)
 
 

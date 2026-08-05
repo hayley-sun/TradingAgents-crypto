@@ -37,6 +37,9 @@ def load_scheduled_review_environment(
     values = server.get("env")
     if not isinstance(values, dict):
         return False
+    results_dir = values.get("TRADINGAGENTS_RESULTS_DIR")
+    if not isinstance(results_dir, str) or not results_dir.strip():
+        return False
     selected = {
         key: value
         for key in SCHEDULED_REVIEW_ENVIRONMENT_KEYS
@@ -72,7 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     mode = arguments[0] if arguments else "unknown"
     try:
-        _load_default_environment()
+        if not _load_default_environment():
+            raise RuntimeError("scheduled-review environment unavailable")
         runner = import_module(
             "tradingagents.integrations.hermes_scheduled_review_runner"
         )

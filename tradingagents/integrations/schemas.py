@@ -416,7 +416,7 @@ class SymbolLearningIndex(_StrictModel):
     schema_version: Literal[1] = 1
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     updated_at: datetime
-    entries: list[SymbolLearningEntry] = Field(max_length=20)
+    entries: list[SymbolLearningEntry]
 
     @field_validator("symbol", mode="before")
     @classmethod

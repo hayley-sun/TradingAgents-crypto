@@ -71,6 +71,46 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             "Exact scheduled lesson.",
         )
 
+    def test_memory_pending_surfaces_unavailable_items_and_keeps_valid_work(self):
+        item = SimpleNamespace(
+            trade_date=date(2026, 8, 5),
+            review_date=date(2026, 8, 6),
+            symbol="ETH",
+            horizon_days=1,
+            review_id="review_1123456789abcdef",
+            hermes_memory_entry="Exact valid lesson.",
+        )
+        listing = SimpleNamespace(
+            items=(item,),
+            unavailable_count=1,
+            unavailable_review_ids=("review_0123456789abcdef",),
+        )
+
+        code, payload = runner.run_memory_pending(1, lambda _limit: listing)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["unavailable_count"], 1)
+        self.assertEqual(
+            payload["unavailable_review_ids"], ["review_0123456789abcdef"]
+        )
+
+    def test_memory_pending_bounds_unavailable_id_sample(self):
+        unavailable_review_ids = tuple(
+            f"review_{offset:032x}" for offset in range(19)
+        )
+        listing = SimpleNamespace(
+            items=(),
+            unavailable_review_ids=unavailable_review_ids,
+            unavailable_count=len(unavailable_review_ids),
+        )
+
+        code, payload = runner.run_memory_pending(18, lambda _limit: listing)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["unavailable_count"], 19)
+        self.assertEqual(len(payload["unavailable_review_ids"]), 18)
+
     def test_confirm_memory_returns_only_project_state(self):
         seen = []
 
@@ -110,6 +150,20 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             "INVALID_SCHEDULED_REVIEW_REQUEST",
         )
 
+    def test_main_rejects_memory_limit_above_agent_bound(self):
+        stdout = io.StringIO()
+        with patch.object(runner, "run_memory_pending") as pending, redirect_stdout(
+            stdout
+        ):
+            code = runner.main(["memory-pending", "--limit", "19"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["error"]["code"],
+            "INVALID_SCHEDULED_REVIEW_REQUEST",
+        )
+        pending.assert_not_called()
+
     def test_bootstrap_loads_only_scheduled_review_environment(self):
         bootstrap = importlib.import_module(
             "tradingagents.integrations.hermes_scheduled_review_bootstrap"
@@ -145,6 +199,45 @@ mcp_servers:
         self.assertNotIn("DEEPSEEK_API_KEY", environment)
         self.assertNotIn("UNRELATED_VALUE", environment)
 
+    def test_bootstrap_rejects_config_without_results_directory(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_scheduled_review_bootstrap"
+        )
+        config_text = """
+mcp_servers:
+  tradingagents_crypto:
+    env:
+      COINGECKO_DEMO_API_KEY: coingecko-key
+"""
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(config_text, encoding="utf-8")
+            environment = {}
+
+            loaded = bootstrap.load_scheduled_review_environment(
+                config_path, environment
+            )
+
+        self.assertFalse(loaded)
+        self.assertEqual(environment, {})
+
+    def test_bootstrap_stops_before_import_when_config_load_fails(self):
+        bootstrap = importlib.import_module(
+            "tradingagents.integrations.hermes_scheduled_review_bootstrap"
+        )
+        stdout = io.StringIO()
+        with patch.object(
+            bootstrap, "_load_default_environment", return_value=False
+        ), patch.object(bootstrap, "import_module") as importer, redirect_stdout(stdout):
+            code = bootstrap.main(["process-due"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["error"]["code"],
+            "SCHEDULED_REVIEW_RUNNER_FAILED",
+        )
+        importer.assert_not_called()
+
     def test_bootstrap_loads_environment_before_runner_import(self):
         bootstrap = importlib.import_module(
             "tradingagents.integrations.hermes_scheduled_review_bootstrap"
@@ -160,7 +253,7 @@ mcp_servers:
         with patch.object(
             bootstrap,
             "_load_default_environment",
-            side_effect=lambda: events.append(("load", None)),
+            side_effect=lambda: events.append(("load", None)) or True,
         ), patch.object(
             bootstrap,
             "import_module",

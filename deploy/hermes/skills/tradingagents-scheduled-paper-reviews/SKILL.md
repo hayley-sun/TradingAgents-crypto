@@ -1,6 +1,6 @@
 ---
 name: tradingagents-scheduled-paper-reviews
-description: Promote due, deterministic TradingAgents paper-review lessons through Hermes memory and confirm persisted consistency.
+description: Use when the attached Hermes Cron explicitly requests scheduled TradingAgents paper-review memory promotion.
 ---
 
 # TradingAgents Scheduled Paper Reviews
@@ -15,8 +15,11 @@ never a real order.
    /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
    ```
 
-2. Continue only when the command returns JSON with `ok: true`. Process the
-   returned items in order. Do not search or read raw Hermes memory.
+2. Continue only when the command returns JSON with `ok: true`. If
+   `unavailable_count` is nonzero, report that total and the bounded
+   `unavailable_review_ids` sample without trying memory add, confirmation, or
+   repair for them. Continue with the valid items in `items`, in order. Do not
+   search or read raw Hermes memory.
 3. For each item, call the Hermes built-in memory tool exactly once with
    `action=add`, target `memory`, and the exact `hermes_memory_entry` as content.
    Do not rewrite, summarize, combine, or decorate the entry.
