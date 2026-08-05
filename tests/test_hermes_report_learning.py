@@ -242,6 +242,26 @@ class HermesReportLearningTests(unittest.TestCase):
             "Legacy lesson 2.",
         ])
 
+    def test_selection_deduplicates_legacy_session_already_used_by_report(self):
+        report = report_learning_record(session_number=500)
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            store.upsert(legacy_review(6, session_number=500))
+            store.upsert(legacy_review(5, session_number=5))
+            store.upsert(legacy_review(4, session_number=4))
+            store.upsert_report(report)
+
+            lessons = store.lessons_for("BTC", limit=3)
+
+        self.assertEqual(
+            lessons,
+            [
+                report.revisions[-1].lesson,
+                "Legacy lesson 5.",
+                "Legacy lesson 4.",
+            ],
+        )
+
     def test_selection_respects_total_character_budget_without_splitting(self):
         first = "a" * 6000
         second = "b" * 6000

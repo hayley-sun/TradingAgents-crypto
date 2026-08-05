@@ -257,9 +257,11 @@ class LearningStore:
             return index
 
     @staticmethod
-    def _legacy_lessons(entries: list[SymbolLearningEntry]) -> list[str]:
+    def _legacy_lessons(
+        entries: list[SymbolLearningEntry], excluded_session_ids: set[str] | None = None
+    ) -> list[str]:
         lessons = []
-        seen_session_ids: set[str] = set()
+        seen_session_ids = set(excluded_session_ids or ())
         included_unknown_session = False
         for entry in entries:
             if entry.session_id is None:
@@ -281,6 +283,7 @@ class LearningStore:
             return []
 
         candidates: list[str] = []
+        report_session_ids: set[str] = set()
         if index.schema_version == 2:
             reports = sorted(
                 index.report_entries,
@@ -303,10 +306,13 @@ class LearningStore:
                 for report in reports
                 if report.session_id not in selected_session_ids
             )
+            report_session_ids = {report.session_id for report in reports}
             legacy_entries = index.legacy_entries
         else:
             legacy_entries = index.entries
-        candidates.extend(self._legacy_lessons(legacy_entries))
+        candidates.extend(
+            self._legacy_lessons(legacy_entries, report_session_ids)
+        )
 
         lessons = []
         total_chars = 0
