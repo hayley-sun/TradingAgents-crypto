@@ -25,7 +25,6 @@ from tradingagents.integrations.schemas import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAX_SYMBOL_LESSONS = 20
 GRAPH_LESSON_LIMIT = 5
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
 _FINAL_ACTION_PATTERN = re.compile(
@@ -105,7 +104,7 @@ class ReviewStore:
 
 
 class LearningStore:
-    """Filesystem-backed, bounded learning indexes isolated by symbol."""
+    """Filesystem-backed, durable learning indexes isolated by symbol."""
 
     def __init__(self, root: Path):
         self.root = Path(root).expanduser().resolve()
@@ -149,7 +148,7 @@ class LearningStore:
                 by_review_id.values(),
                 key=lambda item: (item.review_date, item.review_id),
                 reverse=True,
-            )[:MAX_SYMBOL_LESSONS]
+            )
             index = SymbolLearningIndex(
                 symbol=review.symbol,
                 updated_at=utc_now(),
@@ -206,13 +205,14 @@ def _memory_entry(
     symbol: str,
     trade_date: date,
     review_date: date,
+    horizon_days: int,
     action: str,
     raw_return_pct: float,
     verdict: str,
 ) -> str:
     return (
         f"Paper-trading research lesson for {symbol}: the {trade_date.isoformat()} "
-        f"analysis proposed {action}; USD reference movement through "
+        f"analysis proposed {action}; at T+{horizon_days}, USD reference movement through "
         f"{review_date.isoformat()} was {raw_return_pct:+.2f}%, so the directional "
         f"verdict was {verdict}. This is research and paper trading only, never a real order."
     )
@@ -283,12 +283,14 @@ def review_completed_session(
     )
     action = extract_paper_action(session)
     verdict = classify_direction(action, raw_return_pct)
+    horizon_days = (review_date - trade_date).days
     review = PaperDecisionReview(
         review_id=review_id,
         session_id=session.session_id,
         symbol=session.request.symbol,
         trade_date=trade_date,
         review_date=review_date,
+        horizon_days=horizon_days,
         action=action,
         entry_price=entry_price,
         review_price=observed_price,
@@ -299,6 +301,7 @@ def review_completed_session(
             session.request.symbol,
             trade_date,
             review_date,
+            horizon_days,
             action,
             raw_return_pct,
             verdict,

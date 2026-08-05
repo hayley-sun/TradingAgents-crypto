@@ -14,6 +14,7 @@ from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
 from tradingagents.integrations.hermes_reports import ReportBatchStore
+from tradingagents.integrations.hermes_scheduled_reviews import ScheduledReviewStore
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
@@ -380,6 +381,100 @@ class HermesMcpTests(unittest.TestCase):
         self.assertTrue(start_result["ok"])
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "REPORT_BATCH_ACTIVE")
+
+    def test_daily_report_archive_enrolls_new_scheduled_reviews(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            batch_store = ReportBatchStore(root / "report_batches")
+            schedule_store = ScheduledReviewStore(root / "review_schedules")
+            session = AnalysisSession(
+                session_id="hermes_0123456789abcdef",
+                status="completed",
+                created_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+                request=AnalysisRequest(
+                    symbol="BTC",
+                    trade_date="2026-07-29",
+                    analysts=["market", "news"],
+                    research_depth=1,
+                    llm_provider="deepseek",
+                    quick_model="deepseek-v4-flash",
+                    deep_model="deepseek-v4-pro",
+                ),
+                result=AnalysisResult(
+                    reports={},
+                    investment_plan="plan",
+                    trader_investment_plan="trader plan",
+                    final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                    processed_signal="BUY",
+                ),
+            )
+            start_daily_report_batch_impl(
+                self.daily_request_data(),
+                batch_store=batch_store,
+                starter=lambda _request: session.session_id,
+            )
+
+            result = archive_daily_report_impl(
+                "2026-07-29",
+                "Chinese narrative",
+                batch_store=batch_store,
+                schedule_store=schedule_store,
+                session_loader=lambda _session_id: session,
+            )
+            plan = schedule_store.load(date(2026, 7, 29))
+
+        self.assertTrue(result["ok"])
+        self.assertIsNotNone(plan)
+        self.assertEqual([item.horizon_days for item in plan.items], [1, 7, 15])
+
+    def test_existing_unmarked_archive_is_not_backfilled(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            batch_store = ReportBatchStore(root / "report_batches")
+            schedule_store = ScheduledReviewStore(root / "review_schedules")
+            session = AnalysisSession(
+                session_id="hermes_0123456789abcdef",
+                status="completed",
+                created_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+                request=AnalysisRequest(
+                    symbol="BTC",
+                    trade_date="2026-07-29",
+                    analysts=["market", "news"],
+                    research_depth=1,
+                    llm_provider="deepseek",
+                    quick_model="deepseek-v4-flash",
+                    deep_model="deepseek-v4-pro",
+                ),
+                result=AnalysisResult(
+                    reports={},
+                    investment_plan="plan",
+                    trader_investment_plan="trader plan",
+                    final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                    processed_signal="BUY",
+                ),
+            )
+            start_daily_report_batch_impl(
+                self.daily_request_data(),
+                batch_store=batch_store,
+                starter=lambda _request: session.session_id,
+            )
+            batch = batch_store.load(date(2026, 7, 29))
+            batch_store.archive(
+                batch, lambda _session_id: session, "Legacy narrative"
+            )
+
+            result = archive_daily_report_impl(
+                "2026-07-29",
+                "Legacy narrative",
+                batch_store=batch_store,
+                schedule_store=schedule_store,
+                session_loader=lambda _session_id: session,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(schedule_store.load(date(2026, 7, 29)))
 
     def test_daily_report_mcp_tools_forbid_unknown_fields(self):
         for tool_name in (

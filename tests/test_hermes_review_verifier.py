@@ -47,6 +47,21 @@ DAILY_REPORT_ARCHIVE_SCRIPT = (
     / "scripts"
     / "tradingagents-daily-report-archive.sh"
 )
+SCHEDULED_REVIEW_PROCESS_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-scheduled-review-process.sh"
+)
+SCHEDULED_REVIEW_SKILL_PATH = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "skills"
+    / "tradingagents-scheduled-paper-reviews"
+    / "SKILL.md"
+)
 
 
 def saved_review(results_root: Path) -> PaperDecisionReview:
@@ -96,6 +111,21 @@ class HermesReviewVerifierTests(unittest.TestCase):
             memory_path.write_text(
                 f"{MEMORY_ENTRY}\n{MEMORY_ENTRY}\n", encoding="utf-8"
             )
+
+            with self.assertRaises(ReviewVerificationError):
+                verify_review_consistency(REVIEW_ID, results_root, memory_path)
+
+    def test_verifier_rejects_learning_entry_with_wrong_lesson(self):
+        with TemporaryDirectory() as directory:
+            results_root = Path(directory) / "results"
+            review = saved_review(results_root)
+            LearningStore(results_root / "hermes" / "memories").upsert(
+                review.model_copy(
+                    update={"hermes_memory_entry": "Different indexed lesson."}
+                )
+            )
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text(f"{MEMORY_ENTRY}\n", encoding="utf-8")
 
             with self.assertRaises(ReviewVerificationError):
                 verify_review_consistency(REVIEW_ID, results_root, memory_path)
@@ -261,6 +291,44 @@ class HermesReviewVerifierTests(unittest.TestCase):
             runbook.index("hermes cron create --name tradingagents-daily-report-submit"),
             runbook.index('hermes cron remove "$old_submit_job_id"'),
         )
+
+    def test_scheduled_review_jobs_keep_memory_writes_agent_owned(self):
+        process_script = SCHEDULED_REVIEW_PROCESS_SCRIPT.read_text(encoding="ascii")
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        normalized_skill = " ".join(skill.split())
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("hermes_scheduled_review_bootstrap process-due", process_script)
+        self.assertIn(".venv-hermes-mcp/bin/python", process_script)
+        self.assertNotIn("hermes ", process_script)
+        self.assertNotIn("API_KEY", process_script)
+        self.assertNotIn("MEMORY.md", process_script)
+
+        self.assertIn("memory-pending --limit 18", skill)
+        self.assertIn("memory tool", normalized_skill)
+        self.assertIn("action=add", skill)
+        self.assertIn("Entry added", skill)
+        self.assertIn("Entry already exists", skill)
+        self.assertIn("confirm-memory", skill)
+        self.assertIn("unavailable_count", skill)
+        self.assertIn("unavailable_review_ids", skill)
+        self.assertIn("Continue with the valid items", skill)
+        self.assertIn("Never edit", skill)
+        self.assertIn("MEMORY.md", skill)
+        self.assertIn("never a real order", normalized_skill)
+
+        self.assertIn("tradingagents-scheduled-review-process", runbook)
+        self.assertIn("tradingagents-scheduled-review-memory", runbook)
+        self.assertIn("tradingagents-scheduled-paper-reviews", runbook)
+        self.assertIn("'15 8 * * *'", runbook)
+        self.assertIn("'30 8 * * *'", runbook)
+        self.assertIn("--no-agent --script tradingagents-scheduled-review-process.sh", runbook)
+        self.assertIn("--skill tradingagents-scheduled-paper-reviews", runbook)
+        self.assertIn("不会自动回填旧报告", runbook)
+        self.assertIn("不得通过脚本直接修改", runbook)
+        self.assertIn("持久保留全部复盘索引项", runbook)
+        self.assertIn("最近 5 条", runbook)
+        self.assertIn("MEMORY.md", runbook)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 import multiprocessing
 import time
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -78,6 +78,46 @@ def _concurrent_learning_upsert(root, review_payload, ready_queue, start_event):
 
 
 class HermesLearningTests(unittest.TestCase):
+    def test_learning_index_retains_backlog_beyond_twenty_reviews(self):
+        trade_date = date(2026, 7, 1)
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            reviews = []
+            for offset in range(25):
+                review_date = trade_date + timedelta(days=offset + 1)
+                review = PaperDecisionReview(
+                    review_id=f"review_{offset:032x}",
+                    session_id=f"hermes_{offset:032x}",
+                    symbol="BTC",
+                    trade_date=trade_date,
+                    review_date=review_date,
+                    horizon_days=offset + 1,
+                    action="BUY",
+                    entry_price=PriceReference(
+                        date=trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    review_price=PriceReference(
+                        date=review_date, usd_price=110.0, source="coinbase"
+                    ),
+                    raw_return_pct=10.0,
+                    verdict="correct",
+                    created_at=utc_now(),
+                    hermes_memory_entry=f"Paper lesson {offset}.",
+                )
+                reviews.append(review)
+                store.upsert(review)
+
+            index = store.load("BTC")
+            graph_lessons = store.lessons_for("BTC")
+
+        self.assertEqual(len(index.entries), 25)
+        self.assertEqual(
+            {entry.review_id for entry in index.entries},
+            {review.review_id for review in reviews},
+        )
+        self.assertEqual(len(graph_lessons), 5)
+        self.assertEqual(graph_lessons[0], reviews[-1].hermes_memory_entry)
+
     def test_concurrent_upserts_retain_each_review(self):
         def review(review_id):
             return PaperDecisionReview(
@@ -165,8 +205,10 @@ class HermesLearningTests(unittest.TestCase):
         self.assertEqual(review.verdict, "correct")
         self.assertEqual(review.raw_return_pct, 10.0)
         self.assertEqual(repeated.review_id, review.review_id)
+        self.assertEqual(review.horizon_days, 1)
         self.assertEqual(calls, [(date(2026, 7, 28), date(2026, 7, 29))])
         self.assertIn("paper-trading", review.hermes_memory_entry.lower())
+        self.assertIn("T+1", review.hermes_memory_entry)
         self.assertNotIn("coingecko", review.hermes_memory_entry.lower())
 
     def test_sell_hold_and_unparseable_actions_have_deterministic_verdicts(self):

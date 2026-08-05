@@ -49,9 +49,15 @@ def verify_review_consistency(
     except (OSError, ValueError, json.JSONDecodeError, ValidationError) as error:
         raise ReviewVerificationError("review consistency check failed") from error
 
-    learning_index_contains_review = learning_index is not None and review_id in {
-        entry.review_id for entry in learning_index.entries
-    }
+    matching_entries = (
+        [entry for entry in learning_index.entries if entry.review_id == review_id]
+        if learning_index is not None
+        else []
+    )
+    learning_index_contains_review = len(matching_entries) == 1 and (
+        matching_entries[0].review_date == review.review_date
+        and matching_entries[0].lesson == review.hermes_memory_entry
+    )
     hermes_memory_occurrences = memory_text.count(review.hermes_memory_entry)
     verification = ReviewVerification(
         review_id=review_id,

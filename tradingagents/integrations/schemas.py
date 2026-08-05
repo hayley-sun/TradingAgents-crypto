@@ -192,6 +192,7 @@ class DailyReportArchive(_StrictModel):
     state: Literal["ready", "degraded"]
     archived_at: datetime
     items: list["DailyReportArchiveItem"] = Field(min_length=1, max_length=5)
+    scheduled_review_version: Literal[1] | None = None
 
 
 class DailyReportArchiveItem(_StrictModel):
@@ -231,6 +232,80 @@ class DailyReportBatch(_StrictModel):
         item_symbols = [item.symbol for item in self.items]
         if item_symbols != self.request.symbols[: len(item_symbols)]:
             raise ValueError("batch items must be an ordered request-symbol prefix")
+        return self
+
+
+class ScheduledReviewItem(_StrictModel):
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    session_id: str | None = None
+    horizon_days: Literal[1, 7, 15]
+    review_date: date
+    review_id: str | None = None
+    state: Literal[
+        "review_pending",
+        "memory_pending",
+        "completed",
+        "skipped",
+        "attention_required",
+    ] = "review_pending"
+    attempt_count: int = Field(default=0, ge=0)
+    last_error_code: str | None = Field(default=None, max_length=100)
+    skip_reason: str | None = Field(default=None, max_length=100)
+    updated_at: datetime
+    verified_at: datetime | None = None
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_optional_session_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
+
+    @field_validator("review_id")
+    @classmethod
+    def validate_optional_review_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_review_id(value):
+            raise ValueError("invalid review id")
+        return value
+
+    @model_validator(mode="after")
+    def require_state_identity(self) -> "ScheduledReviewItem":
+        if self.state == "skipped":
+            if not self.skip_reason:
+                raise ValueError("skipped review requires a reason")
+        elif self.session_id is None or self.review_id is None:
+            raise ValueError("active review requires session and review ids")
+        if self.state == "completed" and self.verified_at is None:
+            raise ValueError("completed review requires verification time")
+        return self
+
+
+class ScheduledReviewPlan(_StrictModel):
+    schema_version: Literal[1] = 1
+    batch_id: str
+    trade_date: date
+    created_at: datetime
+    items: list[ScheduledReviewItem] = Field(max_length=15)
+
+    @field_validator("batch_id")
+    @classmethod
+    def validate_batch_id(cls, value: str) -> str:
+        if not is_valid_report_batch_id(value):
+            raise ValueError("invalid report batch id")
+        return value
+
+    @model_validator(mode="after")
+    def require_unique_items(self) -> "ScheduledReviewPlan":
+        identities = [(item.symbol, item.horizon_days) for item in self.items]
+        if len(identities) != len(set(identities)):
+            raise ValueError("scheduled review items must be unique")
         return self
 
 
@@ -286,6 +361,7 @@ class PaperDecisionReview(_StrictModel):
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     trade_date: date
     review_date: date
+    horizon_days: int | None = Field(default=None, gt=0)
     action: Literal["BUY", "SELL", "HOLD", "UNPARSEABLE"]
     entry_price: PriceReference
     review_price: PriceReference
@@ -340,7 +416,7 @@ class SymbolLearningIndex(_StrictModel):
     schema_version: Literal[1] = 1
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     updated_at: datetime
-    entries: list[SymbolLearningEntry] = Field(max_length=20)
+    entries: list[SymbolLearningEntry]
 
     @field_validator("symbol", mode="before")
     @classmethod

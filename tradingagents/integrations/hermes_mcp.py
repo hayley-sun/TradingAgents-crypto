@@ -40,6 +40,10 @@ from tradingagents.integrations.hermes_reports import (
     ReportBatchStorageError,
     ReportBatchStore,
 )
+from tradingagents.integrations.hermes_scheduled_reviews import (
+    ScheduledReviewStorageError,
+    ScheduledReviewStore,
+)
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
@@ -512,6 +516,7 @@ def archive_daily_report_impl(
     batch_store: ReportBatchStore | None = None,
     session_store: SessionStore | None = None,
     session_loader: Callable[[str], AnalysisSession | None] | None = None,
+    schedule_store: ScheduledReviewStore | None = None,
 ) -> dict[str, Any]:
     try:
         requested_date = _parse_report_trade_date(trade_date)
@@ -524,7 +529,21 @@ def archive_daily_report_impl(
                 "Start a daily report batch for this trade date first.",
             )
         loader = session_loader or (session_store or SessionStore.from_environment()).load
-        archive = active_batch_store.archive(batch, loader, narrative)
+        archive = active_batch_store.archive(
+            batch, loader, narrative, scheduled_review_version=1
+        )
+        persisted_batch = active_batch_store.load(requested_date)
+        if (
+            persisted_batch is not None
+            and persisted_batch.archive is not None
+            and persisted_batch.archive.scheduled_review_version == 1
+        ):
+            active_schedule_store = (
+                schedule_store
+                if schedule_store is not None
+                else ScheduledReviewStore.from_environment()
+            )
+            active_schedule_store.create_or_load(persisted_batch)
     except ReportBatchActive:
         return _report_error(
             "REPORT_BATCH_ACTIVE",
@@ -542,6 +561,12 @@ def archive_daily_report_impl(
             "REPORT_BATCH_UNREADABLE",
             "The daily report batch or archive could not be read or written.",
             "Verify report batch and archive storage, then retry later.",
+        )
+    except ScheduledReviewStorageError:
+        return _report_error(
+            "REVIEW_SCHEDULE_WRITE_FAILED",
+            "The scheduled paper reviews could not be persisted.",
+            "Verify scheduled-review storage and retry the same archive request.",
         )
     except (OSError, ValueError, ValidationError, json.JSONDecodeError):
         return _report_error(
