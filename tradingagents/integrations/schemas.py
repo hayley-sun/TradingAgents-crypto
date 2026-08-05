@@ -623,17 +623,62 @@ class ReportLearningRecord(_StrictModel):
         horizons = [outcome.horizon_days for outcome in self.outcomes]
         if horizons != sorted(horizons) or len(horizons) != len(set(horizons)):
             raise ValueError("outcome horizons must be unique and ordered")
+        if not (
+            self.desired_revision == len(self.outcomes) == len(self.revisions)
+        ):
+            raise ValueError("desired revision, outcomes, and revisions must have equal counts")
         expected_revisions = list(range(1, self.desired_revision + 1))
         revisions = [revision.revision for revision in self.revisions]
         if revisions != expected_revisions:
             raise ValueError("revisions must run from 1 through desired revision")
         outcome_ids = [outcome.review_id for outcome in self.outcomes]
-        for revision in self.revisions:
-            expected_ids = outcome_ids[: len(revision.outcome_review_ids)]
+        for revision_number, revision in enumerate(self.revisions, start=1):
+            expected_ids = outcome_ids[:revision_number]
             if revision.outcome_review_ids != expected_ids:
-                raise ValueError("revision outcomes must be a current outcome prefix")
-        if not 0 <= self.confirmed_revision <= self.reflected_revision <= self.desired_revision:
+                raise ValueError("revision outcomes must match the revision-number prefix")
+        if not (
+            0
+            <= self.confirmed_revision
+            <= self.reflected_revision
+            <= self.desired_revision
+        ):
             raise ValueError("revision state must be ordered")
+
+        unconfirmed_memory_states = {
+            "add_pending",
+            "replace_pending",
+            "memory_call_started",
+            "verification_pending",
+            "attention_required",
+        }
+        for revision in self.revisions:
+            content = (
+                revision.reflection,
+                revision.lesson,
+                revision.hermes_memory_entry,
+            )
+            if revision.revision <= self.reflected_revision:
+                if revision.reflection_state != "ready" or any(
+                    item is None for item in content
+                ):
+                    raise ValueError("reflected revisions require ready reflection content")
+            elif (
+                revision.reflection_state == "ready"
+                or any(item is not None for item in content)
+                or revision.memory_state != "blocked"
+            ):
+                raise ValueError("unreflected revisions must remain blocked without content")
+
+            if revision.revision <= self.confirmed_revision:
+                if revision.memory_state != "confirmed" or revision.verified_at is None:
+                    raise ValueError("confirmed revisions require confirmation verification")
+            elif revision.memory_state == "confirmed" or revision.verified_at is not None:
+                raise ValueError("unconfirmed revisions cannot be confirmed or verified")
+            elif (
+                revision.revision <= self.reflected_revision
+                and revision.memory_state not in unconfirmed_memory_states
+            ):
+                raise ValueError("reflected revisions require an active memory state")
         return self
 
 
@@ -662,7 +707,7 @@ class SymbolLearningIndex(_StrictModel):
     schema_version: Literal[1, 2] = 1
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     updated_at: datetime
-    entries: list[SymbolLearningEntry] = Field(default_factory=list)
+    entries: list[SymbolLearningEntry]
     report_entries: list[ReportLearningIndexEntry] = Field(default_factory=list)
     legacy_entries: list[SymbolLearningEntry] = Field(default_factory=list)
 

@@ -464,6 +464,15 @@ class HermesSchemaTests(unittest.TestCase):
                 created_at=utc_now(),
                 updated_at=utc_now(),
             )
+            pending_revision = ReportLearningRevision(
+                revision=1,
+                outcome_review_ids=[outcome.review_id],
+                reflection_state="pending",
+                memory_state="blocked",
+                source_fields=revision.source_fields,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
             record = ReportLearningRecord(
                 session_id="hermes_0123456789abcdef",
                 symbol="BTC",
@@ -472,7 +481,7 @@ class HermesSchemaTests(unittest.TestCase):
                 source_digest="a" * 64,
                 desired_revision=1,
                 outcomes=[outcome],
-                revisions=[revision],
+                revisions=[pending_revision],
                 created_at=utc_now(),
                 updated_at=utc_now(),
             )
@@ -582,50 +591,180 @@ class HermesSchemaTests(unittest.TestCase):
             ReportReflection(**reflection_values)
 
     def test_report_learning_record_requires_coherent_snapshots(self):
-        outcome_one = ReportLearningOutcome(
-            review_id="review_0123456789abcdef",
-            horizon_days=1,
-            review_date="2026-08-06",
-            raw_return_pct=0.0,
-            verdict="flat",
+        outcomes = [
+            ReportLearningOutcome(
+                review_id="review_0123456789abcdef",
+                horizon_days=1,
+                review_date="2026-08-06",
+                raw_return_pct=0.0,
+                verdict="flat",
+            ),
+            ReportLearningOutcome(
+                review_id="review_abcdef0123456789",
+                horizon_days=7,
+                review_date="2026-08-12",
+                raw_return_pct=-1.0,
+                verdict="incorrect",
+            ),
+            ReportLearningOutcome(
+                review_id="review_1111111111111111",
+                horizon_days=15,
+                review_date="2026-08-20",
+                raw_return_pct=2.0,
+                verdict="correct",
+            ),
+        ]
+        reflection = ReportReflection(
+            decision_thesis="Wait for confirmation.",
+            overall_assessment="The evidence became stronger over time.",
+            outcome_assessments=[
+                {"horizon_days": 1, "assessment": "The first outcome was flat."}
+            ],
+            reasoning_strengths=[],
+            causal_hypotheses=[
+                {
+                    "statement": "Momentum developed gradually.",
+                    "evidence": ["The longer horizon became positive."],
+                    "confidence": "medium",
+                }
+            ],
+            mistakes_or_missed_opportunities=[],
+            next_decision_checks=["Check persistence."],
         )
-        outcome_two = ReportLearningOutcome(
-            review_id="review_abcdef0123456789",
-            horizon_days=7,
-            review_date="2026-08-12",
-            raw_return_pct=-1.0,
-            verdict="incorrect",
-        )
-        revision = ReportLearningRevision(
-            revision=1,
-            outcome_review_ids=[outcome_one.review_id],
-            reflection_state="pending",
-            memory_state="blocked",
-            source_fields=[ReportSourceMetadata(name="report", sha256="d" * 64, truncated=False)],
-            reflection_attempt_count=0,
-            created_at=utc_now(),
-            updated_at=utc_now(),
-        )
+        source_fields = [
+            ReportSourceMetadata(name="report", sha256="d" * 64, truncated=False)
+        ]
+        now = utc_now()
+        revisions = [
+            ReportLearningRevision(
+                revision=1,
+                outcome_review_ids=[outcomes[0].review_id],
+                reflection_state="ready",
+                memory_state="confirmed",
+                source_fields=source_fields,
+                reflection=reflection,
+                lesson="Initial lesson.",
+                hermes_memory_entry="Initial memory.",
+                created_at=now,
+                updated_at=now,
+                verified_at=now,
+            ),
+            ReportLearningRevision(
+                revision=2,
+                outcome_review_ids=[outcome.review_id for outcome in outcomes[:2]],
+                reflection_state="ready",
+                memory_state="verification_pending",
+                source_fields=source_fields,
+                reflection=reflection,
+                lesson="Updated lesson.",
+                hermes_memory_entry="Updated memory.",
+                created_at=now,
+                updated_at=now,
+            ),
+            ReportLearningRevision(
+                revision=3,
+                outcome_review_ids=[outcome.review_id for outcome in outcomes],
+                reflection_state="attention_required",
+                memory_state="blocked",
+                source_fields=source_fields,
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
         values = {
             "session_id": "hermes_0123456789abcdef",
             "symbol": "BTC",
             "trade_date": "2026-08-05",
             "action": "BUY",
             "source_digest": "e" * 64,
-            "desired_revision": 1,
-            "reflected_revision": 1,
-            "confirmed_revision": 0,
-            "outcomes": [outcome_one, outcome_two],
-            "revisions": [revision],
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
+            "desired_revision": 3,
+            "reflected_revision": 2,
+            "confirmed_revision": 1,
+            "outcomes": outcomes,
+            "revisions": revisions,
+            "created_at": now,
+            "updated_at": now,
         }
+        self.assertEqual(ReportLearningRecord(**values).reflected_revision, 2)
+
+        invalid_histories = {
+            "revision one contains two outcomes": [
+                {
+                    **revisions[0].model_dump(),
+                    "outcome_review_ids": [
+                        outcome.review_id for outcome in outcomes[:2]
+                    ],
+                },
+                revisions[1],
+                revisions[2],
+            ],
+            "outcome sets decrease": [
+                revisions[0],
+                revisions[1],
+                {
+                    **revisions[2].model_dump(),
+                    "outcome_review_ids": [outcomes[0].review_id],
+                },
+            ],
+            "reflected revision is pending without content": [
+                revisions[0],
+                {
+                    **revisions[1].model_dump(),
+                    "reflection_state": "pending",
+                    "memory_state": "blocked",
+                    "reflection": None,
+                    "lesson": None,
+                    "hermes_memory_entry": None,
+                },
+                revisions[2],
+            ],
+            "confirmed revision has unconfirmed state": [
+                {
+                    **revisions[0].model_dump(),
+                    "memory_state": "add_pending",
+                    "verified_at": None,
+                },
+                revisions[1],
+                revisions[2],
+            ],
+            "unconfirmed revision is marked confirmed": [
+                revisions[0],
+                {
+                    **revisions[1].model_dump(),
+                    "memory_state": "confirmed",
+                    "verified_at": now,
+                },
+                revisions[2],
+            ],
+            "unreflected revision contains reflection content": [
+                revisions[0],
+                revisions[1],
+                {
+                    **revisions[2].model_dump(),
+                    "reflection_state": "ready",
+                    "reflection": reflection.model_dump(),
+                    "lesson": "Premature lesson.",
+                    "hermes_memory_entry": "Premature memory.",
+                },
+            ],
+        }
+        for scenario, invalid_revisions in invalid_histories.items():
+            with self.subTest(scenario=scenario), self.assertRaises(ValidationError):
+                ReportLearningRecord(**{**values, "revisions": invalid_revisions})
+
         with self.assertRaises(ValidationError):
-            ReportLearningRecord(**{**values, "outcomes": [outcome_two, outcome_one]})
+            ReportLearningRecord(
+                **{
+                    **values,
+                    "desired_revision": 2,
+                    "revisions": revisions[:2],
+                }
+            )
+
         with self.assertRaises(ValidationError):
-            ReportLearningRecord(**{**values, "revisions": []})
-        with self.assertRaises(ValidationError):
-            ReportLearningRecord(**{**values, "confirmed_revision": 2})
+            ReportLearningRecord(
+                **{**values, "outcomes": [outcomes[1], outcomes[0], outcomes[2]]}
+            )
 
     def test_symbol_learning_index_v2_separates_report_and_legacy_entries(self):
         report_entry = ReportLearningIndexEntry(
@@ -651,6 +790,11 @@ class HermesSchemaTests(unittest.TestCase):
             legacy_entries=[legacy_entry],
         )
         self.assertEqual(index.symbol, "BTC")
+        with self.assertRaises(ValidationError):
+            SymbolLearningIndex(symbol="BTC", updated_at=utc_now())
+        self.assertIn(
+            "entries", SymbolLearningIndex.model_json_schema()["required"]
+        )
         legacy_json = SymbolLearningIndex(
             symbol="BTC",
             updated_at=utc_now(),
