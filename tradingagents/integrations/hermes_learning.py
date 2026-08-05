@@ -444,7 +444,7 @@ def review_completed_session(
         [str, date, date], tuple[PriceReference, PriceReference]
     ],
     review_store: ReviewStore,
-    learning_store: LearningStore,
+    learning_store: LearningStore | None,
     current_date: date | None = None,
 ) -> PaperDecisionReview:
     """Create or retrieve one deterministic review for a completed analysis session."""
@@ -462,10 +462,11 @@ def review_completed_session(
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         raise ReviewStorageError("review storage is unavailable") from error
     if existing is not None:
-        try:
-            learning_store.upsert(existing)
-        except (OSError, json.JSONDecodeError, ValidationError) as error:
-            raise LearningStorageError("learning storage is unavailable") from error
+        if learning_store is not None:
+            try:
+                learning_store.upsert(existing)
+            except (OSError, json.JSONDecodeError, ValidationError) as error:
+                raise LearningStorageError("learning storage is unavailable") from error
         return existing
 
     entry_price, observed_price = _paired_price_references(
@@ -508,8 +509,9 @@ def review_completed_session(
         review_store.save(review)
     except OSError as error:
         raise ReviewStorageError("review storage is unavailable") from error
-    try:
-        learning_store.upsert(review)
-    except (OSError, json.JSONDecodeError, ValidationError) as error:
-        raise LearningStorageError("learning storage is unavailable") from error
+    if learning_store is not None:
+        try:
+            learning_store.upsert(review)
+        except (OSError, json.JSONDecodeError, ValidationError) as error:
+            raise LearningStorageError("learning storage is unavailable") from error
     return review

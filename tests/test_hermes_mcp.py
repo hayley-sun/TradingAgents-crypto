@@ -423,9 +423,12 @@ class HermesMcpTests(unittest.TestCase):
                 session_loader=lambda _session_id: session,
             )
             plan = schedule_store.load(date(2026, 7, 29))
+            persisted_batch = batch_store.load(date(2026, 7, 29))
 
         self.assertTrue(result["ok"])
         self.assertIsNotNone(plan)
+        self.assertEqual(plan.workflow_version, 2)
+        self.assertEqual(persisted_batch.archive.scheduled_review_version, 2)
         self.assertEqual([item.horizon_days for item in plan.items], [1, 7, 15])
 
     def test_existing_unmarked_archive_is_not_backfilled(self):
@@ -739,6 +742,41 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(result["data"]["review"]["action"], "SELL")
         self.assertEqual(result["data"]["review"]["verdict"], "correct")
         self.assertIn("Paper-trading research lesson", result["data"]["hermes_memory_entry"])
+
+    def test_review_can_skip_legacy_learning_index(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            store = SessionStore(root / "sessions")
+            session_id = "hermes_0123456789abcdef"
+            session = store.create(session_id, self.make_request(), status="queued")
+            store.save(
+                session.model_copy(
+                    update={
+                        "status": "completed",
+                        "result": AnalysisResult(
+                            reports={},
+                            investment_plan="plan",
+                            trader_investment_plan="trader plan",
+                            final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                            processed_signal="BUY",
+                        ),
+                    }
+                )
+            )
+            learning_store = LearningStore(root / "memories")
+
+            result = review_paper_decision_impl(
+                {"session_id": session_id, "review_date": "2026-07-29"},
+                store=store,
+                review_store=ReviewStore(root / "reviews"),
+                learning_store=learning_store,
+                price_reference_resolver=paired_price_references(),
+                current_date=date(2026, 7, 29),
+                write_legacy_learning=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(learning_store.root.exists())
 
     def test_review_uses_default_same_source_resolver(self):
         with TemporaryDirectory() as temp_dir:

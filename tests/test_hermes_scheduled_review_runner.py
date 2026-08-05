@@ -16,6 +16,42 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
 
 
 class HermesScheduledReviewRunnerTests(unittest.TestCase):
+    def test_default_processor_routes_v2_review_to_report_fact(self):
+        schedule_store = object()
+        review_store = object()
+        report_store = object()
+        session = object()
+        session_store = SimpleNamespace(load=lambda _session_id: session)
+        review = SimpleNamespace(session_id="hermes_0123456789abcdef")
+
+        def process(_store, _date, reviewer, fact_recorder):
+            reviewer(review.session_id, date(2026, 8, 6), 1)
+            reviewer(review.session_id, date(2026, 8, 6), 2)
+            fact_recorder(review)
+            return ScheduledReviewProcessReport(2, 2, 0, 0, report_fact_count=1)
+
+        with patch.object(
+            runner.ScheduledReviewStore, "from_environment", return_value=schedule_store
+        ), patch.object(
+            runner.SessionStore, "from_environment", return_value=session_store
+        ), patch.object(
+            runner.ReviewStore, "from_environment", return_value=review_store
+        ), patch.object(
+            runner.ReportLearningStore, "from_environment", return_value=report_store
+        ), patch.object(
+            runner, "process_due_reviews", side_effect=process
+        ), patch.object(
+            runner, "review_paper_decision_impl", return_value={"ok": True}
+        ) as review_impl, patch.object(
+            runner, "record_review_fact"
+        ) as fact_recorder:
+            _code, payload = runner.run_process_due(date(2026, 8, 7))
+
+        self.assertTrue(review_impl.call_args_list[0].kwargs["write_legacy_learning"])
+        self.assertFalse(review_impl.call_args_list[1].kwargs["write_legacy_learning"])
+        fact_recorder.assert_called_once_with(report_store, session, review)
+        self.assertEqual(payload["report_fact_count"], 1)
+
     def test_run_process_due_returns_safe_counts(self):
         seen = []
 
@@ -35,6 +71,7 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "process-due")
         self.assertEqual(payload["reviewed_count"], 2)
         self.assertEqual(payload["retryable_count"], 1)
+        self.assertEqual(payload["report_fact_count"], 0)
 
     def test_main_redacts_unexpected_failure(self):
         stdout = io.StringIO()

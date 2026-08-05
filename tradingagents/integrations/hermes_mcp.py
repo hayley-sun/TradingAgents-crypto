@@ -530,13 +530,13 @@ def archive_daily_report_impl(
             )
         loader = session_loader or (session_store or SessionStore.from_environment()).load
         archive = active_batch_store.archive(
-            batch, loader, narrative, scheduled_review_version=1
+            batch, loader, narrative, scheduled_review_version=2
         )
         persisted_batch = active_batch_store.load(requested_date)
         if (
             persisted_batch is not None
             and persisted_batch.archive is not None
-            and persisted_batch.archive.scheduled_review_version == 1
+            and persisted_batch.archive.scheduled_review_version in (1, 2)
         ):
             active_schedule_store = (
                 schedule_store
@@ -955,6 +955,8 @@ def review_paper_decision_impl(
     learning_store: LearningStore | None = None,
     price_reference_resolver: Any = None,
     current_date: date | None = None,
+    *,
+    write_legacy_learning: bool = True,
 ) -> dict[str, Any]:
     """Review one completed paper-trading decision without an LLM call."""
     try:
@@ -1013,7 +1015,7 @@ def review_paper_decision_impl(
             learning_store
             if learning_store is not None
             else LearningStore.from_environment()
-        )
+        ) if write_legacy_learning else None
     except _SESSION_STORE_CONSTRUCTION_ERRORS:
         return _review_error(
             "REVIEW_STORE_UNAVAILABLE",

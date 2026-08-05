@@ -101,6 +101,23 @@ def _review_for_index(offset: int, review_date: date) -> PaperDecisionReview:
 
 
 class HermesLearningTests(unittest.TestCase):
+    def test_review_without_learning_store_writes_review_only(self):
+        with TemporaryDirectory() as directory:
+            review_store = ReviewStore(Path(directory) / "reviews")
+            session = completed_session("BUY")
+
+            review = review_completed_session(
+                session,
+                date(2026, 7, 29),
+                paired_price_references(),
+                review_store,
+                None,
+                current_date=date(2026, 7, 29),
+            )
+
+            self.assertEqual(review_store.load(review.review_id), review)
+            self.assertFalse((Path(directory) / "memories").exists())
+
     def test_first_report_upsert_migrates_v1_reviews_without_loss(self):
         from tests.test_hermes_report_learning import report_learning_record
 

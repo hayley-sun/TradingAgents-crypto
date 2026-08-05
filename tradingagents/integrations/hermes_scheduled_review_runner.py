@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.integrations.hermes_learning import ReviewStore
-from tradingagents.integrations.hermes_mcp import PROJECT_ROOT, review_paper_decision_impl
+from tradingagents.integrations.hermes_mcp import (
+    PROJECT_ROOT,
+    SessionStore,
+    review_paper_decision_impl,
+)
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
 from tradingagents.integrations.hermes_scheduled_reviews import (
     MAX_MEMORY_ITEMS,
@@ -38,17 +46,28 @@ def run_process_due(
     """Process due project reviews without invoking a Hermes Agent."""
     if processor is None:
         store = ScheduledReviewStore.from_environment()
+        session_store = SessionStore.from_environment()
+        review_store = ReviewStore.from_environment()
+        report_store = ReportLearningStore.from_environment()
 
         def active_processor(as_of_date: date) -> ScheduledReviewProcessReport:
             return process_due_reviews(
                 store,
                 as_of_date,
-                lambda session_id, review_date: review_paper_decision_impl(
+                lambda session_id, review_date, workflow_version: review_paper_decision_impl(
                     {
                         "session_id": session_id,
                         "review_date": review_date.isoformat(),
                     },
+                    store=session_store,
+                    review_store=review_store,
                     current_date=as_of_date,
+                    write_legacy_learning=(workflow_version == 1),
+                ),
+                fact_recorder=lambda review: record_review_fact(
+                    report_store,
+                    session_store.load(review.session_id),
+                    review,
                 ),
             )
 
@@ -63,6 +82,7 @@ def run_process_due(
         "retryable_count": report.retryable_count,
         "skipped_count": report.skipped_count,
         "attention_required_count": report.attention_required_count,
+        "report_fact_count": getattr(report, "report_fact_count", 0),
     }
 
 

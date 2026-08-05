@@ -48,6 +48,7 @@ class ScheduledReviewProcessReport:
     retryable_count: int
     skipped_count: int
     attention_required_count: int = 0
+    report_fact_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ class ScheduledReviewStore:
                 batch_id=batch.batch_id,
                 trade_date=batch.request.trade_date,
                 created_at=utc_now(),
+                workflow_version=batch.archive.scheduled_review_version or 1,
                 items=items,
             )
             self.save(plan)
@@ -322,7 +324,8 @@ def _successful_review_matches(
 def process_due_reviews(
     store: ScheduledReviewStore,
     current_utc_date: date,
-    reviewer: Callable[[str, date], dict[str, Any]],
+    reviewer: Callable[[str, date, int], dict[str, Any]],
+    fact_recorder: Callable[[PaperDecisionReview], Any] | None = None,
 ) -> ScheduledReviewProcessReport:
     """Process only review dates whose UTC calendar day has fully elapsed."""
     if not isinstance(current_utc_date, date):
@@ -332,10 +335,11 @@ def process_due_reviews(
     retryable_count = 0
     skipped_count = 0
     attention_required_count = 0
+    report_fact_count = 0
     with store.processing_lock():
         due_items = sorted(
             (
-                (plan.trade_date, item)
+                (plan, item)
                 for plan in store.plans()
                 for item in plan.items
                 if item.state == "review_pending"
@@ -343,22 +347,56 @@ def process_due_reviews(
             ),
             key=lambda candidate: (
                 candidate[1].review_date,
-                candidate[0],
+                candidate[0].trade_date,
                 candidate[1].symbol,
                 candidate[1].horizon_days,
             ),
         )
-        for trade_date, item in due_items:
+        for plan, item in due_items:
+            trade_date = plan.trade_date
             due_count += 1
             try:
-                result = reviewer(item.session_id, item.review_date)
+                result = reviewer(
+                    item.session_id, item.review_date, plan.workflow_version
+                )
             except Exception:
+                result = {
+                    "ok": False,
+                    "error": {"code": "SCHEDULED_REVIEW_FAILED"},
+                }
+            if not isinstance(result, dict):
                 result = {
                     "ok": False,
                     "error": {"code": "SCHEDULED_REVIEW_FAILED"},
                 }
             attempts = item.attempt_count + 1
             if _successful_review_matches(result, trade_date, item):
+                if plan.workflow_version == 2:
+                    try:
+                        review = PaperDecisionReview.model_validate(result["data"]["review"])
+                        if fact_recorder is None:
+                            raise RuntimeError("report fact recorder unavailable")
+                        fact_recorder(review)
+                    except Exception:
+                        store.update_item(
+                            item.review_id,
+                            attempt_count=attempts,
+                            last_error_code="REPORT_FACT_WRITE_FAILED",
+                            updated_at=utc_now(),
+                        )
+                        retryable_count += 1
+                        continue
+                    store.update_item(
+                        item.review_id,
+                        state="completed",
+                        attempt_count=attempts,
+                        last_error_code=None,
+                        verified_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                    report_fact_count += 1
+                    reviewed_count += 1
+                    continue
                 store.update_item(
                     item.review_id,
                     state="memory_pending",
@@ -405,6 +443,7 @@ def process_due_reviews(
         retryable_count=retryable_count,
         skipped_count=skipped_count,
         attention_required_count=attention_required_count,
+        report_fact_count=report_fact_count,
     )
 
 
