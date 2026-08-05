@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import chromadb
 from chromadb.config import Settings
+import tradingagents.integrations.hermes_mcp as hermes_mcp
 
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
@@ -95,12 +96,48 @@ class HermesMcpTests(unittest.TestCase):
     def test_submit_report_reflection_tool_rejects_unknown_fields(self):
         tool = MCP._tool_manager.get_tool("submit_report_reflection")
         self.assertIs(tool.parameters["additionalProperties"], False)
+        self.assertIs(
+            tool.parameters["properties"]["reflection"]["additionalProperties"],
+            False,
+        )
         _, result = asyncio.run(MCP.call_tool(
             "submit_report_reflection",
             {"session_id":"hermes_0123456789abcdef","expected_revision":1,"reflection":self.valid_reflection_payload(),"unexpected":True},
         ))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_submit_report_reflection_tool_rejects_nested_unknown_fields(self):
+        reflection = self.valid_reflection_payload()
+        reflection["unexpected_nested"] = True
+        _, result = asyncio.run(MCP.call_tool(
+            "submit_report_reflection",
+            {
+                "session_id": "hermes_0123456789abcdef",
+                "expected_revision": 1,
+                "reflection": reflection,
+            },
+        ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_submit_report_reflection_tool_rejects_non_strict_revisions_before_storage(self):
+        for revision in (True, 1.0, "1"):
+            with self.subTest(revision=revision), patch.object(
+                hermes_mcp,
+                "SessionStore",
+                side_effect=AssertionError("store accessed"),
+            ):
+                _, result = asyncio.run(MCP.call_tool(
+                    "submit_report_reflection",
+                    {
+                        "session_id": "hermes_0123456789abcdef",
+                        "expected_revision": revision,
+                        "reflection": self.valid_reflection_payload(),
+                    },
+                ))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
     def make_request(self):
         return AnalysisRequest(
             symbol="BTCUSDT",

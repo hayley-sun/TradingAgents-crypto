@@ -58,6 +58,7 @@ from tradingagents.integrations.schemas import (
     DailyReportRequest,
     PriceReference,
     ReviewRequest,
+    ReportReflection,
     ToolError,
     is_valid_session_id,
     utc_now,
@@ -1113,6 +1114,15 @@ def submit_report_reflection_impl(
         )
 
     try:
+        ReportReflection.model_validate(reflection_data)
+    except (TypeError, ValueError, ValidationError):
+        return _report_error(
+            "INVALID_REPORT_REFLECTION",
+            "The report reflection request is invalid.",
+            "Correct the reflection fields and try again.",
+        )
+
+    try:
         active_session_store = session_store or SessionStore.from_environment()
     except _SESSION_STORE_CONSTRUCTION_ERRORS:
         return _report_error(
@@ -1347,7 +1357,7 @@ class _SubmitReportReflectionArguments(ArgModelBase):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     session_id: str
-    expected_revision: int
+    expected_revision: Any
     reflection: dict[str, Any]
 
     def model_dump_one_level(self) -> dict[str, Any]:
@@ -1421,6 +1431,8 @@ def _configure_submit_report_reflection_tool() -> None:
 
     tool.fn_metadata.arg_model = _SubmitReportReflectionArguments
     tool.parameters = _SubmitReportReflectionArguments.model_json_schema()
+    tool.parameters["properties"]["reflection"] = ReportReflection.model_json_schema()
+    tool.parameters["properties"]["expected_revision"] = {"type": "integer"}
     tool.parameters["additionalProperties"] = False
 
 
