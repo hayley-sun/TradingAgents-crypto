@@ -192,7 +192,7 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertEqual(second_mtime, first_mtime)
 
     def test_stale_report_revision_does_not_downgrade_or_rewrite_index(self):
-        revision_one = report_learning_record(session_number=110, horizons=(7,))
+        revision_one = report_learning_record(session_number=110)
         revision_two = report_learning_record(
             session_number=110, horizons=(1, 7)
         )
@@ -209,6 +209,29 @@ class HermesReportLearningTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), current_bytes)
             self.assertEqual(path.stat().st_mtime_ns, current_mtime)
             self.assertEqual(store.load("BTC").report_entries[0].reflected_revision, 2)
+
+    def test_stale_report_revision_with_changed_trade_date_conflicts(self):
+        current = report_learning_record(
+            session_number=115, horizons=(1, 7)
+        )
+        changed_date = report_learning_record(
+            session_number=115, trade_date=date(2026, 7, 2)
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            original_index = store.upsert_report(current)
+            path = store.path_for("BTC")
+            original_bytes = path.read_bytes()
+            original_mtime = path.stat().st_mtime_ns
+
+            with self.assertRaisesRegex(
+                LearningStorageError, "^report learning index conflicts$"
+            ):
+                store.upsert_report(changed_date)
+
+            self.assertEqual(store.load("BTC"), original_index)
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertEqual(path.stat().st_mtime_ns, original_mtime)
 
     def test_equal_report_revision_with_changed_identity_or_content_conflicts(self):
         current = report_learning_record(session_number=120)
@@ -292,7 +315,7 @@ class HermesReportLearningTests(unittest.TestCase):
         )
 
     def test_concurrent_report_revisions_finish_at_highest_revision(self):
-        revision_one = report_learning_record(session_number=130, horizons=(7,))
+        revision_one = report_learning_record(session_number=130)
         revision_two = report_learning_record(
             session_number=130, horizons=(1, 7)
         )

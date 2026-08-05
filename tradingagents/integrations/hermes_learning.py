@@ -235,15 +235,16 @@ class LearningStore:
                 else None
             )
             if existing_entry is not None:
-                if (
-                    entry.trade_date != existing_entry.trade_date
-                    or entry.maturity_days < existing_entry.maturity_days
-                ):
+                if entry.trade_date != existing_entry.trade_date:
                     raise LearningStorageError(
                         "report learning index conflicts"
                     )
                 if entry.reflected_revision < existing_entry.reflected_revision:
                     return current
+                if entry.maturity_days < existing_entry.maturity_days:
+                    raise LearningStorageError(
+                        "report learning index conflicts"
+                    )
                 if entry.reflected_revision == existing_entry.reflected_revision:
                     existing_content = (
                         existing_entry.trade_date,
