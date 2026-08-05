@@ -688,6 +688,47 @@ class HermesReportLearningTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ReportEvidencePacket.model_validate(invalid)
 
+    def test_evidence_packet_rejects_outcome_name_and_revision_coherence_tampering(self):
+        session = completed_session()
+        record = record_with_pending_revision(session, horizons=(1, 7))
+        packet = hermes_report_learning.build_evidence_packet(record, session, 2)
+        packet_data = packet.model_dump(mode="json")
+
+        renamed = {
+            **packet_data,
+            "fields": [
+                (
+                    {**field, "name": "outcome.t15"}
+                    if field["name"] == "outcome.t1"
+                    else field
+                )
+                for field in packet_data["fields"]
+            ],
+        }
+        mismatched_revision = {
+            **packet_data,
+            "revision": 1,
+            "outcome_review_ids": [
+                *packet_data["outcome_review_ids"],
+                "review_0000000000000000000000000000000f",
+            ],
+            "fields": [
+                *packet_data["fields"],
+                {
+                    **next(
+                        field
+                        for field in packet_data["fields"]
+                        if field["name"] == "outcome.t7"
+                    ),
+                    "name": "outcome.t15",
+                },
+            ],
+        }
+        for invalid in (renamed, mismatched_revision):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    ReportEvidencePacket.model_validate(invalid)
+
     def test_maximal_chinese_rendering_is_bounded_in_chars_and_utf8_bytes(self):
         record = ready_record()
         reflection = ReportReflection(

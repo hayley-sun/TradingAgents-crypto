@@ -298,6 +298,7 @@ def _packet_from_parts(
             revision=revision,
             source_digest=source_digest,
             outcome_review_ids=[outcome.review_id for outcome in outcomes],
+            outcome_horizons=[outcome.horizon_days for outcome in outcomes],
             fields=[
                 *source_fields,
                 *[_outcome_evidence_field(outcome) for outcome in outcomes],

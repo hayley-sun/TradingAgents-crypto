@@ -484,6 +484,7 @@ class ReportEvidencePacket(_StrictModel):
     revision: int = Field(ge=1, le=3)
     source_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     outcome_review_ids: list[str] = Field(min_length=1, max_length=3)
+    outcome_horizons: list[Literal[1, 7, 15]] = Field(min_length=1, max_length=3)
     fields: list[ReportEvidenceField] = Field(min_length=9, max_length=11)
 
     @field_validator("session_id")
@@ -500,6 +501,13 @@ class ReportEvidencePacket(_StrictModel):
             raise ValueError("invalid review id")
         if len(value) != len(set(value)):
             raise ValueError("outcome review ids must be unique")
+        return value
+
+    @field_validator("outcome_horizons")
+    @classmethod
+    def validate_outcome_horizons(cls, value: list[int]) -> list[int]:
+        if value != sorted(value) or len(value) != len(set(value)):
+            raise ValueError("evidence packet outcome horizons must be ordered")
         return value
 
     @field_validator("fields")
@@ -531,9 +539,20 @@ class ReportEvidencePacket(_StrictModel):
     @model_validator(mode="after")
     def require_outcome_field_coherence(self) -> "ReportEvidencePacket":
         names = {field.name for field in self.fields}
-        outcome_names = {name for name in names if name.startswith("outcome.t")}
-        if len(outcome_names) != len(self.outcome_review_ids):
-            raise ValueError("evidence packet outcomes must match review ids")
+        if not (
+            len(self.outcome_horizons)
+            == len(self.outcome_review_ids)
+            == self.revision
+        ):
+            raise ValueError("evidence packet revision outcomes must be coherent")
+        expected_outcome_names = {
+            f"outcome.t{horizon}" for horizon in self.outcome_horizons
+        }
+        actual_outcome_names = {
+            name for name in names if name.startswith("outcome.t")
+        }
+        if actual_outcome_names != expected_outcome_names:
+            raise ValueError("evidence packet outcome fields must match horizons")
         return self
 
 
