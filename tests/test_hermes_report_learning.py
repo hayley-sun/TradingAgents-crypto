@@ -192,7 +192,7 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertEqual(second_mtime, first_mtime)
 
     def test_stale_report_revision_does_not_downgrade_or_rewrite_index(self):
-        revision_one = report_learning_record(session_number=110)
+        revision_one = report_learning_record(session_number=110, horizons=(7,))
         revision_two = report_learning_record(
             session_number=110, horizons=(1, 7)
         )
@@ -231,8 +231,68 @@ class HermesReportLearningTests(unittest.TestCase):
                     store.upsert_report(conflict)
                 self.assertEqual(path.read_bytes(), current_bytes)
 
+    def test_higher_report_revision_with_changed_trade_date_conflicts(self):
+        current = report_learning_record(session_number=125)
+        changed_date = report_learning_record(
+            session_number=125,
+            trade_date=date(2026, 7, 2),
+            horizons=(1, 7),
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            original_index = store.upsert_report(current)
+            path = store.path_for("BTC")
+            original_bytes = path.read_bytes()
+
+            with self.assertRaisesRegex(
+                LearningStorageError, "^report learning index conflicts$"
+            ):
+                store.upsert_report(changed_date)
+
+            self.assertEqual(store.load("BTC"), original_index)
+            self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_higher_report_revision_with_decreased_maturity_conflicts(self):
+        current = report_learning_record(session_number=126, horizons=(15,))
+        decreased_maturity = report_learning_record(
+            session_number=126, horizons=(1, 7)
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            original_index = store.upsert_report(current)
+            path = store.path_for("BTC")
+            original_bytes = path.read_bytes()
+
+            with self.assertRaisesRegex(
+                LearningStorageError, "^report learning index conflicts$"
+            ):
+                store.upsert_report(decreased_maturity)
+
+            self.assertEqual(store.load("BTC"), original_index)
+            self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_higher_report_revision_with_increased_maturity_updates(self):
+        current = report_learning_record(session_number=127)
+        increased_maturity = report_learning_record(
+            session_number=127, horizons=(1, 7)
+        )
+        with TemporaryDirectory() as directory:
+            store = LearningStore(Path(directory))
+            store.upsert_report(current)
+
+            updated = store.upsert_report(increased_maturity)
+
+        self.assertEqual(len(updated.report_entries), 1)
+        self.assertEqual(updated.report_entries[0].trade_date, current.trade_date)
+        self.assertEqual(updated.report_entries[0].reflected_revision, 2)
+        self.assertEqual(updated.report_entries[0].maturity_days, 7)
+        self.assertEqual(
+            updated.report_entries[0].lesson,
+            increased_maturity.revisions[-1].lesson,
+        )
+
     def test_concurrent_report_revisions_finish_at_highest_revision(self):
-        revision_one = report_learning_record(session_number=130)
+        revision_one = report_learning_record(session_number=130, horizons=(7,))
         revision_two = report_learning_record(
             session_number=130, horizons=(1, 7)
         )
