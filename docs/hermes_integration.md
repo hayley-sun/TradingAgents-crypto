@@ -329,6 +329,72 @@ hermes cron list --all
 
 日常观测使用 `hermes cron status`、`hermes cron list --all` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
 
+## T+1/T+7/T+15 自动复盘与长期记忆
+
+新版本归档的每个 BTC、ETH、SOL completed session 会注册 T+1、T+7、T+15 三个复盘项，计划保存在 `results/hermes/review_schedules/<trade_date>.json`。T+N 表示精确 UTC 复盘价格日期；只有该 UTC 日期完整结束，即 `review_date` 严格早于当前 UTC 日期后才会执行。旧归档没有复盘版本标记，因此上线后不会自动回填旧报告。
+
+自动化分成两个持久化阶段。08:15 无 agent processor 只调用项目确定性复盘代码，写入 `results/hermes/reviews` 并更新 `results/hermes/memories/<SYMBOL>.json`，绝不读取或写入 Hermes 长期 memory。08:30 Hermes Agent job 只加载专用 skill，通过内置 memory tool 写入精确的 `hermes_memory_entry`，随后运行项目一致性确认。任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
+
+安装 owner-only wrapper 和 skill：
+
+```bash
+cd /home/ubuntu/workspace/TradingAgents-crypto
+install -d -m 700 /home/ubuntu/.hermes/scripts
+install -m 700 deploy/hermes/scripts/tradingagents-scheduled-review-process.sh /home/ubuntu/.hermes/scripts/tradingagents-scheduled-review-process.sh
+install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-scheduled-paper-reviews
+install -m 600 deploy/hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.md /home/ubuntu/.hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.md
+hermes memory status
+```
+
+预期 memory tool 和 memory injection 均为 enabled。processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载 `TRADINGAGENTS_RESULTS_DIR`、CoinGecko 与 CryptoCompare 白名单值，不加载 DeepSeek key、不创建 `.env` 或第二份密钥文件。
+
+创建两个 local job 后立即暂停，完成人工验收前不得让它们按计划执行：
+
+```bash
+PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
+MEMORY_PROMPT='Run the tradingagents-scheduled-paper-reviews skill once. Process the returned pending items independently and never edit memory files directly.'
+
+hermes cron create --name tradingagents-scheduled-review-process --deliver local --no-agent --script tradingagents-scheduled-review-process.sh --workdir "$PROJECT_DIR" '15 8 * * *'
+hermes cron create --name tradingagents-scheduled-review-memory --deliver local --skill tradingagents-scheduled-paper-reviews --workdir "$PROJECT_DIR" '30 8 * * *' "$MEMORY_PROMPT"
+hermes cron list --all
+
+scheduled_review_process_job_id='<replace-with-process-job-id>'
+scheduled_review_memory_job_id='<replace-with-memory-job-id>'
+hermes cron pause "$scheduled_review_process_job_id"
+hermes cron pause "$scheduled_review_memory_job_id"
+hermes cron list --all
+```
+
+人工验收必须使用部署后新创建且已归档的测试日期。先确认 `review_schedules` 有 9 项，再用已完整结束 T+1 UTC 日期的次日作为显式当前日期运行 processor；不得为了测试修改计划 JSON：
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+1-next-UTC-date>
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/review_schedules -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
+find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/reviews -maxdepth 1 -type f -name 'review_*.json' -printf '%m %f\n'
+```
+
+预期仅 T+1 的三个 completed session 进入 `memory_pending`，T+7/T+15 保持 `review_pending`。临时恢复并手动运行 memory job，等待 durable execution 终态后立即暂停：
+
+```bash
+hermes cron resume "$scheduled_review_memory_job_id"
+hermes cron run "$scheduled_review_memory_job_id" --accept-hooks
+hermes cron pause "$scheduled_review_memory_job_id"
+hermes cron runs "$scheduled_review_memory_job_id" --limit 1
+```
+
+成功项必须为 `completed` 且 verifier 确认 review、币种 learning index 和 Hermes memory 中精确条目只出现一次。`PRICE_DATA_UNAVAILABLE` 等安全错误保持 `review_pending` 并在次日重试；memory 或三处一致性异常进入 `attention_required`，不得自动重试或用 shell 修复。经批准的 memory 修复只能使用 Hermes memory tool 的目标 `replace` 或 `remove` 操作。
+
+验收全部通过后恢复两个 job：
+
+```bash
+hermes cron resume "$scheduled_review_process_job_id"
+hermes cron resume "$scheduled_review_memory_job_id"
+hermes cron status
+```
+
+撤销调度时先暂停两个 job，确认不再产生新 run 后再移除；保留 schedules、reviews、learning indexes、reports 和 Hermes memory 供审计，不得删除目录作为回滚方式。该流程只评价模拟交易方向，不连接交易所、不真实下单、不向外部渠道发送内容。
+
 ## 会话存储和故障处理
 
 所有分析会话均以 schema 版本 1 的 JSON 文件持久化到 `/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/sessions`。后台 worker 的标准输出和错误输出保存到同级的 `results/hermes/logs`，其中 `.log` 文件由 `tradingagents-hermes-maintenance.timer` 按 14 天保留期清理。确定性复盘记录保存在 `results/hermes/reviews`，每个币种最近 20 条学习项保存在 `results/hermes/memories/<SYMBOL>.json`；后续同币种分析最多加载最近 5 条。会话、复盘、学习索引和 Hermes 长期 memory 永不由维护任务删除。
