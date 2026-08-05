@@ -1,6 +1,5 @@
 import hashlib
 import multiprocessing
-import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -13,6 +12,7 @@ from tradingagents.integrations.hermes_learning import (
 )
 from tradingagents.integrations.hermes_report_learning import (
     ReportLearningConflict,
+    ReportLearningError,
     ReportLearningStore,
     record_review_fact,
 )
@@ -101,7 +101,12 @@ def paper_review(horizon_days: int) -> PaperDecisionReview:
 
 
 def _concurrent_report_fact(
-    root, session_payload, review_payload, write_started, allow_write
+    root,
+    session_payload,
+    review_payload,
+    write_started,
+    allow_write,
+    record_call_started,
 ):
     from tradingagents.integrations import hermes_report_learning as report_module
 
@@ -110,10 +115,10 @@ def _concurrent_report_fact(
     def delayed_write(destination, value):
         write_started.put(True)
         allow_write.wait(timeout=5)
-        time.sleep(0.1)
         original_write(destination, value)
 
     report_module._atomic_json_write = delayed_write
+    record_call_started.put(True)
     report_module.record_review_fact(
         report_module.ReportLearningStore(Path(root)),
         AnalysisSession.model_validate(session_payload),
@@ -264,6 +269,25 @@ def _controlled_legacy_upsert(root, review_payload, write_started, allow_write):
 
 
 class HermesReportLearningTests(unittest.TestCase):
+    def test_report_store_records_maps_invalid_filename_to_storage_error(self):
+        invalid_filename = "hermes_not-a-valid-id.json"
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            invalid_path = store.root / invalid_filename
+            invalid_path.write_text("{}", encoding="ascii")
+
+            try:
+                store.records()
+            except ReportLearningError as error:
+                self.assertEqual(
+                    str(error), "report learning records unavailable"
+                )
+                self.assertNotIn(invalid_filename, str(error))
+            except Exception as error:
+                self.fail(f"records raised {type(error).__name__}")
+            else:
+                self.fail("records accepted an invalid report filename")
+
     def test_report_store_sorts_reverse_arrival_and_rebuilds_pending_snapshots(self):
         with TemporaryDirectory() as directory:
             store = ReportLearningStore(Path(directory))
@@ -457,6 +481,115 @@ class HermesReportLearningTests(unittest.TestCase):
                         self.fail(f"same-ID {changed_field} was accepted")
                     self.assertEqual(path.read_bytes(), original_bytes)
 
+    def test_report_store_validates_price_dates_on_exact_review_replay(self):
+        original_review = paper_review(1)
+        malformed_reviews = {
+            "entry_price_date": original_review.model_copy(
+                update={
+                    "entry_price": original_review.entry_price.model_copy(
+                        update={"date": original_review.review_date}
+                    )
+                }
+            ),
+            "review_price_date": original_review.model_copy(
+                update={
+                    "review_price": original_review.review_price.model_copy(
+                        update={"date": original_review.trade_date}
+                    )
+                }
+            ),
+        }
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            record_review_fact(store, session, original_review)
+            path = store.path_for(session.session_id)
+            original_bytes = path.read_bytes()
+
+            for malformed_field, malformed_review in malformed_reviews.items():
+                with self.subTest(malformed_field=malformed_field):
+                    with self.assertRaises(ValueError):
+                        record_review_fact(store, session, malformed_review)
+                    self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_report_store_rejects_tampered_persisted_source_metadata(self):
+        for tamper_kind in ("sha256", "name", "missing"):
+            for incoming_horizon in (1, 7):
+                with self.subTest(
+                    tamper_kind=tamper_kind,
+                    incoming_horizon=incoming_horizon,
+                ), TemporaryDirectory() as directory:
+                    store = ReportLearningStore(Path(directory))
+                    session = completed_session()
+                    original = record_review_fact(store, session, paper_review(1))
+                    source_fields = [
+                        field.model_copy(deep=True)
+                        for field in original.revisions[0].source_fields
+                    ]
+                    if tamper_kind == "sha256":
+                        source_fields[0] = source_fields[0].model_copy(
+                            update={"sha256": "0" * 64}
+                        )
+                    elif tamper_kind == "name":
+                        source_fields[0] = source_fields[0].model_copy(
+                            update={"name": "unexpected_report"}
+                        )
+                    else:
+                        source_fields.pop()
+                    tampered_revision = original.revisions[0].model_copy(
+                        update={"source_fields": source_fields}
+                    )
+                    tampered = ReportLearningRecord.model_validate(
+                        {
+                            **original.model_dump(),
+                            "revisions": [tampered_revision],
+                        }
+                    )
+                    store.save(tampered)
+                    path = store.path_for(session.session_id)
+                    tampered_bytes = path.read_bytes()
+
+                    with self.assertRaises(ReportLearningConflict):
+                        record_review_fact(
+                            store,
+                            session,
+                            paper_review(incoming_horizon),
+                        )
+
+                    self.assertEqual(path.read_bytes(), tampered_bytes)
+
+    def test_report_store_allows_packet_specific_truncation_metadata(self):
+        with TemporaryDirectory() as directory:
+            store = ReportLearningStore(Path(directory))
+            session = completed_session()
+            original = record_review_fact(store, session, paper_review(1))
+            source_fields = [
+                field.model_copy(deep=True)
+                for field in original.revisions[0].source_fields
+            ]
+            source_fields[0] = source_fields[0].model_copy(
+                update={"truncated": True}
+            )
+            truncated_revision = original.revisions[0].model_copy(
+                update={"source_fields": source_fields}
+            )
+            truncated = ReportLearningRecord.model_validate(
+                {
+                    **original.model_dump(),
+                    "revisions": [truncated_revision],
+                }
+            )
+            store.save(truncated)
+            path = store.path_for(session.session_id)
+            truncated_bytes = path.read_bytes()
+
+            repeated = record_review_fact(store, session, paper_review(1))
+
+            repeated_bytes = path.read_bytes()
+
+        self.assertEqual(repeated, truncated)
+        self.assertEqual(repeated_bytes, truncated_bytes)
+
     def test_concurrent_report_facts_retain_outcomes_and_order_revisions(self):
         context = multiprocessing.get_context("fork")
         session = completed_session()
@@ -466,6 +599,7 @@ class HermesReportLearningTests(unittest.TestCase):
             ), TemporaryDirectory() as directory:
                 write_started = context.Queue()
                 allow_write = context.Event()
+                record_call_started = context.Queue()
                 processes = [
                     context.Process(
                         target=_concurrent_report_fact,
@@ -475,13 +609,16 @@ class HermesReportLearningTests(unittest.TestCase):
                             paper_review(horizon).model_dump(mode="json"),
                             write_started,
                             allow_write,
+                            record_call_started,
                         ),
                     )
                     for horizon in arrival_order
                 ]
                 processes[0].start()
+                record_call_started.get(timeout=5)
                 write_started.get(timeout=5)
                 processes[1].start()
+                record_call_started.get(timeout=5)
                 allow_write.set()
                 for process in processes:
                     process.join(timeout=5)

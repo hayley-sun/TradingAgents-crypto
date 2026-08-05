@@ -113,7 +113,7 @@ class ReportLearningStore:
                 for session_id in session_ids
                 if (record := self.load(session_id)) is not None
             ]
-        except OSError as error:
+        except (OSError, ValueError, ReportLearningError) as error:
             raise ReportLearningError("report learning records unavailable") from error
 
     def _save_unlocked(self, record: ReportLearningRecord) -> None:
@@ -199,6 +199,12 @@ def _source_digest(source_values: dict[str, str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _source_field_identity(
+    source_fields: list[ReportSourceMetadata],
+) -> tuple[tuple[str, str], ...]:
+    return tuple((field.name, field.sha256) for field in source_fields)
+
+
 def _validate_review_identity(
     session: AnalysisSession, review: PaperDecisionReview
 ) -> None:
@@ -282,6 +288,15 @@ def record_review_fact(
                 raise ReportLearningConflict("report learning identity changed")
             if current.source_digest != source_digest:
                 raise ReportLearningConflict("report learning source changed")
+            expected_source_identity = _source_field_identity(source_fields)
+            if any(
+                _source_field_identity(revision.source_fields)
+                != expected_source_identity
+                for revision in current.revisions
+            ):
+                raise ReportLearningConflict(
+                    "report learning source metadata changed"
+                )
             existing_outcome = next(
                 (
                     item
@@ -295,6 +310,7 @@ def record_review_fact(
                     raise ReportLearningConflict(
                         "report learning review outcome changed"
                     )
+                _validate_review_dates(review)
                 return current
             if len(current.outcomes) >= MAX_REPORT_REVISIONS:
                 raise ReportLearningConflict("report learning outcome limit reached")
