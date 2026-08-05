@@ -192,6 +192,7 @@ class DailyReportArchive(_StrictModel):
     state: Literal["ready", "degraded"]
     archived_at: datetime
     items: list["DailyReportArchiveItem"] = Field(min_length=1, max_length=5)
+    scheduled_review_version: Literal[1] | None = None
 
 
 class DailyReportArchiveItem(_StrictModel):

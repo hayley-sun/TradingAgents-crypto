@@ -20,6 +20,7 @@ from tradingagents.integrations.schemas import (
 
 
 HORIZON_DAYS = (1, 7, 15)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class ScheduledReviewStorageError(RuntimeError):
@@ -54,6 +55,12 @@ class ScheduledReviewStore:
 
     def __init__(self, root: Path):
         self.root = Path(root).expanduser().resolve()
+
+    @classmethod
+    def from_environment(cls) -> "ScheduledReviewStore":
+        configured = os.getenv("TRADINGAGENTS_RESULTS_DIR")
+        results_root = Path(configured) if configured else PROJECT_ROOT / "results"
+        return cls(results_root / "hermes" / "review_schedules")
 
     def path_for(self, trade_date: date) -> Path:
         if not isinstance(trade_date, date):

@@ -344,6 +344,7 @@ class ReportBatchStore:
         batch: DailyReportBatch,
         session_loader: Callable[[str], AnalysisSession | None],
         narrative: str,
+        scheduled_review_version: int | None = None,
     ) -> ReportArchiveResult:
         if not isinstance(narrative, str) or not narrative.strip() or len(narrative) > 20000:
             raise ValueError("invalid report narrative")
@@ -389,6 +390,7 @@ class ReportBatchStore:
                 state=summary.state,
                 archived_at=archived_at,
                 items=_archive_items(summary),
+                scheduled_review_version=scheduled_review_version,
             )
             self.save(persisted.model_copy(update={"archive": archive}))
             return ReportArchiveResult(path=destination, sha256=digest, state=summary.state)
