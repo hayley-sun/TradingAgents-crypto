@@ -5,8 +5,12 @@ from tempfile import TemporaryDirectory
 
 from pydantic import ValidationError
 
+from tradingagents.integrations.hermes_learning import ReviewStore
 from tradingagents.integrations.hermes_scheduled_reviews import (
+    ScheduledReviewConfirmationError,
     ScheduledReviewStore,
+    confirm_scheduled_memory,
+    list_pending_memory,
     process_due_reviews,
 )
 from tradingagents.integrations.schemas import (
@@ -15,6 +19,8 @@ from tradingagents.integrations.schemas import (
     DailyReportBatch,
     DailyReportBatchItem,
     DailyReportRequest,
+    PaperDecisionReview,
+    PriceReference,
     ScheduledReviewItem,
     utc_now,
 )
@@ -180,6 +186,85 @@ class HermesScheduledReviewTests(unittest.TestCase):
         self.assertEqual(item.state, "review_pending")
         self.assertEqual(item.attempt_count, 1)
         self.assertEqual(item.last_error_code, "PRICE_DATA_UNAVAILABLE")
+
+    def test_pending_memory_is_canonical_and_bounded(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ScheduledReviewStore(root / "review_schedules")
+            review_store = ReviewStore(root / "reviews")
+            plan = store.create_or_load(archived_batch())
+            item = plan.items[0]
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(
+                    date=plan.trade_date, usd_price=100.0, source="coinbase"
+                ),
+                review_price=PriceReference(
+                    date=item.review_date, usd_price=110.0, source="coinbase"
+                ),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="Exact scheduled BTC T+1 lesson.",
+            )
+            review_store.save(review)
+            store.update_item(
+                item.review_id, state="memory_pending", updated_at=utc_now()
+            )
+
+            work = list_pending_memory(store, review_store.load, limit=1)
+
+        self.assertEqual(len(work), 1)
+        self.assertEqual(work[0].review_id, item.review_id)
+        self.assertEqual(
+            work[0].hermes_memory_entry, "Exact scheduled BTC T+1 lesson."
+        )
+
+    def test_confirmation_completes_only_after_successful_verification(self):
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch())
+            item = plan.items[0]
+            store.update_item(
+                item.review_id, state="memory_pending", updated_at=utc_now()
+            )
+
+            confirmed = confirm_scheduled_memory(
+                store, item.review_id, lambda review_id: review_id == item.review_id
+            )
+
+        self.assertEqual(confirmed.state, "completed")
+        self.assertIsNotNone(confirmed.verified_at)
+
+    def test_failed_confirmation_requires_attention(self):
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch())
+            item = plan.items[0]
+            store.update_item(
+                item.review_id, state="memory_pending", updated_at=utc_now()
+            )
+
+            with self.assertRaises(ScheduledReviewConfirmationError):
+                confirm_scheduled_memory(
+                    store,
+                    item.review_id,
+                    lambda _review_id: (_ for _ in ()).throw(
+                        RuntimeError("memory mismatch details")
+                    ),
+                )
+            quarantined = store.load(date(2026, 8, 5)).items[0]
+
+        self.assertEqual(quarantined.state, "attention_required")
+        self.assertEqual(
+            quarantined.last_error_code, "REVIEW_CONSISTENCY_FAILED"
+        )
 
 
 if __name__ == "__main__":

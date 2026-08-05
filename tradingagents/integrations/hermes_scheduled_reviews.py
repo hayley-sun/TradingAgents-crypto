@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from tradingagents.integrations.hermes_learning import make_review_id
 from tradingagents.integrations.schemas import (
     DailyReportBatch,
+    PaperDecisionReview,
     ScheduledReviewItem,
     ScheduledReviewPlan,
     utc_now,
@@ -31,12 +32,26 @@ class ScheduledReviewStorageError(RuntimeError):
     """Raised when a scheduled-review plan cannot be persisted safely."""
 
 
+class ScheduledReviewConfirmationError(RuntimeError):
+    """Raised when scheduled review persistence is not consistent with memory."""
+
+
 @dataclass(frozen=True)
 class ScheduledReviewProcessReport:
     due_count: int
     reviewed_count: int
     retryable_count: int
     skipped_count: int
+
+
+@dataclass(frozen=True)
+class ScheduledMemoryWork:
+    trade_date: date
+    review_date: date
+    symbol: str
+    horizon_days: int
+    review_id: str
+    hermes_memory_entry: str
 
 
 def _atomic_json_write(destination: Path, value: dict) -> None:
@@ -222,6 +237,13 @@ class ScheduledReviewStore:
                     return updated_item
         raise ScheduledReviewStorageError("scheduled review item unavailable")
 
+    def find_item(self, review_id: str) -> tuple[ScheduledReviewPlan, ScheduledReviewItem]:
+        for plan in self.plans():
+            for item in plan.items:
+                if item.review_id == review_id:
+                    return plan, item
+        raise ScheduledReviewStorageError("scheduled review item unavailable")
+
 
 _SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
 _SKIPPED_REVIEW_ERRORS = {
@@ -320,4 +342,94 @@ def process_due_reviews(
         reviewed_count=reviewed_count,
         retryable_count=retryable_count,
         skipped_count=skipped_count,
+    )
+
+
+def list_pending_memory(
+    store: ScheduledReviewStore,
+    review_loader: Callable[[str], PaperDecisionReview | None],
+    limit: int = 18,
+) -> list[ScheduledMemoryWork]:
+    """Return bounded canonical lessons without reading or changing Hermes memory."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("invalid pending memory limit")
+    candidates = sorted(
+        (
+            (plan, item)
+            for plan in store.plans()
+            for item in plan.items
+            if item.state == "memory_pending"
+        ),
+        key=lambda pair: (
+            pair[1].review_date,
+            pair[0].trade_date,
+            pair[1].symbol,
+            pair[1].horizon_days,
+        ),
+    )[:limit]
+    work = []
+    for plan, item in candidates:
+        try:
+            review = review_loader(item.review_id)
+        except Exception as error:
+            raise ScheduledReviewStorageError(
+                "scheduled review memory work unavailable"
+            ) from error
+        if (
+            review is None
+            or review.review_id != item.review_id
+            or review.session_id != item.session_id
+            or review.review_date != item.review_date
+            or review.symbol != item.symbol
+        ):
+            raise ScheduledReviewStorageError(
+                "scheduled review memory work unavailable"
+            )
+        work.append(
+            ScheduledMemoryWork(
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                symbol=item.symbol,
+                horizon_days=item.horizon_days,
+                review_id=item.review_id,
+                hermes_memory_entry=review.hermes_memory_entry,
+            )
+        )
+    return work
+
+
+def confirm_scheduled_memory(
+    store: ScheduledReviewStore,
+    review_id: str,
+    verifier: Callable[[str], Any],
+) -> ScheduledReviewItem:
+    """Confirm memory consistency and update only the project-owned schedule."""
+    _, item = store.find_item(review_id)
+    if item.state == "completed":
+        return item
+    if item.state != "memory_pending":
+        raise ScheduledReviewConfirmationError(
+            "scheduled review confirmation failed"
+        )
+    try:
+        verification = verifier(review_id)
+        if verification is None or verification is False:
+            raise ValueError("review verification failed")
+    except Exception as error:
+        store.update_item(
+            review_id,
+            state="attention_required",
+            last_error_code="REVIEW_CONSISTENCY_FAILED",
+            updated_at=utc_now(),
+        )
+        raise ScheduledReviewConfirmationError(
+            "scheduled review confirmation failed"
+        ) from error
+    now = utc_now()
+    return store.update_item(
+        review_id,
+        state="completed",
+        last_error_code=None,
+        updated_at=now,
+        verified_at=now,
     )
