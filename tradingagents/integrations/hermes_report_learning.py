@@ -665,8 +665,10 @@ def _compact_memory_entry(
         quality_value = "None recorded."
 
     hypothesis = reflection.causal_hypotheses[0]
+    hypothesis_statement = _clip_text(hypothesis.statement, 14, 42)
+    hypothesis_evidence = _clip_text(hypothesis.evidence[0], 18, 54)
     hypothesis_value = (
-        f"{hypothesis.statement} [evidence: {', '.join(hypothesis.evidence)}; "
+        f"{hypothesis_statement} [evidence: {hypothesis_evidence}; "
         f"confidence: {hypothesis.confidence}]"
     )
     next_check = reflection.next_decision_checks[0]
@@ -680,7 +682,7 @@ def _compact_memory_entry(
         f"Outcomes: {outcome_summary}",
         f"Decision-time market context: {_clip_text(market_context, 16, 48)}",
         f"{quality_label}: {_clip_text(quality_value, 12, 36)}",
-        f"Causal hypothesis: {_clip_text(hypothesis_value, 18, 54)}",
+        f"Causal hypothesis: {hypothesis_value}",
         f"Next paper-decision check: {_clip_text(next_check, 14, 42)}",
         (
             "Disclaimer: paper trading only; hypotheses are uncertain; "
