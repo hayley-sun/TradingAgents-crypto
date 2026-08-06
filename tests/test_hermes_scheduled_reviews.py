@@ -22,6 +22,7 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
     list_pending_memory,
     process_due_reviews,
 )
+from tradingagents.integrations.hermes_report_learning import ReportLearningStore
 from tradingagents.integrations.schemas import (
     DailyReportArchive,
     DailyReportArchiveItem,
@@ -106,22 +107,24 @@ class HermesScheduledReviewTests(unittest.TestCase):
         def reviewer(_session_id, _review_date, version):
             self.assertEqual(version, 2)
             item = plan.items[0]
-            review = PaperDecisionReview(
-                review_id=item.review_id,
-                session_id=item.session_id,
-                symbol=item.symbol,
-                trade_date=plan.trade_date,
-                review_date=item.review_date,
-                horizon_days=item.horizon_days,
-                action="BUY",
-                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
-                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
-                raw_return_pct=10.0,
-                verdict="correct",
-                created_at=utc_now(),
-                hermes_memory_entry="legacy lesson",
-            )
-            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+            return {
+                "ok": True,
+                "data": {"review": {
+                    "review_id": item.review_id,
+                    "session_id": item.session_id,
+                    "symbol": item.symbol,
+                    "trade_date": plan.trade_date.isoformat(),
+                    "review_date": item.review_date.isoformat(),
+                    "horizon_days": item.horizon_days,
+                    "action": "BUY",
+                    "entry_price": {"date": plan.trade_date.isoformat(), "usd_price": 100.0, "source": "coinbase"},
+                    "review_price": {"date": item.review_date.isoformat(), "usd_price": 110.0, "source": "coinbase"},
+                    "raw_return_pct": 10.0,
+                    "verdict": "correct",
+                    "created_at": utc_now().isoformat(),
+                    "hermes_memory_entry": "legacy lesson",
+                }},
+            }
 
         with TemporaryDirectory() as directory:
             store = ScheduledReviewStore(Path(directory) / "review_schedules")
@@ -141,22 +144,21 @@ class HermesScheduledReviewTests(unittest.TestCase):
     def test_v1_due_review_keeps_memory_pending(self):
         def reviewer(_session_id, _review_date, _version):
             item = plan.items[0]
-            review = PaperDecisionReview(
-                review_id=item.review_id,
-                session_id=item.session_id,
-                symbol=item.symbol,
-                trade_date=plan.trade_date,
-                review_date=item.review_date,
-                horizon_days=item.horizon_days,
-                action="BUY",
-                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
-                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
-                raw_return_pct=10.0,
-                verdict="correct",
-                created_at=utc_now(),
-                hermes_memory_entry="legacy lesson",
-            )
-            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+            return {"ok": True, "data": {"review": {
+                "review_id": item.review_id,
+                "session_id": item.session_id,
+                "symbol": item.symbol,
+                "trade_date": plan.trade_date.isoformat(),
+                "review_date": item.review_date.isoformat(),
+                "horizon_days": item.horizon_days,
+                "action": "BUY",
+                "entry_price": {"date": plan.trade_date.isoformat(), "usd_price": 100.0, "source": "coinbase"},
+                "review_price": {"date": item.review_date.isoformat(), "usd_price": 110.0, "source": "coinbase"},
+                "raw_return_pct": 10.0,
+                "verdict": "correct",
+                "created_at": utc_now().isoformat(),
+                "hermes_memory_entry": "legacy lesson",
+            }}}
 
         with TemporaryDirectory() as directory:
             store = ScheduledReviewStore(Path(directory) / "review_schedules")
