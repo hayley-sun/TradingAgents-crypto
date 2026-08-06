@@ -345,10 +345,17 @@ def process_due_reviews(
         return True
 
     with store.processing_lock():
+        plans = store.plans()
+        item_states = {
+            item.review_id: item.state
+            for plan in plans
+            for item in plan.items
+            if item.review_id is not None
+        }
         due_items = sorted(
             (
                 (plan, item)
-                for plan in store.plans()
+                for plan in plans
                 for item in plan.items
                 if item.state == "review_pending"
                 and item.review_date < current_utc_date
@@ -361,6 +368,13 @@ def process_due_reviews(
             ),
         )
         for plan, item in due_items:
+            if plan.workflow_version == 2 and any(
+                candidate.session_id == item.session_id
+                and candidate.horizon_days < item.horizon_days
+                and item_states.get(candidate.review_id) != "completed"
+                for candidate in plan.items
+            ):
+                continue
             trade_date = plan.trade_date
             due_count += 1
             try:
@@ -408,6 +422,7 @@ def process_due_reviews(
                         continue
                     report_fact_count += 1
                     reviewed_count += 1
+                    item_states[item.review_id] = "completed"
                     continue
                 if not transition_pending(
                     item.review_id,

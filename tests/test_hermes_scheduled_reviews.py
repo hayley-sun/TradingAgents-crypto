@@ -11,6 +11,10 @@ from tradingagents.integrations.hermes_learning import (
     review_completed_session,
 )
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.hermes_scheduled_reviews import (
     ScheduledReviewConfirmationError,
     ScheduledReviewStore,
@@ -197,6 +201,112 @@ class HermesScheduledReviewTests(unittest.TestCase):
         self.assertEqual(item.last_error_code, "REPORT_FACT_WRITE_FAILED")
         self.assertEqual(report.retryable_count, 1)
         self.assertEqual(report.report_fact_count, 0)
+
+    def test_v2_later_horizon_waits_for_same_session_and_other_sessions_continue(self):
+        session_ids = {
+            "BTC": SESSION_IDS["BTC"],
+            "ETH": SESSION_IDS["ETH"],
+        }
+        calls = []
+        fail_btc_t1 = True
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ScheduledReviewStore(root / "review_schedules")
+            report_store = ReportLearningStore(root / "report_memories")
+            batch = archived_batch(
+                session_ids=session_ids,
+                workflow_version=2,
+            )
+            plan = store.create_or_load(batch)
+            sessions = {
+                item.session_id: AnalysisSession(
+                    session_id=item.session_id,
+                    status="completed",
+                    created_at=utc_now(),
+                    completed_at=utc_now(),
+                    request=batch.request.for_symbol(item.symbol),
+                    result=AnalysisResult(
+                        reports={"market": "Archived market evidence."},
+                        investment_plan="plan",
+                        trader_investment_plan="trader plan",
+                        final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                        processed_signal="BUY",
+                    ),
+                )
+                for item in batch.items
+            }
+
+            def reviewer(session_id, review_date, _version):
+                nonlocal fail_btc_t1
+                item = next(
+                    candidate
+                    for candidate in plan.items
+                    if candidate.session_id == session_id
+                    and candidate.review_date == review_date
+                )
+                calls.append((item.symbol, item.horizon_days))
+                if item.symbol == "BTC" and item.horizon_days == 1 and fail_btc_t1:
+                    return {"ok": False, "error": {"code": "PRICE_DATA_UNAVAILABLE"}}
+                review = PaperDecisionReview(
+                    review_id=item.review_id,
+                    session_id=item.session_id,
+                    symbol=item.symbol,
+                    trade_date=plan.trade_date,
+                    review_date=item.review_date,
+                    horizon_days=item.horizon_days,
+                    action="BUY",
+                    entry_price=PriceReference(
+                        date=plan.trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    review_price=PriceReference(
+                        date=item.review_date, usd_price=110.0, source="coinbase"
+                    ),
+                    raw_return_pct=10.0,
+                    verdict="correct",
+                    created_at=utc_now(),
+                    hermes_memory_entry=(
+                        f"Exact {item.symbol} T+{item.horizon_days} lesson."
+                    ),
+                )
+                return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+            def fact_recorder(review):
+                record_review_fact(report_store, sessions[review.session_id], review)
+
+            process_due_reviews(
+                store, date(2026, 8, 14), reviewer, fact_recorder=fact_recorder
+            )
+            first_calls = list(calls)
+            first_btc = [
+                item
+                for item in store.load(plan.trade_date).items
+                if item.symbol == "BTC"
+            ]
+            first_eth = [
+                item
+                for item in store.load(plan.trade_date).items
+                if item.symbol == "ETH"
+            ]
+
+            fail_btc_t1 = False
+            calls.clear()
+            process_due_reviews(
+                store, date(2026, 8, 14), reviewer, fact_recorder=fact_recorder
+            )
+            second_calls = list(calls)
+            btc_record = report_store.load(session_ids["BTC"])
+
+        self.assertEqual(
+            [(item.state, item.last_error_code) for item in first_eth],
+            [("completed", None), ("completed", None), ("review_pending", None)],
+        )
+        self.assertEqual(first_calls, [("BTC", 1), ("ETH", 1), ("ETH", 7)])
+        self.assertEqual([item.state for item in first_btc], ["review_pending"] * 3)
+        self.assertEqual(second_calls, [("BTC", 1), ("BTC", 7)])
+        self.assertEqual(
+            [outcome.horizon_days for outcome in btc_record.outcomes], [1, 7]
+        )
 
     def test_state_conflict_does_not_overwrite_external_transition(self):
         def reviewer(_session_id, _review_date, _version):

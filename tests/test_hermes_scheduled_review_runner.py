@@ -3,7 +3,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -283,6 +283,66 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             {"session_id", "symbol", "trade_date", "revision", "maturity_days"},
         )
         self.assertNotIn("Market report.", json.dumps(payload))
+
+    def test_report_reflection_pending_is_oldest_first_bounded_and_revision_ordered(self):
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+        def record(position):
+            session_id = f"hermes_{99 - position:016x}"
+            revision = SimpleNamespace(
+                revision=1,
+                reflection_state="pending",
+                created_at=start + timedelta(minutes=position),
+            )
+            return SimpleNamespace(
+                session_id=session_id,
+                symbol=f"S{position:02d}",
+                trade_date=date(2026, 7, 1),
+                reflected_revision=0,
+                revisions=[revision],
+                outcomes=[SimpleNamespace(horizon_days=1)],
+            )
+
+        records = [record(position) for position in reversed(range(20))]
+        code, payload = runner.run_report_reflection_pending(
+            18, lambda _limit: records
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["count"], 18)
+        self.assertEqual(
+            [item["session_id"] for item in payload["items"]],
+            [record(position).session_id for position in range(18)],
+        )
+
+        revisions = [
+            SimpleNamespace(
+                revision=revision,
+                reflection_state="pending",
+                created_at=start + timedelta(minutes=3 - revision),
+            )
+            for revision in (1, 2, 3)
+        ]
+        multi_revision = SimpleNamespace(
+            session_id="hermes_aaaaaaaaaaaaaaaa",
+            symbol="BTC",
+            trade_date=date(2026, 7, 1),
+            reflected_revision=0,
+            revisions=revisions,
+            outcomes=[SimpleNamespace(horizon_days=value) for value in (1, 7, 15)],
+        )
+        _, ordered = runner.run_report_reflection_pending(
+            18, lambda _limit: [multi_revision]
+        )
+        self.assertEqual(
+            [item["revision"] for item in ordered["items"]], [1, 2, 3]
+        )
+
+        multi_revision.revisions[0].reflection_state = "attention_required"
+        _, blocked = runner.run_report_reflection_pending(
+            18, lambda _limit: [multi_revision]
+        )
+        self.assertEqual(blocked["items"], [])
 
     def test_report_reflection_evidence_returns_one_selected_packet(self):
         with TemporaryDirectory() as directory:

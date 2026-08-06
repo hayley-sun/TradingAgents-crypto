@@ -180,13 +180,36 @@ def run_report_reflection_pending(
         store = ReportLearningStore.from_environment()
         lister = lambda selected_limit: store.records()
     records = list(lister(limit))
+    candidates = sorted(
+        (
+            (record, revision)
+            for record in records
+            for revision in record.revisions
+            if revision.reflection_state == "pending"
+        ),
+        key=lambda item: (
+            item[1].created_at,
+            item[0].trade_date,
+            item[0].symbol,
+            item[0].session_id,
+            item[1].revision,
+        ),
+    )
+    next_revisions = {
+        record.session_id: record.reflected_revision + 1 for record in records
+    }
     items: list[dict[str, Any]] = []
-    for record in sorted(records, key=lambda item: (item.session_id, item.trade_date)):
-        for revision in record.revisions:
-            if revision.reflection_state != "pending":
-                continue
+    remaining = candidates
+    while remaining and len(items) < limit:
+        deferred = []
+        progressed = False
+        for record, revision in remaining:
             if len(items) >= limit:
-                break
+                deferred.append((record, revision))
+                continue
+            if revision.revision != next_revisions[record.session_id]:
+                deferred.append((record, revision))
+                continue
             maturity_days = record.outcomes[revision.revision - 1].horizon_days
             items.append(
                 {
@@ -197,6 +220,11 @@ def run_report_reflection_pending(
                     "maturity_days": maturity_days,
                 }
             )
+            next_revisions[record.session_id] += 1
+            progressed = True
+        if not progressed:
+            break
+        remaining = deferred
     return 0, {
         "ok": True,
         "mode": "report-reflection-pending",

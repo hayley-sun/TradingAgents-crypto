@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -15,13 +15,17 @@ import tradingagents.integrations.hermes_mcp as hermes_mcp
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
-from tradingagents.integrations.hermes_report_learning import ReportLearningStore
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.hermes_reports import ReportBatchStore
 from tradingagents.integrations.hermes_scheduled_reviews import ScheduledReviewStore
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    PaperDecisionReview,
     PriceReference,
 )
 
@@ -155,6 +159,82 @@ class HermesMcpTests(unittest.TestCase):
                 ))
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_invalid_reflection_schema_counts_domain_attempts_and_quarantines(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            session_store = SessionStore(root / "sessions")
+            report_store = ReportLearningStore(root / "report_memories")
+            learning_store = LearningStore(root / "memories")
+            request = self.make_request()
+            session = AnalysisSession(
+                session_id="hermes_0123456789abcdef",
+                status="completed",
+                created_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+                request=request,
+                result=AnalysisResult(
+                    reports={"market": "Archived market report."},
+                    investment_plan="plan",
+                    trader_investment_plan="trader plan",
+                    final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                    processed_signal="BUY",
+                ),
+            )
+            session_store.save(session)
+            review_date = request.trade_date + timedelta(days=1)
+            record_review_fact(
+                report_store,
+                session,
+                PaperDecisionReview(
+                    review_id="review_0123456789abcdef0123456789abcdef",
+                    session_id=session.session_id,
+                    symbol=request.symbol,
+                    trade_date=request.trade_date,
+                    review_date=review_date,
+                    horizon_days=1,
+                    action="BUY",
+                    entry_price=PriceReference(
+                        date=request.trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    review_price=PriceReference(
+                        date=review_date, usd_price=101.0, source="coinbase"
+                    ),
+                    raw_return_pct=1.0,
+                    verdict="correct",
+                    created_at=datetime.now(timezone.utc),
+                    hermes_memory_entry="Legacy paper lesson.",
+                ),
+            )
+            invalid_reflection = self.valid_reflection_payload()
+            invalid_reflection.pop("decision_thesis")
+
+            for attempt in range(1, 5):
+                result = submit_report_reflection_impl(
+                    {
+                        "session_id": session.session_id,
+                        "expected_revision": 1,
+                        "reflection": invalid_reflection,
+                    },
+                    session_store=session_store,
+                    report_store=report_store,
+                    learning_store=learning_store,
+                )
+                snapshot = report_store.load(session.session_id).revisions[0]
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    result["error"]["code"], "INVALID_REPORT_REFLECTION"
+                )
+                self.assertEqual(snapshot.reflection_attempt_count, min(attempt, 3))
+                self.assertEqual(
+                    snapshot.reflection_state,
+                    "attention_required" if attempt >= 3 else "pending",
+                )
+                self.assertEqual(
+                    snapshot.last_error_code, "REFLECTION_SCHEMA_INVALID"
+                )
+
     def make_request(self):
         return AnalysisRequest(
             symbol="BTCUSDT",

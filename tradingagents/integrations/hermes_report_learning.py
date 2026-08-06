@@ -428,6 +428,40 @@ _REAL_ORDER_PATTERNS = (
     re.compile(r"(?:立即|马上|现在).{0,4}(?:买入|卖出|下单|开仓|平仓)"),
     re.compile(r"(?:买入|卖出|开仓|平仓).{0,12}(?:实盘|真实仓位)"),
 )
+_UNTRUSTED_INSTRUCTION_PATTERN = re.compile(
+    r"\b(?:ignore|disregard|override|forget)\s+(?:all\s+)?"
+    r"(?:previous|prior|above|system|developer)\s+"
+    r"(?:instructions?|prompts?|messages?)\b",
+    re.IGNORECASE,
+)
+_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"\b(?:api[_ -]?key|access[_ -]?token|secret|password)\s*"
+        r"(?:is\s+|[:=]\s*)\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE),
+)
+_UNSUPPORTED_SOURCE_PATTERNS = (
+    re.compile(
+        r"\b(?:later|subsequent|post[- ]decision|live|real[- ]time)\s+"
+        r"(?:external\s+)?(?:news|data|sources?|information|prices?|markets?|"
+        r"search|lookup|web(?:site)?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bexternal\s+(?:news|data|sources?|search|lookup|web(?:site)?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:search(?:ed|ing)?|brows(?:e|ed|ing))\s+(?:the\s+)?web\b",
+        re.IGNORECASE,
+    ),
+)
 
 
 def _reflection_text_values(value) -> Iterator[str]:
@@ -439,6 +473,18 @@ def _reflection_text_values(value) -> Iterator[str]:
     elif isinstance(value, list):
         for item in value:
             yield from _reflection_text_values(item)
+
+
+def _is_unsafe_reflection_text(text: str) -> bool:
+    return (
+        "§" in text
+        or _UNTRUSTED_INSTRUCTION_PATTERN.search(text) is not None
+        or any(pattern.search(text) is not None for pattern in _CREDENTIAL_PATTERNS)
+        or any(
+            pattern.search(text) is not None
+            for pattern in _UNSUPPORTED_SOURCE_PATTERNS
+        )
+    )
 
 
 def _validated_reflection(
@@ -489,6 +535,7 @@ def _validated_reflection(
     if any(
         _CERTAINTY_PATTERN.search(text) is not None
         or any(pattern.search(text) is not None for pattern in _REAL_ORDER_PATTERNS)
+        or _is_unsafe_reflection_text(text)
         for text in _reflection_text_values(text_values)
     ):
         raise ReportReflectionRejected("REFLECTION_UNSAFE_CONTENT")
@@ -697,6 +744,34 @@ def _replace_revision(
     )
 
 
+def _save_reflection_rejection(
+    report_store: ReportLearningStore,
+    record: ReportLearningRecord,
+    revision: int,
+    snapshot: ReportLearningRevision,
+    error: ReportReflectionRejected,
+) -> None:
+    now = utc_now()
+    attempts = min(
+        snapshot.reflection_attempt_count + 1, MAX_REFLECTION_ATTEMPTS
+    )
+    rejected_snapshot = snapshot.model_copy(
+        update={
+            "reflection_state": (
+                "attention_required"
+                if attempts >= MAX_REFLECTION_ATTEMPTS
+                else "pending"
+            ),
+            "reflection_attempt_count": attempts,
+            "last_error_code": error.error_code,
+            "updated_at": now,
+        }
+    )
+    report_store._save_unlocked(
+        _replace_revision(record, revision, rejected_snapshot)
+    )
+
+
 def submit_report_reflection(
     report_store: ReportLearningStore,
     learning_store: LearningStore,
@@ -730,8 +805,27 @@ def submit_report_reflection(
             if (
                 expected_revision != current.reflected_revision + 1
                 or snapshot.revision != expected_revision
-                or snapshot.reflection_state != "pending"
             ):
+                raise ReportLearningConflict(
+                    "report learning revision is not the next pending snapshot"
+                )
+            if snapshot.reflection_state not in {"pending", "attention_required"}:
+                raise ReportLearningConflict(
+                    "report learning revision is not the next pending snapshot"
+                )
+            try:
+                ReportReflection.model_validate(reflection_data)
+            except (TypeError, ValueError, ValidationError) as validation_error:
+                rejected = ReportReflectionRejected("REFLECTION_SCHEMA_INVALID")
+                _save_reflection_rejection(
+                    report_store,
+                    current,
+                    expected_revision,
+                    snapshot,
+                    rejected,
+                )
+                raise rejected from validation_error
+            if snapshot.reflection_state != "pending":
                 raise ReportLearningConflict(
                     "report learning revision is not the next pending snapshot"
                 )
@@ -753,24 +847,13 @@ def submit_report_reflection(
                     reflection_data, packet, outcomes
                 )
             except ReportReflectionRejected as error:
-                now = utc_now()
-                attempts = snapshot.reflection_attempt_count + 1
-                rejected_snapshot = snapshot.model_copy(
-                    update={
-                        "reflection_state": (
-                            "attention_required"
-                            if attempts >= MAX_REFLECTION_ATTEMPTS
-                            else "pending"
-                        ),
-                        "reflection_attempt_count": attempts,
-                        "last_error_code": error.error_code,
-                        "updated_at": now,
-                    }
+                _save_reflection_rejection(
+                    report_store,
+                    current,
+                    expected_revision,
+                    snapshot,
+                    error,
                 )
-                rejected = _replace_revision(
-                    current, expected_revision, rejected_snapshot
-                )
-                report_store._save_unlocked(rejected)
                 raise
 
             rendered = _render_reflection(current, expected_revision, reflection)

@@ -1115,12 +1115,16 @@ def submit_report_reflection_impl(
 
     try:
         ReportReflection.model_validate(reflection_data)
-    except (TypeError, ValueError, ValidationError):
-        return _report_error(
-            "INVALID_REPORT_REFLECTION",
-            "The report reflection request is invalid.",
-            "Correct the reflection fields and try again.",
-        )
+    except ValidationError as validation_error:
+        if any(
+            item.get("type") == "extra_forbidden"
+            for item in validation_error.errors()
+        ):
+            return _report_error(
+                "INVALID_REPORT_REFLECTION",
+                "The report reflection request is invalid.",
+                "Use only the documented reflection fields.",
+            )
 
     try:
         active_session_store = session_store or SessionStore.from_environment()

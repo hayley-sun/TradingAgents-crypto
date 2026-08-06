@@ -30,6 +30,7 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
 )
 from tradingagents.integrations import hermes_scheduled_review_runner as runner
 from tradingagents.integrations.hermes_report_memory_verifier import (
+    ENTRY_DELIMITER,
     verify_report_memory_consistency,
 )
 from tradingagents.integrations.schemas import (
@@ -78,7 +79,7 @@ class FakeHermesMemory:
 
     @property
     def text(self) -> str:
-        return "\n\n".join(self.entries)
+        return ENTRY_DELIMITER.join(self.entries)
 
     def apply(self, action: str, content: str, old_text: str | None) -> str:
         self.actions.append(action)
@@ -532,13 +533,51 @@ class HermesReportMemoryTests(unittest.TestCase):
             other_marker = REPORT_MEMORY_MARKER.format(session_id="hermes_abcdef0123456789")
             memory_path = results / "MEMORY.md"
             memory_path.write_text(
-                f"{other_marker}\nUnrelated report entry.\n\n{entry}", encoding="utf-8"
+                ENTRY_DELIMITER.join(
+                    [f"{other_marker}\nUnrelated report entry.", entry]
+                ),
+                encoding="utf-8",
             )
             self.assertTrue(verify_report_memory_consistency(SESSION_ID, 1, results, memory_path).ok)
             target_marker = REPORT_MEMORY_MARKER.format(session_id=SESSION_ID)
             for tampered in (entry + " forged suffix", entry.replace(target_marker, target_marker + " forged prefix")):
                 memory_path.write_text(tampered, encoding="utf-8")
                 self.assertFalse(verify_report_memory_consistency(SESSION_ID, 1, results, memory_path).ok)
+
+    def test_verifier_uses_complete_hermes_entries_at_any_position(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            record = store.load(SESSION_ID)
+            results = Path(directory)
+            LearningStore(results / "hermes" / "memories").upsert_report(record)
+            entry = record.revisions[0].hermes_memory_entry
+            memory_path = results / "MEMORY.md"
+            ordinary_entries = ["Ordinary preference.", "Another unrelated memory."]
+
+            for entries in (
+                [entry, *ordinary_entries],
+                [ordinary_entries[0], entry, ordinary_entries[1]],
+                [*ordinary_entries, entry],
+            ):
+                with self.subTest(position=entries.index(entry)):
+                    memory_path.write_text(ENTRY_DELIMITER.join(entries), encoding="utf-8")
+                    result = verify_report_memory_consistency(
+                        SESSION_ID, 1, results, memory_path
+                    )
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.exact_content_occurrences, 1)
+
+            for entries in (
+                [entry, entry],
+                [entry + " forged suffix", ordinary_entries[0]],
+            ):
+                with self.subTest(entries=entries):
+                    memory_path.write_text(ENTRY_DELIMITER.join(entries), encoding="utf-8")
+                    self.assertFalse(
+                        verify_report_memory_consistency(
+                            SESSION_ID, 1, results, memory_path
+                        ).ok
+                    )
 
     def test_verification_pending_is_listable_and_begin_is_idempotent_after_crash(self):
         with TemporaryDirectory() as directory:

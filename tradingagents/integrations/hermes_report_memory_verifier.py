@@ -1,7 +1,6 @@
 """Read-only verification for ordered Hermes report-memory promotions."""
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +13,7 @@ from tradingagents.integrations.hermes_report_learning import (
 )
 
 
-_REPORT_MARKER_RE = re.compile(r"\[TradingAgents paper report: [^\]\r\n]+\]")
+ENTRY_DELIMITER = "\n§\n"
 
 
 @dataclass(frozen=True)
@@ -74,14 +73,10 @@ def verify_report_memory_consistency(
         marker = REPORT_MEMORY_MARKER.format(session_id=session_id)
         marker_occurrences = memory_text.count(marker)
         if snapshot.hermes_memory_entry is not None:
-            markers = list(_REPORT_MARKER_RE.finditer(memory_text))
-            segments = [
-                memory_text[match.start() : markers[index + 1].start() if index + 1 < len(markers) else len(memory_text)]
-                for index, match in enumerate(markers)
-            ]
             desired = snapshot.hermes_memory_entry.strip("\r\n")
             exact_content_occurrences = sum(
-                segment.strip("\r\n") == desired for segment in segments
+                entry.strip("\r\n") == desired
+                for entry in memory_text.split(ENTRY_DELIMITER)
             )
 
         index = LearningStore(Path(results_root) / "hermes" / "memories").load(record.symbol)
