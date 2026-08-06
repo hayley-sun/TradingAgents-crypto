@@ -392,7 +392,14 @@ def run_confirm_report_memory(
     confirmer: Callable[[str, int], Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Verify Hermes memory read-only, then expose project state only."""
-    if not is_valid_session_id(session_id) or isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= 3:
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if (
+        not is_valid_session_id(session_id)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or not 1 <= revision <= 3
+        or canonical_memory_path is None
+    ):
         return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "confirm-report-memory")
     if confirmer is None:
         store = ReportLearningStore.from_environment()
@@ -402,7 +409,10 @@ def run_confirm_report_memory(
             selected_session,
             selected_revision,
             verifier=lambda *_args: verify_report_memory_consistency(
-                selected_session, selected_revision, results_root, memory_path
+                selected_session,
+                selected_revision,
+                results_root,
+                canonical_memory_path,
             ),
         )
     record = confirmer(session_id, revision)
@@ -739,10 +749,19 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("invalid report memory request")
             code, payload = run_begin_report_memory(parsed.session_id, parsed.revision)
         elif parsed.mode == "confirm-report-memory":
-            if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if (
+                not is_valid_session_id(parsed.session_id)
+                or not 1 <= parsed.revision <= 3
+                or canonical_memory_path is None
+            ):
                 raise ValueError("invalid report memory request")
             code, payload = run_confirm_report_memory(
-                parsed.session_id, parsed.revision, parsed.hermes_memory_path.expanduser().resolve()
+                parsed.session_id,
+                parsed.revision,
+                canonical_memory_path,
             )
         elif parsed.mode == "quarantine-report-memory":
             if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:

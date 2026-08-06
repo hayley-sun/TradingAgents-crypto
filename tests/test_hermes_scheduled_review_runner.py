@@ -241,6 +241,95 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             },
         )
 
+    def test_confirm_report_memory_accepts_only_patched_canonical_memory_path(self):
+        session_id = "hermes_0123456789abcdef"
+        seen = []
+
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "MEMORY.md"
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", memory_path, create=True
+            ):
+                code, payload = runner.run_confirm_report_memory(
+                    session_id,
+                    1,
+                    memory_path,
+                    lambda selected_session, selected_path: (
+                        seen.append((selected_session, selected_path))
+                        or SimpleNamespace(
+                            confirmed_revision=1,
+                            revisions=[SimpleNamespace(memory_state="confirmed")],
+                        )
+                    ),
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [(session_id, 1)])
+        self.assertEqual(payload["memory_state"], "confirmed")
+
+    def test_confirm_report_memory_rejects_noncanonical_path_before_confirmer(self):
+        session_id = "hermes_0123456789abcdef"
+        rejected_paths = (Path("/dev/null"), Path("/tmp/alternate-report-memory.md"))
+        seen = []
+
+        with TemporaryDirectory() as directory:
+            canonical_path = Path(directory) / "MEMORY.md"
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", canonical_path, create=True
+            ):
+                for candidate_path in rejected_paths:
+                    with self.subTest(path=candidate_path):
+                        code, payload = runner.run_confirm_report_memory(
+                            session_id,
+                            1,
+                            candidate_path,
+                            lambda *_args: (
+                                seen.append(candidate_path)
+                                or SimpleNamespace(
+                                    confirmed_revision=1,
+                                    revisions=[
+                                        SimpleNamespace(memory_state="confirmed")
+                                    ]
+                                )
+                            ),
+                        )
+                        self.assertEqual(code, 1)
+                        self.assertEqual(
+                            payload["error"]["code"],
+                            "INVALID_SCHEDULED_REVIEW_REQUEST",
+                        )
+                        self.assertNotIn(str(candidate_path), json.dumps(payload))
+
+        self.assertEqual(seen, [])
+
+    def test_main_rejects_noncanonical_report_memory_confirmation_path_before_runner(self):
+        session_id = "hermes_0123456789abcdef"
+        stdout = io.StringIO()
+        with TemporaryDirectory() as directory:
+            canonical_path = Path(directory) / "MEMORY.md"
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", canonical_path, create=True
+            ), patch.object(runner, "run_confirm_report_memory") as confirmer, redirect_stdout(stdout):
+                code = runner.main(
+                    [
+                        "confirm-report-memory",
+                        "--session-id",
+                        session_id,
+                        "--revision",
+                        "1",
+                        "--hermes-memory-path",
+                        "/dev/null",
+                    ]
+                )
+
+        self.assertEqual(code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST"
+        )
+        self.assertNotIn("/dev/null", stdout.getvalue())
+        confirmer.assert_not_called()
+
     def test_main_rejects_noncanonical_date_as_safe_json(self):
         stdout = io.StringIO()
         with redirect_stdout(stdout):
