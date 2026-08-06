@@ -335,12 +335,28 @@ hermes cron list --all
 
 复盘使用一个共享的确定性 processor 和一个 Hermes Agent job，时区均为 `Asia/Shanghai`：08:15 processor 同时处理 v1 legacy review 与 v2 report fact，更新 `results/hermes/reviews`、`results/hermes/memories/<SYMBOL>.json` 和 `results/hermes/report_memories/<session_id>.json`；该项目索引持久保留全部复盘索引项，后续分析仍只注入最近 5 条 lesson。processor 绝不读取或写入 Hermes 长期 memory。08:30 Agent job 只加载专用 skill，通过内置 memory tool 完成旧 v1 add 以及 v2 的 report-level add/replace；任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
 
-### 安装来源与暂停替换任务
+### 暂停旧任务、安装来源并创建替换任务
 
-从已评审、已推送的集成提交安装 wrapper 和 skill；不要创建新 API key 或第二份密钥文件：
+覆盖 wrapper 或 skill 之前，先记录旧 v1 job ID，暂停两项并用第二次 list 验证状态
+确实为 paused。全新部署没有旧 job 时记录该事实并跳过对应 pause；不得用名称猜测 ID：
 
 ```bash
+set -e
 cd /home/ubuntu/workspace/TradingAgents-crypto
+hermes cron list --all
+old_process_job_id='<old-v1-processor-job-id-from-list>'
+old_memory_job_id='<old-v1-memory-job-id-from-list>'
+hermes cron pause "$old_process_job_id"
+hermes cron pause "$old_memory_job_id"
+hermes cron list --all
+# 人工确认两个 old_* ID 均显示 paused 后才继续。
+```
+
+然后从已评审、已推送的集成提交安装 owner-only wrapper 和 skill；不要创建新 API
+key 或第二份密钥文件：
+
+```bash
+set -e
 install -d -m 700 /home/ubuntu/.hermes/scripts
 install -m 700 deploy/hermes/scripts/tradingagents-scheduled-review-process.sh /home/ubuntu/.hermes/scripts/tradingagents-scheduled-review-process.sh
 install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-scheduled-paper-reviews
@@ -348,24 +364,22 @@ install -m 600 deploy/hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.
 hermes memory status
 ```
 
-先用 `hermes cron list --all` 记录旧 v1 processor/Agent job ID，并确认它们均为
-paused。创建 replacement job 后立即暂停；旧 job 继续保持 paused 并保留，直到
-replacement 08:15/08:30 pair 与新 v2 验收全部成功。创建或暂停失败时保留旧配置。
-两个 replacement job 固定使用本地投递、Asia/Shanghai 和项目目录：
+Hermes 创建 Cron job 后默认 enabled，所以必须逐项创建和立即暂停。处理完第一项的
+create 输出、记录 ID 并 pause 后，才能创建第二项；两次 create/pause 之间不得执行
+其它命令。旧 job 继续保持 paused 并保留，直到全部 v2 验收成功：
 
 ```bash
+set -e
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
 MEMORY_PROMPT='Run the tradingagents-scheduled-paper-reviews skill once. Process bounded legacy and report items independently; never edit memory files directly.'
-old_process_job_id='<paused-old-v1-processor-job-id>'
-old_memory_job_id='<paused-old-v1-memory-job-id>'
 hermes cron create --name tradingagents-scheduled-review-process --deliver local --no-agent --script tradingagents-scheduled-review-process.sh --workdir "$PROJECT_DIR" '15 8 * * *'
-hermes cron create --name tradingagents-scheduled-review-memory --deliver local --skill tradingagents-scheduled-paper-reviews --workdir "$PROJECT_DIR" '30 8 * * *' "$MEMORY_PROMPT"
-hermes cron list --all
-scheduled_review_process_job_id='<replace-with-process-job-id>'
-scheduled_review_memory_job_id='<replace-with-memory-job-id>'
+scheduled_review_process_job_id='<job-id-from-immediately-preceding-create>'
 hermes cron pause "$scheduled_review_process_job_id"
+hermes cron create --name tradingagents-scheduled-review-memory --deliver local --skill tradingagents-scheduled-paper-reviews --workdir "$PROJECT_DIR" '30 8 * * *' "$MEMORY_PROMPT"
+scheduled_review_memory_job_id='<job-id-from-immediately-preceding-create>'
 hermes cron pause "$scheduled_review_memory_job_id"
 hermes cron list --all
+# 人工确认两个 scheduled_review_* ID 均显示 paused，旧 v1 ID 仍保留且 paused。
 ```
 
 processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载结果目录和价格
@@ -376,40 +390,122 @@ tool/injection 均 enabled，且工作树、结果目录和 Hermes 目录权限�
 
 使用部署后新创建且已归档的测试日期，不修改计划 JSON。确认每个 session 有三个
 review schedule 项，且新的 batch/report metadata 显示
-`scheduled_review_version: 2`：
+`scheduled_review_version: 2`。以下 helper 会临时 resume 指定 job，等待新 durable
+run 到达 completed/failed 后立即 pause；超时和 failed 都会返回非零。只读 verifier
+调用项目现有函数，不修改 Hermes memory，并且只输出安全字段：
+
+```bash
+set -e
+run_scheduled_job_once_and_pause() {
+  local job_id="$1" before current
+  shift
+  before="$(hermes cron runs "$job_id" --limit 1 2>&1 || true)"
+  hermes cron resume "$job_id"
+  if ! hermes cron run "$job_id" "$@"; then
+    hermes cron pause "$job_id"
+    return 1
+  fi
+  for _ in $(seq 1 60); do
+    current="$(hermes cron runs "$job_id" --limit 1 2>&1 || true)"
+    if [ "$current" != "$before" ] && printf '%s\n' "$current" | grep -Eq '[[:space:]](completed|failed)[[:space:]]'; then
+      hermes cron pause "$job_id"
+      printf '%s\n' "$current"
+      if printf '%s\n' "$current" | grep -Eq '[[:space:]]failed[[:space:]]'; then return 1; fi
+      return 0
+    fi
+    sleep 2
+  done
+  hermes cron pause "$job_id"
+  echo "Cron run did not reach a terminal state before timeout" >&2
+  return 1
+}
+
+verify_report_memory_stage() {
+  local session_id="$1" revision="$2"
+  /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python - "$session_id" "$revision" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from tradingagents.integrations.hermes_report_memory_verifier import (
+    verify_report_memory_consistency,
+)
+
+result = verify_report_memory_consistency(
+    sys.argv[1],
+    int(sys.argv[2]),
+    Path("/home/ubuntu/workspace/TradingAgents-crypto/results"),
+    Path("/home/ubuntu/.hermes/memories/MEMORY.md"),
+)
+print(json.dumps({
+    "ok": result.ok,
+    "session_id": result.session_id,
+    "revision": result.revision,
+    "marker_occurrences": result.marker_occurrences,
+    "exact_content_occurrences": result.exact_content_occurrences,
+    "index_matches_latest_reflection": result.index_matches_latest_reflection,
+}, sort_keys=True))
+raise SystemExit(0 if result.ok else 1)
+PY
+}
+```
+
+先手动执行一次 replacement 08:15 processor job，证明安装后的 wrapper、workdir 和
+Cron path 可运行；helper 返回后该 job 必须重新处于 paused：
+
+```bash
+run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"
+```
+
+T+1 使用 add，后续 `T+7/T+15 replace` 同一稳定 marker。每个阶段都必须先运行
+processor，再运行 08:30 Agent，并从安全 pending 输出记录三个 session ID。Agent
+内部的 `confirm-report-memory` 成功后再运行只读 verifier；不得手工编辑 memory。
+
+#### T+1 add acceptance
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+1-next-UTC-date>
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+T1_SESSION_IDS='<three-space-separated-session-ids-from-pending-output>'
+run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
+for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 1; done
+```
+
+确认 Agent run 中每项 `confirm-report-memory` 成功，verifier 每行均为
+`marker_occurrences: 1`、`exact_content_occurrences: 1` 和
+`index_matches_latest_reflection: true`；此时每份报告只有一个 T+1 add 条目。
+
+#### T+7 replace acceptance
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+7-next-UTC-date>
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
+for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 2; done
+```
+
+确认 Agent run 中每项 `confirm-report-memory` 成功，replace 后仍为
+`marker_occurrences: 1`、`exact_content_occurrences: 1` 和
+`index_matches_latest_reflection: true`，不存在第二个 Hermes memory 条目。
+
+#### T+15 replace acceptance
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+15-next-UTC-date>
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
+for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 3; done
 find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/review_schedules -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
 find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_memories -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
 ```
 
-T+1 应出现三个 completed review 和 `T+1 add`；T+7/T+15 在精确 UTC 日期前保持
-`review_pending`，到期后转为 `T+7/T+15 replace`。每个 report reflection 只能读取
-一个 `report-reflection-evidence` packet、提交一次，并且只有
-`reflection_state: ready` 才能继续。report-memory queue 必须先调用
-`begin-report-memory`，然后执行一次匹配操作：add 只接受 `Entry added` 或 `Entry
-already exists`，replace 只接受 `Entry replaced`。
-
-临时恢复 08:30 Agent job 并手动运行，等待新的 durable execution 终态后立即暂停；
-不要在运行中删除或修改任何项目文件：
-
-```bash
-hermes cron resume "$scheduled_review_memory_job_id"
-hermes cron run "$scheduled_review_memory_job_id" --accept-hooks
-# 此命令不等待；重复查询，确认新的 run 已为 completed 或 failed 后再执行 pause。
-hermes cron runs "$scheduled_review_memory_job_id" --limit 1
-hermes cron pause "$scheduled_review_memory_job_id"
-```
-
-每次 accepted mutation 后，skill 通过 bootstrap 的只读
-`confirm-report-memory` 验证 `report_memories/<session_id>.json`、项目
-`memories/<SYMBOL>.json` report index 与 Hermes memory。成功必须同时满足：稳定
-marker 只出现一次、目标 revision 的精确内容只出现一次、项目 index 指向最新
-reflection，即每份报告 `只有一个 Hermes memory 条目`。验收输出只能包含 ID、symbol、
-revision、state、count 和安全错误码，不能包含 evidence 或 memory 正文。
+确认 Agent run 中每项 `confirm-report-memory` 成功，最终仍为
+`marker_occurrences: 1`、`exact_content_occurrences: 1` 和
+`index_matches_latest_reflection: true`，即每份报告 `只有一个 Hermes memory 条目`。
+任一阶段失败都保持新旧 jobs paused，保留 artifact 调查，不得进入下一阶段或移除旧
+jobs。验收输出只能包含 ID、symbol、revision、state、count 和安全错误码，不能包含
+evidence 或 memory 正文。
 
 `unavailable_count` 及其最多 18 个 ID 样本不得触发 memory mutation。只有 Hermes
 memory tool 返回 ambiguous、unaccepted 或与 action 不匹配的结果时，才调用

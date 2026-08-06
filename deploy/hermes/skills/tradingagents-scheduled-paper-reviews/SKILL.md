@@ -55,9 +55,11 @@ fetch another packet, infer missing facts, or include raw report/evidence text
 in a summary. Call
 `mcp__tradingagents_crypto__submit_report_reflection` once with the packet's
 `session_id`, `revision` as `expected_revision`, and the structured reflection.
-Continue only when the response has `ok: true`, `reflection_state: ready`, and
-the returned project state is `add_pending` or `replace_pending`; otherwise
-report only the safe error and continue with independent items.
+Continue only when the response `ok` is exactly `true`,
+`data.reflection_state` is exactly `"ready"`, and `data.memory_state` is either `"add_pending"` or `"replace_pending"`.
+Missing or unknown response nesting is failure:
+report only the safe error, do not call report-memory commands for that item,
+and continue with independent items.
 
 ## 3. Promote one report memory entry at a time
 
@@ -67,7 +69,8 @@ List report-memory metadata, bounded to 18:
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-pending --limit 18
 ```
 
-For each item, run exactly once:
+Inspect each listed item's `memory_state` before starting it. For
+`add_pending`, `replace_pending`, or `memory_call_started`, run exactly once:
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap begin-report-memory --session-id <session_id> --revision <revision>
@@ -77,11 +80,14 @@ Inspect only its returned `memory_state`, `action`, `content`, and (for
 replacement) `old_text`:
 
 - For `add_pending`, `replace_pending`, or `memory_call_started`, call Hermes
-  built-in memory exactly once using the returned `action`, `content`, and
-  `old_text` fields. T+1 must be
+  `begin-report-memory` is idempotent and returns the same operation after a
+  restart. Call Hermes built-in memory exactly once using the returned `action`,
+  `content`, and `old_text` fields. T+1 must be
   `memory(action=add,target=memory,content=...)`. T+7 and T+15 must be
   `memory(action=replace,target=memory,old_text=<stable marker>,content=...)`.
-- For `verification_pending`, do not mutate Hermes memory. Call
+- For `verification_pending`, do not call `begin-report-memory` again and do not
+  mutate Hermes memory. This recovery state does not return `content` or `old_text`.
+  Call
   `confirm-report-memory --session-id <session_id> --revision <revision>`
   directly; this is crash recovery after the mutation and prevents a second
   Hermes mutation.

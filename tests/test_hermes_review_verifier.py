@@ -448,6 +448,102 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("恢复旧 v1 job", text)
         self.assertNotIn("SCHEDULED_REVIEW_RUNNER_FAILED", text)
 
+    def test_runbook_pauses_old_jobs_before_install_and_each_replacement_immediately(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        scheduled = text[text.index("## T+1/T+7/T+15") :]
+        self.assertIn('hermes cron pause "$old_process_job_id"', scheduled)
+        self.assertIn('hermes cron pause "$old_memory_job_id"', scheduled)
+        old_list = scheduled.index("hermes cron list --all")
+        old_process_pause = scheduled.index('hermes cron pause "$old_process_job_id"')
+        old_memory_pause = scheduled.index('hermes cron pause "$old_memory_job_id"')
+        install_wrapper = scheduled.index(
+            "install -m 700 deploy/hermes/scripts/tradingagents-scheduled-review-process.sh"
+        )
+        create_process = scheduled.index(
+            "hermes cron create --name tradingagents-scheduled-review-process"
+        )
+        pause_process = scheduled.index(
+            'hermes cron pause "$scheduled_review_process_job_id"'
+        )
+        create_memory = scheduled.index(
+            "hermes cron create --name tradingagents-scheduled-review-memory"
+        )
+        pause_memory = scheduled.index(
+            'hermes cron pause "$scheduled_review_memory_job_id"'
+        )
+
+        self.assertLess(old_list, old_process_pause)
+        self.assertLess(old_process_pause, old_memory_pause)
+        self.assertLess(old_memory_pause, install_wrapper)
+        self.assertLess(create_process, pause_process)
+        self.assertLess(pause_process, create_memory)
+        self.assertLess(create_memory, pause_memory)
+
+    def test_runbook_executes_all_v2_horizons_before_retiring_old_jobs(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        scheduled = text[text.index("## T+1/T+7/T+15") :]
+        self.assertIn(
+            'run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"',
+            scheduled,
+        )
+        self.assertIn("#### T+1 add acceptance", scheduled)
+        self.assertIn("#### T+7 replace acceptance", scheduled)
+        self.assertIn("#### T+15 replace acceptance", scheduled)
+        processor = scheduled.index(
+            'run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"'
+        )
+        t1 = scheduled.index("#### T+1 add acceptance")
+        t7 = scheduled.index("#### T+7 replace acceptance")
+        t15 = scheduled.index("#### T+15 replace acceptance")
+        retire = scheduled.index('hermes cron remove "$old_process_job_id"')
+
+        self.assertLess(processor, t1)
+        self.assertLess(t1, t7)
+        self.assertLess(t7, t15)
+        self.assertLess(t15, retire)
+        self.assertEqual(scheduled.count("process-due --current-utc-date <T+"), 3)
+        self.assertEqual(
+            scheduled.count(
+                'run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks'
+            ),
+            3,
+        )
+        for start, end in ((t1, t7), (t7, t15), (t15, retire)):
+            stage = scheduled[start:end]
+            self.assertIn("confirm-report-memory", stage)
+            self.assertIn("marker_occurrences: 1", stage)
+            self.assertIn("index_matches_latest_reflection: true", stage)
+
+    def test_scheduled_skill_requires_nested_mcp_success_and_state_aware_restart(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        memory_started = skill[
+            skill.index("- For `add_pending`") : skill.index("- For `verification_pending`")
+        ]
+        verification_pending = skill[
+            skill.index("- For `verification_pending`") : skill.index("For an add")
+        ]
+
+        self.assertIn("response `ok` is exactly `true`", skill)
+        self.assertIn('`data.reflection_state` is exactly `"ready"`', skill)
+        self.assertIn(
+            '`data.memory_state` is either `"add_pending"` or `"replace_pending"`',
+            skill,
+        )
+        self.assertIn("Missing or unknown response nesting is failure", skill)
+        self.assertIn("idempotent", memory_started)
+        self.assertIn("exactly once", memory_started)
+        self.assertIn("does not return `content` or `old_text`", verification_pending)
+        self.assertIn("do not call `begin-report-memory` again", verification_pending)
+        self.assertNotIn("memory(action=", verification_pending)
+        self.assertLess(
+            skill.index("memory-pending --limit 18"),
+            skill.index("report-reflection-pending --limit 18"),
+        )
+        self.assertLess(
+            skill.index("report-reflection-pending --limit 18"),
+            skill.index("report-memory-pending --limit 18"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
