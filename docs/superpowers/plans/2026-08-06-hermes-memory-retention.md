@@ -332,7 +332,7 @@ git commit -m "docs: deploy bounded Hermes report retention"
 - Modify: tests/test_hermes_report_memory.py
 - Modify: docs/superpowers/plans/2026-08-06-hermes-memory-retention.md only to mark completed checkboxes
 
-- [ ] **Step 1: Write the full lifecycle test**
+- [x] **Step 1: Write the full lifecycle test**
 
 ~~~
 def test_retention_keeps_active_reports_and_five_newest_completed_entries(self):
@@ -350,7 +350,7 @@ def test_retention_keeps_active_reports_and_five_newest_completed_entries(self):
 Also cover cross-symbol isolation, exact \n§\n delimiter semantics and count-only
 capacity output.
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
 
 ~~~
 /Users/xiashan/Site/0-ext/TradingAgents-crypto/.venv/bin/python -m unittest discover -s tests -p 'test_hermes*.py' -v
@@ -364,7 +364,7 @@ git status --short
 Expected: zero failures, no whitespace errors, no project-side memory writes, and
 only intended retention/version references.
 
-- [ ] **Step 3: Commit and request final review**
+- [x] **Step 3: Commit and request final review**
 
 ~~~
 git add tests/test_hermes_report_memory.py

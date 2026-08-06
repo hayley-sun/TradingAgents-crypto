@@ -133,6 +133,18 @@ class FakeHermesMemory:
                 return "Entry already exists"
             self.entries.append(content)
             return "Entry added"
+        if action == "remove":
+            if content is not None or old_text is None:
+                raise AssertionError("remove requires old text and no content")
+            matches = [
+                position
+                for position, entry in enumerate(self.entries)
+                if old_text in entry
+            ]
+            if len(matches) != 1:
+                raise AssertionError("remove marker must identify exactly one entry")
+            del self.entries[matches[0]]
+            return "Entry removed"
         if action != "replace" or old_text is None:
             raise AssertionError("replace requires old text")
         matches = [
@@ -412,6 +424,17 @@ class HermesReportMemoryTests(unittest.TestCase):
         self.assertEqual(result.configured_limit, 40000)
         self.assertEqual(result.reserved_report_chars, 30897)
         self.assertEqual(result.available_chars, 40000 - len("operator memory\n"))
+        self.assertEqual(
+            set(result.model_dump()),
+            {
+                "current_chars",
+                "configured_limit",
+                "reserved_report_chars",
+                "available_chars",
+                "ok",
+                "error_code",
+            },
+        )
         serialized = result.model_dump_json()
         self.assertNotIn("operator memory", serialized)
         self.assertNotIn(str(memory_path), serialized)
@@ -732,6 +755,204 @@ class HermesReportMemoryTests(unittest.TestCase):
 
 
 class HermesReportMemoryRetentionTests(unittest.TestCase):
+    def test_active_report_survives_retention_reconciliation_and_replacements(self):
+        with VersionTwoLifecycleHarness() as harness:
+            harness.archive_new_report()
+            retirement_store = ReportMemoryRetirementStore(
+                harness.root / "report_memory_retirements"
+            )
+
+            for horizon, return_pct, verdict, expected_action in (
+                (1, 1.2, "correct", "add"),
+                (7, -4.2, "incorrect", "replace"),
+                (15, 3.1, "correct", "replace"),
+            ):
+                harness.process_horizon(
+                    horizon, return_pct=return_pct, verdict=verdict
+                )
+                harness.reflect_and_promote(expected_action=expected_action)
+                self.assertEqual(
+                    list_pending_report_memory_retirements(
+                        retirement_store, harness.report_store
+                    ),
+                    [],
+                )
+
+            self.assertEqual(harness.memory_actions, ["add", "replace", "replace"])
+            self.assertEqual(harness.memory_marker_count(), 1)
+
+    def test_six_completed_reports_retire_oldest_only_and_preserve_project_artifacts(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            review_store = ReviewStore(root / "reviews")
+            index_store = LearningStore(root / "memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            records_by_symbol = {
+                "BTC": [
+                    confirmed_report_record(number, date(2026, 7, number))
+                    for number in range(1, 7)
+                ],
+                "ETH": [
+                    confirmed_report_record(
+                        number + 100, date(2026, 7, number), symbol="ETH"
+                    )
+                    for number in range(1, 7)
+                ],
+            }
+            records = [record for group in records_by_symbol.values() for record in group]
+            for record in records:
+                report_store.save(record)
+                index_store.upsert_report(record)
+                for outcome in record.outcomes:
+                    review_store.save(
+                        paper_review(outcome.horizon_days, verdict=outcome.verdict).model_copy(
+                            update={
+                                "review_id": outcome.review_id,
+                                "session_id": record.session_id,
+                                "symbol": record.symbol,
+                                "trade_date": record.trade_date,
+                                "review_date": outcome.review_date,
+                                "created_at": record.created_at,
+                            }
+                        )
+                    )
+
+            memory = FakeHermesMemory()
+            memory.entries = [
+                f"{REPORT_MEMORY_MARKER.format(session_id=record.session_id)}\n"
+                f"Completed {record.symbol} report {record.trade_date.isoformat()}"
+                for record in records
+            ]
+            memory_path = root / "MEMORY.md"
+            memory_path.write_text(memory.text, encoding="utf-8")
+            project_artifacts = {
+                "reports": {
+                    path: path.read_bytes()
+                    for path in report_store.root.glob("hermes_*.json")
+                },
+                "reviews": {
+                    path: path.read_bytes()
+                    for path in review_store.root.glob("review_*.json")
+                },
+                "indexes": {
+                    symbol: index_store.path_for(symbol).read_bytes()
+                    for symbol in records_by_symbol
+                },
+            }
+
+            pending = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )
+            self.assertEqual(
+                {item.symbol: item.session_id for item in pending},
+                {
+                    "BTC": records_by_symbol["BTC"][0].session_id,
+                    "ETH": records_by_symbol["ETH"][0].session_id,
+                },
+            )
+            btc_item = next(item for item in pending if item.symbol == "BTC")
+            operation = begin_report_memory_retirement(
+                retirement_store, btc_item.symbol, btc_item.session_id
+            )
+            self.assertEqual(
+                memory.apply("remove", None, operation.old_text), "Entry removed"
+            )
+            memory_path.write_text(memory.text, encoding="utf-8")
+            retired = confirm_report_memory_retirement(
+                retirement_store,
+                btc_item.symbol,
+                btc_item.session_id,
+                lambda session_id, marker: verify_report_memory_absence(
+                    session_id, marker, memory_path
+                ),
+            )
+
+            self.assertEqual(retired.state, "retired")
+            btc_markers = {
+                REPORT_MEMORY_MARKER.format(session_id=record.session_id)
+                for record in records_by_symbol["BTC"][1:]
+            }
+            self.assertEqual(
+                {
+                    entry.split("\n", 1)[0]
+                    for entry in memory.entries
+                    if entry.startswith("[TradingAgents paper report:")
+                    and "BTC" in entry
+                },
+                btc_markers,
+            )
+            self.assertEqual(
+                sum(
+                    REPORT_MEMORY_MARKER.format(session_id=record.session_id) in entry
+                    for entry in memory.entries
+                    for record in records_by_symbol["BTC"]
+                ),
+                5,
+            )
+            self.assertEqual(
+                sum(
+                    REPORT_MEMORY_MARKER.format(session_id=record.session_id) in entry
+                    for entry in memory.entries
+                    for record in records_by_symbol["ETH"]
+                ),
+                6,
+            )
+            remaining = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )
+            self.assertEqual(
+                [(item.symbol, item.session_id) for item in remaining],
+                [("ETH", records_by_symbol["ETH"][0].session_id)],
+            )
+            self.assertEqual(
+                {
+                    "reports": {
+                        path: path.read_bytes()
+                        for path in report_store.root.glob("hermes_*.json")
+                    },
+                    "reviews": {
+                        path: path.read_bytes()
+                        for path in review_store.root.glob("review_*.json")
+                    },
+                    "indexes": {
+                        symbol: index_store.path_for(symbol).read_bytes()
+                        for symbol in records_by_symbol
+                    },
+                },
+                project_artifacts,
+            )
+
+    def test_real_hermes_delimiter_keeps_ordinary_section_sign_inside_entry(self):
+        with TemporaryDirectory() as directory:
+            store = report_store_with_ready_revisions(directory, 1)
+            record = store.load(SESSION_ID)
+            self.assertIsNotNone(record)
+            marker = REPORT_MEMORY_MARKER.format(session_id=SESSION_ID)
+            entry = f"{marker}\nEvidence contains an ordinary § section sign."
+            snapshot = record.revisions[0].model_copy(
+                update={"hermes_memory_entry": entry}
+            )
+            record = record.model_copy(update={"revisions": [snapshot]})
+            store.save(record)
+            results = Path(directory)
+            LearningStore(results / "hermes" / "memories").upsert_report(record)
+            memory_path = results / "MEMORY.md"
+            memory_path.write_text(
+                ENTRY_DELIMITER.join([entry, "Unrelated § preference."]),
+                encoding="utf-8",
+            )
+
+            result = verify_report_memory_consistency(
+                SESSION_ID, 1, results, memory_path
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.marker_occurrences, 1)
+        self.assertEqual(result.exact_content_occurrences, 1)
+
     def test_retirement_lifecycle_removes_one_marker_and_confirms_absence(self):
         with TemporaryDirectory() as directory:
             root = Path(directory) / "results" / "hermes"
