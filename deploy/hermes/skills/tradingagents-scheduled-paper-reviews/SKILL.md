@@ -79,7 +79,7 @@ Inspect each listed item's `memory_state` before starting it. For
 Inspect only its returned `memory_state`, `action`, `content`, and (for
 replacement) `old_text`:
 
-- For `add_pending`, `replace_pending`, or `memory_call_started`, call Hermes
+- For `add_pending`, `replace_pending`, or `memory_call_started`,
   `begin-report-memory` is idempotent and returns the same operation after a
   restart. Call Hermes built-in memory exactly once using the returned `action`,
   `content`, and `old_text` fields. T+1 must be

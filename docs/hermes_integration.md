@@ -388,11 +388,10 @@ tool/injection 均 enabled，且工作树、结果目录和 Hermes 目录权限�
 
 ### 新 v2 验收与 T+ 检查
 
-使用部署后新创建且已归档的测试日期，不修改计划 JSON。确认每个 session 有三个
-review schedule 项，且新的 batch/report metadata 显示
-`scheduled_review_version: 2`。以下 helper 会临时 resume 指定 job，等待新 durable
-run 到达 completed/failed 后立即 pause；超时和 failed 都会返回非零。只读 verifier
-调用项目现有函数，不修改 Hermes memory，并且只输出安全字段：
+先定义验收 helper，此时不要创建或归档 v2 acceptance report。helper 会临时 resume
+指定 job，等待新 durable run 到达 completed/failed 后立即 pause；超时和 failed
+都会返回非零。只读 verifier 调用项目现有函数，不修改 Hermes memory，并且只输出
+安全字段：
 
 ```bash
 set -e
@@ -456,6 +455,56 @@ Cron path 可运行；helper 返回后该 job 必须重新处于 paused：
 ```bash
 run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"
 ```
+
+#### Create and archive v2 acceptance report
+
+processor smoke 完成并重新 paused 后，才创建一个结果目录中从未使用过的历史日期
+report batch。submit 创建三个异步 session；重复 archive 直到不再返回 active，随后
+用结构化 JSON 检查归档版本和九个尚未到期的 schedule 项。不要复用已有 batch/date，
+也不要在此时运行 scheduled review processor：
+
+```bash
+set -e
+ACCEPTANCE_TRADE_DATE='<unused-historical-YYYY-MM-DD>'
+test ! -e "/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches/$ACCEPTANCE_TRADE_DATE.json"
+test ! -e "/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/review_schedules/$ACCEPTANCE_TRADE_DATE.json"
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_daily_report_bootstrap submit --trade-date "$ACCEPTANCE_TRADE_DATE"
+
+archive_state=active
+for _ in $(seq 1 180); do
+  archive_output="$(/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_daily_report_bootstrap archive --trade-date "$ACCEPTANCE_TRADE_DATE")"
+  printf '%s\n' "$archive_output"
+  archive_state="$(printf '%s\n' "$archive_output" | /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -c 'import json, sys; print(json.load(sys.stdin).get("state", "archived"))')"
+  if [ "$archive_state" != "active" ]; then break; fi
+  sleep 10
+done
+test "$archive_state" != "active"
+
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python - "$ACCEPTANCE_TRADE_DATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path("/home/ubuntu/workspace/TradingAgents-crypto/results/hermes")
+trade_date = sys.argv[1]
+batch = json.loads((root / "report_batches" / f"{trade_date}.json").read_text(encoding="ascii"))
+schedule = json.loads((root / "review_schedules" / f"{trade_date}.json").read_text(encoding="ascii"))
+assert batch["archive"].get("scheduled_review_version") == 2
+assert schedule.get("workflow_version") == 2
+assert len(schedule["items"]) == 9
+assert all(item["state"] == "review_pending" for item in schedule["items"])
+print(json.dumps({
+    "scheduled_review_version": 2,
+    "workflow_version": 2,
+    "schedule_count": len(schedule["items"]),
+    "all_review_pending": True,
+}, sort_keys=True))
+PY
+```
+
+只有上述检查通过后，才用同一个 `ACCEPTANCE_TRADE_DATE` 计算并替换以下 T+1、T+7、
+T+15 日期占位值。这样三个显式 `process-due` 调用会依次创建 revision 1、2、3，而
+processor smoke 不可能提前消费 acceptance schedule。
 
 T+1 使用 add，后续 `T+7/T+15 replace` 同一稳定 marker。每个阶段都必须先运行
 processor，再运行 08:30 Agent，并从安全 pending 输出记录三个 session ID。Agent

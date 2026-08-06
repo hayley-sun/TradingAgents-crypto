@@ -514,6 +514,30 @@ class HermesReviewVerifierTests(unittest.TestCase):
             self.assertIn("marker_occurrences: 1", stage)
             self.assertIn("index_matches_latest_reflection: true", stage)
 
+    def test_runbook_smokes_processor_before_enrolling_acceptance_report(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        scheduled = text[text.index("## T+1/T+7/T+15") :]
+        smoke = scheduled.index(
+            'run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"'
+        )
+        self.assertIn("#### Create and archive v2 acceptance report", scheduled)
+        enrollment = scheduled.index("#### Create and archive v2 acceptance report")
+        submit = scheduled.index(
+            'hermes_daily_report_bootstrap submit --trade-date "$ACCEPTANCE_TRADE_DATE"'
+        )
+        archive = scheduled.index(
+            'hermes_daily_report_bootstrap archive --trade-date "$ACCEPTANCE_TRADE_DATE"'
+        )
+        t1 = scheduled.index("#### T+1 add acceptance")
+
+        self.assertLess(smoke, enrollment)
+        self.assertLess(enrollment, submit)
+        self.assertLess(submit, archive)
+        self.assertLess(archive, t1)
+        self.assertIn('scheduled_review_version") == 2', scheduled[archive:t1])
+        self.assertIn('workflow_version") == 2', scheduled[archive:t1])
+        self.assertIn('len(schedule["items"]) == 9', scheduled[archive:t1])
+
     def test_scheduled_skill_requires_nested_mcp_success_and_state_aware_restart(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
         memory_started = skill[
