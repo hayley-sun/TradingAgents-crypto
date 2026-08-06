@@ -5,7 +5,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
-from tradingagents.integrations.hermes_mcp import SessionStore
+from tradingagents.integrations.hermes_mcp import (
+    SessionStore,
+    archive_daily_report_impl,
+    review_paper_decision_impl,
+)
 from tradingagents.integrations.hermes_report_learning import (
     REPORT_MEMORY_MARKER,
     ReportLearningStore,
@@ -32,7 +36,6 @@ from tradingagents.integrations.schemas import (
     AnalysisResult,
     AnalysisSession,
     DailyReportRequest,
-    PaperDecisionReview,
     PriceReference,
     utc_now,
 )
@@ -113,6 +116,10 @@ class VersionTwoLifecycleHarness:
         self.index_store = LearningStore(self.root / "memories")
         self.memory = FakeHermesMemory()
         self.revision_progression: list[int] = []
+        self.archive_result: dict = {}
+        self.canonical_review_results: list[dict] = []
+        self._review_snapshots: dict[Path, bytes] = {}
+        self.review_immutability_checks = 0
 
         self.request = DailyReportRequest(
             trade_date=self.trade_date,
@@ -159,19 +166,24 @@ class VersionTwoLifecycleHarness:
         return self.memory.text
 
     def archive_new_report(self) -> None:
-        batch = self.batch_store.create_or_load(
+        self.batch_store.create_or_load(
             self.request, lambda _request: self.session_id
         )
-        self.batch_store.archive(
-            batch,
-            self.session_store.load,
+        self.archive_result = archive_daily_report_impl(
+            self.trade_date.isoformat(),
             "Lifecycle integration report.",
-            scheduled_review_version=2,
+            batch_store=self.batch_store,
+            session_store=self.session_store,
+            schedule_store=self.schedule_store,
         )
+        if self.archive_result.get("ok") is not True:
+            raise AssertionError("v2 report archive failed")
         archived = self.batch_store.load(self.trade_date)
         if archived is None or archived.archive is None:
             raise AssertionError("v2 report was not archived")
-        plan = self.schedule_store.create_or_load(archived)
+        plan = self.schedule_store.load(self.trade_date)
+        if plan is None:
+            raise AssertionError("v2 schedule was not enrolled")
         if plan.workflow_version != 2:
             raise AssertionError("v2 schedule was not enrolled")
 
@@ -190,29 +202,37 @@ class VersionTwoLifecycleHarness:
                 or workflow_version != 2
             ):
                 raise AssertionError("scheduled review identity changed")
-            review = PaperDecisionReview(
-                review_id=item.review_id,
-                session_id=session_id,
-                symbol="BTC",
-                trade_date=self.trade_date,
-                review_date=review_date,
-                horizon_days=horizon,
-                action="BUY",
-                entry_price=PriceReference(
-                    date=self.trade_date, usd_price=100.0, source="coinbase"
+            result = review_paper_decision_impl(
+                {
+                    "session_id": session_id,
+                    "review_date": review_date.isoformat(),
+                },
+                store=self.session_store,
+                review_store=self.review_store,
+                learning_store=self.index_store,
+                price_reference_resolver=lambda _symbol, trade_date, observed_date: (
+                    PriceReference(
+                        date=trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    PriceReference(
+                        date=observed_date,
+                        usd_price=100.0 * (1.0 + return_pct / 100.0),
+                        source="coinbase",
+                    ),
                 ),
-                review_price=PriceReference(
-                    date=review_date,
-                    usd_price=100.0 * (1.0 + return_pct / 100.0),
-                    source="coinbase",
-                ),
-                raw_return_pct=return_pct,
-                verdict=verdict,
-                created_at=utc_now(),
-                hermes_memory_entry=f"Legacy T+{horizon} lesson.",
+                current_date=review_date,
+                write_legacy_learning=False,
             )
-            self.review_store.save(review)
-            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+            if result.get("ok") is not True:
+                raise AssertionError("canonical paper review failed")
+            review = result["data"]["review"]
+            if (review["raw_return_pct"], review["verdict"]) != (
+                return_pct,
+                verdict,
+            ):
+                raise AssertionError("canonical paper review outcome changed")
+            self.canonical_review_results.append(result)
+            return result
 
         result = process_due_reviews(
             self.schedule_store,
@@ -224,6 +244,13 @@ class VersionTwoLifecycleHarness:
         )
         if (result.reviewed_count, result.report_fact_count) != (1, 1):
             raise AssertionError("v2 scheduled review did not record one fact")
+        for path, expected_bytes in self._review_snapshots.items():
+            if path.read_bytes() != expected_bytes:
+                raise AssertionError("persisted review was mutated")
+            self.review_immutability_checks += 1
+        for path in self.review_store_files():
+            if path not in self._review_snapshots:
+                self._review_snapshots[path] = path.read_bytes()
 
     def reflect_and_promote(self, *, expected_action: str) -> None:
         before = self.record()
@@ -284,6 +311,22 @@ class VersionTwoLifecycleHarness:
     def report_store_files(self) -> list[Path]:
         return sorted(self.report_store.root.glob("hermes_*.json"))
 
+    def persisted_review_outcomes(self) -> list[tuple[int, float, str]]:
+        reviews = [
+            self.review_store.load(path.stem) for path in self.review_store_files()
+        ]
+        return sorted(
+            (review.horizon_days, review.raw_return_pct, review.verdict)
+            for review in reviews
+            if review is not None
+        )
+
+    def report_outcomes(self) -> list[tuple[int, float, str]]:
+        return [
+            (outcome.horizon_days, outcome.raw_return_pct, outcome.verdict)
+            for outcome in self.record().outcomes
+        ]
+
     def index(self):
         index = self.index_store.load("BTC")
         if index is None:
@@ -330,6 +373,17 @@ class HermesReportMemoryTests(unittest.TestCase):
             self.assertEqual(len(harness.review_store_files()), 3)
             self.assertEqual(len(harness.report_store_files()), 1)
             self.assertEqual(len(harness.index().report_entries), 1)
+            self.assertTrue(harness.archive_result["ok"])
+            self.assertEqual(len(harness.canonical_review_results), 3)
+            self.assertEqual(
+                harness.persisted_review_outcomes(),
+                [(1, 1.2, "correct"), (7, -4.2, "incorrect"), (15, 3.1, "correct")],
+            )
+            self.assertEqual(
+                harness.report_outcomes(),
+                [(1, 1.2, "correct"), (7, -4.2, "incorrect"), (15, 3.1, "correct")],
+            )
+            self.assertEqual(harness.review_immutability_checks, 3)
             self.assertEqual(harness.revision_progression, [1, 2, 3])
             self.assertEqual(harness.memory_actions, ["add", "replace", "replace"])
             self.assertEqual(harness.record().desired_revision, 3)
