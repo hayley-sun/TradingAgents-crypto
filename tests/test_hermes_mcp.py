@@ -160,7 +160,7 @@ class HermesMcpTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
 
-    def test_invalid_reflection_schema_counts_domain_attempts_and_quarantines(self):
+    def test_attention_required_reflection_rejects_malformed_retry_without_write(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "hermes"
             session_store = SessionStore(root / "sessions")
@@ -206,15 +206,17 @@ class HermesMcpTests(unittest.TestCase):
                     hermes_memory_entry="Legacy paper lesson.",
                 ),
             )
-            invalid_reflection = self.valid_reflection_payload()
-            invalid_reflection.pop("decision_thesis")
+            unsafe_reflection = self.valid_reflection_payload()
+            unsafe_reflection["overall_assessment"] = (
+                "This outcome was guaranteed."
+            )
 
-            for attempt in range(1, 5):
+            for attempt in range(1, 4):
                 result = submit_report_reflection_impl(
                     {
                         "session_id": session.session_id,
                         "expected_revision": 1,
-                        "reflection": invalid_reflection,
+                        "reflection": unsafe_reflection,
                     },
                     session_store=session_store,
                     report_store=report_store,
@@ -224,16 +226,39 @@ class HermesMcpTests(unittest.TestCase):
 
                 self.assertFalse(result["ok"])
                 self.assertEqual(
-                    result["error"]["code"], "INVALID_REPORT_REFLECTION"
+                    result["error"]["code"], "REFLECTION_UNSAFE_CONTENT"
                 )
-                self.assertEqual(snapshot.reflection_attempt_count, min(attempt, 3))
+                self.assertEqual(snapshot.reflection_attempt_count, attempt)
                 self.assertEqual(
                     snapshot.reflection_state,
-                    "attention_required" if attempt >= 3 else "pending",
+                    "attention_required" if attempt == 3 else "pending",
                 )
                 self.assertEqual(
-                    snapshot.last_error_code, "REFLECTION_SCHEMA_INVALID"
+                    snapshot.last_error_code, "REFLECTION_UNSAFE_CONTENT"
                 )
+
+            record_path = report_store.path_for(session.session_id)
+            quarantined_bytes = record_path.read_bytes()
+            quarantined_snapshot = report_store.load(session.session_id).revisions[0]
+            malformed_reflection = self.valid_reflection_payload()
+            malformed_reflection.pop("decision_thesis")
+
+            retry = submit_report_reflection_impl(
+                {
+                    "session_id": session.session_id,
+                    "expected_revision": 1,
+                    "reflection": malformed_reflection,
+                },
+                session_store=session_store,
+                report_store=report_store,
+                learning_store=learning_store,
+            )
+            retried_snapshot = report_store.load(session.session_id).revisions[0]
+
+            self.assertFalse(retry["ok"])
+            self.assertEqual(retry["error"]["code"], "REPORT_REFLECTION_STALE")
+            self.assertEqual(record_path.read_bytes(), quarantined_bytes)
+            self.assertEqual(retried_snapshot, quarantined_snapshot)
 
     def make_request(self):
         return AnalysisRequest(

@@ -430,14 +430,20 @@ _REAL_ORDER_PATTERNS = (
 )
 _UNTRUSTED_INSTRUCTION_PATTERN = re.compile(
     r"\b(?:ignore|disregard|override|forget)\s+(?:all\s+)?"
-    r"(?:previous|prior|above|system|developer)\s+"
+    r"(?:previous|prior|earlier|above|below|current|system|developer)\s+"
     r"(?:instructions?|prompts?|messages?)\b",
     re.IGNORECASE,
 )
 _CREDENTIAL_PATTERNS = (
     re.compile(
-        r"\b(?:api[_ -]?key|access[_ -]?token|secret|password)\s*"
+        r"\b(?:api[_ -]?key|access[_ -]?token|secret|password|"
+        r"private[_ -]?key)\s*"
         r"(?:is\s+|[:=]\s*)\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:[A-Z0-9]+_)*(?:API_KEY|SECRET(?:_ACCESS)?_KEY|SECRET|"
+        r"ACCESS_TOKEN|TOKEN|PASSWORD|PRIVATE_KEY)\s*(?:is\s+|[:=]\s*)\S+",
         re.IGNORECASE,
     ),
     re.compile(
@@ -461,7 +467,20 @@ _UNSUPPORTED_SOURCE_PATTERNS = (
         r"\b(?:search(?:ed|ing)?|brows(?:e|ed|ing))\s+(?:the\s+)?web\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:google|bing|duckduckgo|web|internet)\s+"
+        r"(?:search|brows(?:e|ed|ing)|lookup)\b.{0,48}"
+        r"\b(?:after\s+(?:the\s+)?decision|later|subsequent|post[- ]decision)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:after\s+(?:the\s+)?decision|later|subsequent|post[- ]decision)\b"
+        r".{0,48}\b(?:google|bing|duckduckgo|web|internet)\s+"
+        r"(?:search|brows(?:e|ed|ing)|lookup)\b",
+        re.IGNORECASE,
+    ),
 )
+_HERMES_ENTRY_DELIMITER_PATTERN = re.compile(r"(?:\r?\n)[ \t]*§[ \t]*(?:\r?\n)")
 
 
 def _reflection_text_values(value) -> Iterator[str]:
@@ -477,7 +496,7 @@ def _reflection_text_values(value) -> Iterator[str]:
 
 def _is_unsafe_reflection_text(text: str) -> bool:
     return (
-        "§" in text
+        _HERMES_ENTRY_DELIMITER_PATTERN.search(text) is not None
         or _UNTRUSTED_INSTRUCTION_PATTERN.search(text) is not None
         or any(pattern.search(text) is not None for pattern in _CREDENTIAL_PATTERNS)
         or any(
@@ -809,7 +828,7 @@ def submit_report_reflection(
                 raise ReportLearningConflict(
                     "report learning revision is not the next pending snapshot"
                 )
-            if snapshot.reflection_state not in {"pending", "attention_required"}:
+            if snapshot.reflection_state != "pending":
                 raise ReportLearningConflict(
                     "report learning revision is not the next pending snapshot"
                 )
@@ -825,10 +844,6 @@ def submit_report_reflection(
                     rejected,
                 )
                 raise rejected from validation_error
-            if snapshot.reflection_state != "pending":
-                raise ReportLearningConflict(
-                    "report learning revision is not the next pending snapshot"
-                )
             packet = build_evidence_packet(current, session, expected_revision)
             outcomes_by_id = {
                 outcome.review_id: outcome for outcome in current.outcomes
