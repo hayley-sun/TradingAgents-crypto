@@ -1,11 +1,17 @@
 import json
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from tradingagents.integrations.hermes_learning import LearningStore
-from tradingagents.integrations.hermes_report_learning import ReportLearningStore
+from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
+from tradingagents.integrations.hermes_mcp import SessionStore
+from tradingagents.integrations.hermes_report_learning import (
+    REPORT_MEMORY_MARKER,
+    ReportLearningStore,
+    record_review_fact,
+    submit_report_reflection,
+)
 from tradingagents.integrations.hermes_report_memory import (
     MEMORY_ERROR_CODES,
     begin_report_memory,
@@ -13,10 +19,22 @@ from tradingagents.integrations.hermes_report_memory import (
     list_pending_report_memory,
     quarantine_report_memory,
 )
-from tradingagents.integrations.hermes_report_learning import REPORT_MEMORY_MARKER
+from tradingagents.integrations.hermes_reports import ReportBatchStore
+from tradingagents.integrations.hermes_scheduled_reviews import (
+    ScheduledReviewStore,
+    process_due_reviews,
+)
 from tradingagents.integrations import hermes_scheduled_review_runner as runner
 from tradingagents.integrations.hermes_report_memory_verifier import (
     verify_report_memory_consistency,
+)
+from tradingagents.integrations.schemas import (
+    AnalysisResult,
+    AnalysisSession,
+    DailyReportRequest,
+    PaperDecisionReview,
+    PriceReference,
+    utc_now,
 )
 from tests.test_hermes_report_learning import (
     completed_session,
@@ -48,7 +66,278 @@ def report_store_with_ready_revisions(directory: str, *horizons: int):
     return report_store
 
 
+class FakeHermesMemory:
+    """In-memory model of Hermes exact add and marker-based replace semantics."""
+
+    def __init__(self):
+        self.entries: list[str] = []
+        self.actions: list[str] = []
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(self.entries)
+
+    def apply(self, action: str, content: str, old_text: str | None) -> str:
+        self.actions.append(action)
+        if action == "add":
+            if old_text is not None:
+                raise AssertionError("add must not have old text")
+            if content in self.entries:
+                return "Entry already exists"
+            self.entries.append(content)
+            return "Entry added"
+        if action != "replace" or old_text is None:
+            raise AssertionError("replace requires old text")
+        matches = [
+            position
+            for position, entry in enumerate(self.entries)
+            if old_text in entry
+        ]
+        if len(matches) != 1:
+            raise AssertionError("replace marker must identify exactly one entry")
+        self.entries[matches[0]] = content
+        return "Entry replaced"
+
+
+class VersionTwoLifecycleHarness:
+    def __init__(self):
+        self._temporary_directory = TemporaryDirectory()
+        self.root = Path(self._temporary_directory.name) / "results" / "hermes"
+        self.trade_date = date(2026, 7, 1)
+        self.session_id = SESSION_ID
+        self.batch_store = ReportBatchStore(self.root / "report_batches")
+        self.session_store = SessionStore(self.root / "sessions")
+        self.schedule_store = ScheduledReviewStore(self.root / "review_schedules")
+        self.review_store = ReviewStore(self.root / "reviews")
+        self.report_store = ReportLearningStore(self.root / "report_memories")
+        self.index_store = LearningStore(self.root / "memories")
+        self.memory = FakeHermesMemory()
+        self.revision_progression: list[int] = []
+
+        self.request = DailyReportRequest(
+            trade_date=self.trade_date,
+            symbols=["BTC"],
+            analysts=["market", "news", "fundamentals"],
+            research_depth=1,
+            llm_provider="deepseek",
+            quick_model="deepseek-v4-flash",
+            deep_model="deepseek-v4-pro",
+        )
+        self.session = AnalysisSession(
+            session_id=self.session_id,
+            status="completed",
+            created_at=utc_now(),
+            completed_at=utc_now(),
+            request=self.request.for_symbol("BTC"),
+            result=AnalysisResult(
+                reports={
+                    "market": "BTC held archived support after confirmation.",
+                    "sentiment": "Sentiment was constructive but mixed.",
+                    "news": "News was context rather than an entry trigger.",
+                    "fundamentals": "Fundamentals did not contradict the thesis.",
+                },
+                investment_plan="Buy only after confirmation.",
+                trader_investment_plan="Use a paper position with an invalidation level.",
+                final_trade_decision="FINAL TRANSACTION PROPOSAL: **BUY**",
+                processed_signal="BUY",
+            ),
+        )
+        self.session_store.save(self.session)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self._temporary_directory.cleanup()
+
+    @property
+    def memory_actions(self) -> list[str]:
+        return self.memory.actions
+
+    @property
+    def memory_text(self) -> str:
+        return self.memory.text
+
+    def archive_new_report(self) -> None:
+        batch = self.batch_store.create_or_load(
+            self.request, lambda _request: self.session_id
+        )
+        self.batch_store.archive(
+            batch,
+            self.session_store.load,
+            "Lifecycle integration report.",
+            scheduled_review_version=2,
+        )
+        archived = self.batch_store.load(self.trade_date)
+        if archived is None or archived.archive is None:
+            raise AssertionError("v2 report was not archived")
+        plan = self.schedule_store.create_or_load(archived)
+        if plan.workflow_version != 2:
+            raise AssertionError("v2 schedule was not enrolled")
+
+    def process_horizon(
+        self, horizon: int, *, return_pct: float, verdict: str
+    ) -> None:
+        plan = self.schedule_store.load(self.trade_date)
+        if plan is None:
+            raise AssertionError("scheduled review plan is unavailable")
+        item = next(item for item in plan.items if item.horizon_days == horizon)
+
+        def reviewer(session_id: str, review_date: date, workflow_version: int):
+            if (
+                session_id != self.session_id
+                or review_date != item.review_date
+                or workflow_version != 2
+            ):
+                raise AssertionError("scheduled review identity changed")
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=session_id,
+                symbol="BTC",
+                trade_date=self.trade_date,
+                review_date=review_date,
+                horizon_days=horizon,
+                action="BUY",
+                entry_price=PriceReference(
+                    date=self.trade_date, usd_price=100.0, source="coinbase"
+                ),
+                review_price=PriceReference(
+                    date=review_date,
+                    usd_price=100.0 * (1.0 + return_pct / 100.0),
+                    source="coinbase",
+                ),
+                raw_return_pct=return_pct,
+                verdict=verdict,
+                created_at=utc_now(),
+                hermes_memory_entry=f"Legacy T+{horizon} lesson.",
+            )
+            self.review_store.save(review)
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        result = process_due_reviews(
+            self.schedule_store,
+            item.review_date + timedelta(days=1),
+            reviewer,
+            fact_recorder=lambda review: record_review_fact(
+                self.report_store, self.session_store.load(self.session_id), review
+            ),
+        )
+        if (result.reviewed_count, result.report_fact_count) != (1, 1):
+            raise AssertionError("v2 scheduled review did not record one fact")
+
+    def reflect_and_promote(self, *, expected_action: str) -> None:
+        before = self.record()
+        revision = before.desired_revision
+        reflected = submit_report_reflection(
+            self.report_store,
+            self.index_store,
+            self.session_store.load(self.session_id),
+            revision,
+            valid_reflection_payload(
+                horizons=tuple(outcome.horizon_days for outcome in before.outcomes)
+            ),
+        )
+        operation = begin_report_memory(self.report_store, self.session_id, revision)
+        if operation.action != expected_action:
+            raise AssertionError("unexpected report memory action")
+        expected_old_text = (
+            None
+            if revision == 1
+            else REPORT_MEMORY_MARKER.format(session_id=self.session_id)
+        )
+        if operation.old_text != expected_old_text:
+            raise AssertionError("unexpected report memory replace marker")
+        self.memory.apply(operation.action, operation.content, operation.old_text)
+        confirmed = confirm_report_memory(
+            self.report_store,
+            self.session_id,
+            revision,
+            verifier=self._verify_memory,
+        )
+        if reflected.reflected_revision != revision:
+            raise AssertionError("reflection revision did not advance")
+        self.revision_progression.append(confirmed.confirmed_revision)
+
+    def _verify_memory(self, session_id: str, revision: int) -> bool:
+        record = self.report_store.load(session_id)
+        index = self.index_store.load("BTC")
+        if record is None or index is None:
+            return False
+        content = record.revisions[revision - 1].hermes_memory_entry
+        marker = REPORT_MEMORY_MARKER.format(session_id=session_id)
+        indexed = [
+            entry
+            for entry in index.report_entries
+            if entry.session_id == session_id
+            and entry.reflected_revision == revision
+        ]
+        return (
+            content is not None
+            and self.memory.entries.count(content) == 1
+            and self.memory.text.count(marker) == 1
+            and len(indexed) == 1
+        )
+
+    def review_store_files(self) -> list[Path]:
+        return sorted(self.review_store.root.glob("review_*.json"))
+
+    def report_store_files(self) -> list[Path]:
+        return sorted(self.report_store.root.glob("hermes_*.json"))
+
+    def index(self):
+        index = self.index_store.load("BTC")
+        if index is None:
+            raise AssertionError("symbol learning index is unavailable")
+        return index
+
+    def record(self):
+        record = self.report_store.load(self.session_id)
+        if record is None:
+            raise AssertionError("report learning record is unavailable")
+        return record
+
+    def latest_memory_entry(self) -> str:
+        record = self.record()
+        content = record.revisions[record.confirmed_revision - 1].hermes_memory_entry
+        if content is None:
+            raise AssertionError("confirmed report memory content is unavailable")
+        return content
+
+    def memory_marker_count(self) -> int:
+        marker = REPORT_MEMORY_MARKER.format(session_id=self.session_id)
+        return self.memory.text.count(marker)
+
+    def memory_entry_count_for_report(self) -> int:
+        marker = REPORT_MEMORY_MARKER.format(session_id=self.session_id)
+        return sum(marker in entry for entry in self.memory.entries)
+
+
 class HermesReportMemoryTests(unittest.TestCase):
+    def test_v2_report_lifecycle_keeps_one_project_and_memory_entry(self):
+        with VersionTwoLifecycleHarness() as harness:
+            harness.archive_new_report()
+
+            for horizon, return_pct, verdict, expected_action in (
+                (1, 1.2, "correct", "add"),
+                (7, -4.2, "incorrect", "replace"),
+                (15, 3.1, "correct", "replace"),
+            ):
+                harness.process_horizon(
+                    horizon, return_pct=return_pct, verdict=verdict
+                )
+                harness.reflect_and_promote(expected_action=expected_action)
+
+            self.assertEqual(len(harness.review_store_files()), 3)
+            self.assertEqual(len(harness.report_store_files()), 1)
+            self.assertEqual(len(harness.index().report_entries), 1)
+            self.assertEqual(harness.revision_progression, [1, 2, 3])
+            self.assertEqual(harness.memory_actions, ["add", "replace", "replace"])
+            self.assertEqual(harness.record().desired_revision, 3)
+            self.assertEqual(harness.record().confirmed_revision, 3)
+            self.assertEqual(harness.memory_marker_count(), 1)
+            self.assertEqual(harness.memory_entry_count_for_report(), 1)
+            self.assertEqual(harness.memory_text, harness.latest_memory_entry())
+
     def test_memory_queue_exposes_only_earliest_unconfirmed_revision(self):
         with TemporaryDirectory() as directory:
             store = report_store_with_ready_revisions(directory, 1, 7)
