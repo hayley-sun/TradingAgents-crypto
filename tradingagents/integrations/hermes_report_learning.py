@@ -436,16 +436,17 @@ _UNTRUSTED_INSTRUCTION_PATTERN = re.compile(
 )
 _CREDENTIAL_PATTERNS = (
     re.compile(
-        r"\b(?:api[_ -]?key|access[_ -]?token|secret|password|"
+        r"\b(?:api[_ -]?key|api[_ -]?token|access[_ -]?token|password|"
         r"private[_ -]?key)\s*"
         r"(?:is\s+|[:=]\s*)\S+",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:[A-Z0-9]+_)*(?:API_KEY|SECRET(?:_ACCESS)?_KEY|SECRET|"
+        r"\b(?:[A-Z0-9]+_)+(?:API_KEY|SECRET(?:_ACCESS)?_KEY|SECRET|"
         r"ACCESS_TOKEN|TOKEN|PASSWORD|PRIVATE_KEY)\s*(?:is\s+|[:=]\s*)\S+",
         re.IGNORECASE,
     ),
+    re.compile(r"\bSECRET\s*=\s*\S+"),
     re.compile(
         r"\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b",
         re.IGNORECASE,
