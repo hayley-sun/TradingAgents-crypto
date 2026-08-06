@@ -742,6 +742,7 @@ class HermesReportLearningTests(unittest.TestCase):
         self.assertIn("Maturity: T+7", rendered.lesson)
         self.assertIn("Archived market context:", rendered.lesson)
         self.assertIn("report.market", rendered.lesson)
+        self.assertIn("report.market", rendered.hermes_memory_entry)
 
     def test_renderer_preserves_actual_decision_time_market_context(self):
         record = report_learning_record(horizons=(7,))

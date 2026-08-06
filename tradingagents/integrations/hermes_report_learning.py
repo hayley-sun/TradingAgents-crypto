@@ -805,8 +805,7 @@ def _render_reflection(
         if value is not None
     ]
     market_context = reflection.technical_context or (
-        "Archived evidence fallback: report.market was captured at decision time; "
-        "no optional technical context was supplied."
+        "report.market archived at decision time; no optional technical context."
     )
     required_lines.insert(
         4,
