@@ -755,6 +755,141 @@ class HermesReportMemoryTests(unittest.TestCase):
 
 
 class HermesReportMemoryRetentionTests(unittest.TestCase):
+    def test_active_report_stays_pinned_while_completed_retirements_run(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            index_store = LearningStore(root / "memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            completed = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 7)
+            ]
+            active = report_learning_record(
+                session_number=900,
+                trade_date=date(2026, 7, 20),
+                horizons=(1, 7, 15),
+            )
+            active_marker = REPORT_MEMORY_MARKER.format(
+                session_id=active.session_id
+            )
+            active = active.model_copy(
+                update={
+                    "revisions": [
+                        revision.model_copy(
+                            update={
+                                "hermes_memory_entry": (
+                                    f"{active_marker}\n"
+                                    f"Active revision {revision.revision}"
+                                )
+                            }
+                        )
+                        for revision in active.revisions
+                    ]
+                }
+            )
+            for record in [*completed, active]:
+                report_store.save(record)
+                index_store.upsert_report(record)
+
+            memory = FakeHermesMemory()
+            memory.entries = [
+                f"{REPORT_MEMORY_MARKER.format(session_id=record.session_id)}\n"
+                f"Completed BTC report {record.trade_date.isoformat()}"
+                for record in completed
+            ]
+
+            completed_report_bytes = {
+                report_store.path_for(record.session_id): report_store.path_for(
+                    record.session_id
+                ).read_bytes()
+                for record in completed
+            }
+            btc_index_bytes = index_store.path_for("BTC").read_bytes()
+
+            first = begin_report_memory(report_store, active.session_id, 1)
+            self.assertEqual(first.action, "add")
+            self.assertEqual(
+                memory.apply(first.action, first.content, first.old_text),
+                "Entry added",
+            )
+            confirm_report_memory(
+                report_store, active.session_id, 1, verifier=lambda *_args: True
+            )
+
+            second = begin_report_memory(report_store, active.session_id, 2)
+            self.assertEqual(second.action, "replace")
+            self.assertEqual(second.old_text, active_marker)
+            self.assertEqual(
+                memory.apply(second.action, second.content, second.old_text),
+                "Entry replaced",
+            )
+            confirm_report_memory(
+                report_store, active.session_id, 2, verifier=lambda *_args: True
+            )
+
+            memory_path = root / "MEMORY.md"
+            memory_path.write_text(memory.text, encoding="utf-8")
+            pending = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )
+            oldest = next(item for item in pending if item.symbol == "BTC")
+            self.assertEqual(oldest.session_id, completed[0].session_id)
+            self.assertNotIn(active.session_id, {item.session_id for item in pending})
+            operation = begin_report_memory_retirement(
+                retirement_store, oldest.symbol, oldest.session_id
+            )
+            self.assertEqual(
+                memory.apply("remove", None, operation.old_text), "Entry removed"
+            )
+            memory_path.write_text(memory.text, encoding="utf-8")
+            self.assertEqual(
+                confirm_report_memory_retirement(
+                    retirement_store,
+                    oldest.symbol,
+                    oldest.session_id,
+                    lambda session_id, marker: verify_report_memory_absence(
+                        session_id, marker, memory_path
+                    ),
+                ).state,
+                "retired",
+            )
+            self.assertIn(active_marker, memory.text)
+
+            third = begin_report_memory(report_store, active.session_id, 3)
+            self.assertEqual(third.action, "replace")
+            self.assertEqual(third.old_text, active_marker)
+            self.assertEqual(
+                memory.apply(third.action, third.content, third.old_text),
+                "Entry replaced",
+            )
+            confirm_report_memory(
+                report_store, active.session_id, 3, verifier=lambda *_args: True
+            )
+            memory_path.write_text(memory.text, encoding="utf-8")
+            pending_after_t15 = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )
+            self.assertNotIn(
+                active.session_id, {item.session_id for item in pending_after_t15}
+            )
+            self.assertIn(active_marker, memory.text)
+            self.assertEqual(
+                report_store.load(active.session_id).confirmed_revision, 3
+            )
+            self.assertEqual(
+                {
+                    report_store.path_for(record.session_id): report_store.path_for(
+                        record.session_id
+                    ).read_bytes()
+                    for record in completed
+                },
+                completed_report_bytes,
+            )
+            self.assertEqual(index_store.path_for("BTC").read_bytes(), btc_index_bytes)
+
     def test_active_report_survives_retention_reconciliation_and_replacements(self):
         with VersionTwoLifecycleHarness() as harness:
             harness.archive_new_report()
@@ -926,6 +1061,7 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
             )
 
     def test_real_hermes_delimiter_keeps_ordinary_section_sign_inside_entry(self):
+        self.assertEqual(ENTRY_DELIMITER, "\n§\n")
         with TemporaryDirectory() as directory:
             store = report_store_with_ready_revisions(directory, 1)
             record = store.load(SESSION_ID)
