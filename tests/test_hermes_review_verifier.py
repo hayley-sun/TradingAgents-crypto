@@ -434,7 +434,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
 
     def test_scheduled_skill_separates_legacy_retry_from_report_quarantine(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
-        safe_summary = skill[skill.index("## 4. Safety and reporting") :]
+        safe_summary = skill[skill.index("## 5. Safety and reporting") :]
 
         self.assertIn("leave the item in `memory_pending`", skill)
         self.assertNotIn("quarantined by the project bootstrap", skill)
@@ -627,6 +627,62 @@ class HermesReviewVerifierTests(unittest.TestCase):
             skill.index("report-reflection-pending --limit 18"),
             skill.index("report-memory-pending --limit 18"),
         )
+
+    def test_scheduled_skill_uses_agent_owned_completed_report_retirement(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        self.assertIn("## 4. Retire bounded completed report memory", skill)
+        retirement = skill[skill.index("## 4. Retire bounded completed report memory") :]
+        verification_pending = retirement[
+            retirement.index("For `verification_pending`") : retirement.index(
+                "## 5. Safety and reporting"
+            )
+        ]
+        normalized_verification_pending = " ".join(verification_pending.split())
+
+        self.assertIn("report-memory-retirement-pending --limit 18", retirement)
+        self.assertIn("begin-report-memory-retirement", retirement)
+        self.assertIn(
+            "memory(action=remove,target=memory,old_text=<returned marker>)",
+            retirement,
+        )
+        self.assertIn("Entry removed", retirement)
+        self.assertIn("confirm-report-memory-retirement", retirement)
+        self.assertIn("quarantine-report-memory-retirement", retirement)
+        self.assertIn("MEMORY_RESULT_AMBIGUOUS", retirement)
+        self.assertIn("MEMORY_REMOVE_FAILED", retirement)
+        self.assertIn("MEMORY_VERIFICATION_FAILED", retirement)
+        self.assertIn("retries only confirmation", verification_pending)
+        self.assertIn(
+            "Do not call `begin-report-memory-retirement`",
+            normalized_verification_pending,
+        )
+        self.assertIn(
+            "do not call the Hermes memory remove tool again",
+            normalized_verification_pending,
+        )
+        self.assertNotIn("memory(action=read", skill)
+        self.assertLess(
+            skill.index("report-memory-pending --limit 18"),
+            skill.index("report-memory-retirement-pending --limit 18"),
+        )
+
+    def test_runbook_documents_bounded_report_memory_capacity_and_retention(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("memory:\n  memory_char_limit: 40000", text)
+        self.assertIn("report-memory-capacity", text)
+        self.assertIn("--memory-char-limit 40000", text)
+        self.assertIn("current_chars <= 9000", text)
+        self.assertIn("reserved_report_chars == 30897", text)
+        self.assertIn("safe/no-memory-text", text)
+        self.assertIn("T+15", text)
+        self.assertIn("never retired", text)
+        self.assertIn("latest 5 final completed reports per symbol", text)
+        self.assertIn("report records, immutable review, and learning index remain permanent", text)
+        self.assertIn("six completed reports for one symbol", text)
+        self.assertIn("only oldest final marker", text)
+        self.assertIn("attention_required", text)
+        self.assertNotIn("memory(action=read", text)
 
 
 if __name__ == "__main__":

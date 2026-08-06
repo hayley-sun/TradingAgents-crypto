@@ -84,6 +84,8 @@ hermes config edit
 在标准顶层 `mcp_servers` 映射中加入以下条目。每个占位值必须替换为真实密钥，或完全删除对应环境变量；不得将占位值当作凭据。
 
 ```yaml
+memory:
+  memory_char_limit: 40000
 mcp_servers:
   tradingagents_crypto:
     command: "/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python"
@@ -98,6 +100,10 @@ mcp_servers:
     timeout: 900
     connect_timeout: 60
 ```
+
+上述 `memory` 配置是部署值。它为 Hermes 内置 memory 的固定容量预留空间；项目
+脚本不会读取、编辑或写入 `MEMORY.md`，只有 Hermes Agent 的内置 memory tool 可以
+add、replace 或 remove 条目。
 
 仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用。
 
@@ -333,7 +339,7 @@ hermes cron list --all
 
 新版本归档的每个 BTC、ETH、SOL completed session 会注册 T+1、T+7、T+15 三个复盘项，计划保存在 `results/hermes/review_schedules/<trade_date>.json`。新归档必须带有 `scheduled_review_version: 2`；旧归档属于 `旧 v1`，保持原有 review 和 learning index 连续性，不会自动回填旧报告。T+N 表示精确 UTC 复盘价格日期，只有该日期完整结束（`review_date` 严格早于当前 UTC 日期）才会执行。
 
-复盘使用一个共享的确定性 processor 和一个 Hermes Agent job，时区均为 `Asia/Shanghai`：08:15 processor 同时处理 v1 legacy review 与 v2 report fact，更新 `results/hermes/reviews`、`results/hermes/memories/<SYMBOL>.json` 和 `results/hermes/report_memories/<session_id>.json`；该项目索引持久保留全部复盘索引项，后续分析仍只注入最近 5 条 lesson。processor 绝不读取或写入 Hermes 长期 memory。08:30 Agent job 只加载专用 skill，通过内置 memory tool 完成旧 v1 add 以及 v2 的 report-level add/replace；任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
+复盘使用一个共享的确定性 processor 和一个 Hermes Agent job，时区均为 `Asia/Shanghai`：08:15 processor 同时处理 v1 legacy review 与 v2 report fact，更新 `results/hermes/reviews`、`results/hermes/memories/<SYMBOL>.json` 和 `results/hermes/report_memories/<session_id>.json`；该项目索引持久保留全部复盘索引项，后续分析仍只注入最近 5 条 lesson。processor 绝不读取或写入 Hermes 长期 memory。08:30 Agent job 只加载专用 skill，通过内置 memory tool 完成旧 v1 add、v2 的 report-level add/replace，以及已完成报告的 bounded remove；任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
 
 ### 暂停旧任务、安装来源并创建替换任务
 
@@ -363,6 +369,42 @@ install -d -m 700 /home/ubuntu/.hermes/skills/tradingagents-scheduled-paper-revi
 install -m 600 deploy/hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.md /home/ubuntu/.hermes/skills/tradingagents-scheduled-paper-reviews/SKILL.md
 hermes memory status
 ```
+
+### Hermes memory 容量预检和保留规则
+
+在创建 replacement jobs 前，必须对 canonical Hermes memory path 运行仅计数的
+预检。该命令不输出 memory text；下面的 safe/no-memory-text 输出也只保留计数和
+安全状态。任何断言失败都不得创建或 resume replacement job：
+
+```bash
+set -e
+capacity_output="$(/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-capacity --hermes-memory-path /home/ubuntu/.hermes/memories/MEMORY.md --memory-char-limit 40000)"
+printf '%s\n' "$capacity_output" | /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+assert payload.get("ok") is True
+assert payload.get("configured_limit") == 40000
+assert payload.get("current_chars") <= 9000
+assert payload.get("reserved_report_chars") == 30897
+assert payload.get("error_code") is None
+print(json.dumps({
+    "current_chars": payload["current_chars"],
+    "reserved_report_chars": payload["reserved_report_chars"],
+    "available_chars": payload["available_chars"],
+}, sort_keys=True))
+'
+```
+
+固定部署只处理 BTC、ETH、SOL。每个币种最多预留 15 条 active/进行中报告和 5 条
+final completed 报告，共最多 60 条紧凑 Hermes entries；按每条 512 Unicode 字符和
+条目分隔符计算，`reserved_report_chars == 30897`。因此 `current_chars <= 9000` 是
+部署前提，二者与 `memory_char_limit: 40000` 一起留出安全余量。
+
+active/进行中 reports remain pinned until confirmed T+15 and are never retired。每个币种
+只在 T+15 已确认后保留 latest 5 final completed reports per symbol，较旧的已完成
+条目才会由 Agent 退休。完整项目资料不受 Hermes 容量淘汰影响：report records, immutable review, and learning index remain permanent and intact；它们不会被 remove、quarantine 或容量预检修改。
 
 Hermes 创建 Cron job 后默认 enabled，所以必须逐项创建和立即暂停。处理完第一项的
 create 输出、记录 ID 并 pause 后，才能创建第二项；两次 create/pause 之间不得执行
@@ -601,6 +643,38 @@ find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_memories 
 确认 Agent run 中每项 `confirm-report-memory` 成功，最终仍为
 `marker_occurrences: 1`、`exact_content_occurrences: 1` 和
 `index_matches_latest_reflection: true`，即每份报告 `只有一个 Hermes memory 条目`。
+
+#### Bounded Hermes memory retention acceptance
+
+在上面的 T+7 replace 验收中，三个报告仍处于 confirmed T+15 之前。每个
+`verify_report_memory_stage "$session_id" 2` 的 `marker_occurrences: 1` 结果证明 active
+report replacement survives；并且 retirement pending 的安全元数据不得列出这些进行中
+session。不得为了检查这一点读取、搜索或打印 Hermes memory 正文。
+
+随后对同一 symbol 完成六份彼此独立、已确认 T+15 的 v2 reports。第六份完成后，先
+只读取 bounded pending metadata，再运行一次 Agent job：
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id"
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+```
+
+第一个安全列表只能给出 six completed reports for one symbol 中最旧 final report 的
+metadata；Agent 只能对唯一的最旧 final marker（only oldest final marker）执行一次内置
+`memory(action=remove,target=memory,old_text=...)`，随后确认 retired。第二个列表不再
+包含该退休请求，其余五份 final reports 仍保留。不要从 begin 输出复制或打印 marker，
+不要使用 shell 修改任何 memory 文件。通过项目的只读 record/review/index 检查确认
+report records and index stay intact；所有六份 report learning records、immutable
+reviews 与学习索引都永久保留，即使最旧 Hermes entry 已退休。
+
+若 Agent remove 的结果不是 `Entry removed`、begin/confirm 返回意外安全状态，或确认
+落入 `attention_required`，只记录 symbol、session ID、state 和 allowlisted error code。
+skill 会安全 quarantine 该退休项；不要第二次 remove、不要读取原始 memory、不要删除
+records 或索引。保持 replacement jobs paused，使用安全状态和 journal 调查后，再按
+skill 的 `verification_pending` 仅确认恢复路径处理；active reports 和其他 symbols
+仍可继续各自独立的 promotion。
+
 任一阶段失败都保持新旧 jobs paused，保留 artifact 调查，不得进入下一阶段或移除旧
 jobs。验收输出只能包含 ID、symbol、revision、state、count 和安全错误码，不能包含
 evidence 或 memory 正文。

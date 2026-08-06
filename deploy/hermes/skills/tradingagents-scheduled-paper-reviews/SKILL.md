@@ -109,7 +109,63 @@ Do not call `quarantine-report-memory` after a confirmation failure, and never
 call a memory mutation again for that revision in the same run. Process later
 independent items.
 
-## 4. Safety and reporting
+## 4. Retire bounded completed report memory
+
+Run this step only after all report-memory promotions in section 3, including
+their direct `verification_pending` confirmations. Retirement is independent:
+an unavailable or quarantined retirement must not block active report
+replacements or later work for another symbol.
+
+List retirement metadata only, bounded to 18:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+```
+
+Accept only JSON with `ok: true` and `items`. If the list result is unexpected,
+report its safe error and continue the run; it contains no reliable item
+identity to quarantine. For each returned `pending` or `memory_call_started`
+item, begin the operation exactly once:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap begin-report-memory-retirement --symbol <symbol> --session-id <session_id>
+```
+
+Accept only `ok: true`, `action: "remove"`, `state: "memory_call_started"`,
+and the returned stable `old_text` marker. This is the only command that
+returns a marker. Do not print, summarize, repeat, or otherwise expose the
+marker. On any unexpected begin result, run the safe quarantine command with
+`MEMORY_RESULT_AMBIGUOUS`, report only its safe result, and continue later
+independent work:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap quarantine-report-memory-retirement --symbol <symbol> --session-id <session_id> --error-code MEMORY_RESULT_AMBIGUOUS
+```
+
+For a listed item with an unknown state, use the same command with
+`MEMORY_RESULT_AMBIGUOUS`; it has a safe identity but no valid protocol branch.
+For an accepted begin result, call the Hermes built-in tool exactly once:
+`memory(action=remove,target=memory,old_text=<returned marker>)`. Accept only
+the literal success `Entry removed`. For a missing, ambiguous, or any other
+remove result, quarantine with `MEMORY_REMOVE_FAILED`; do not call confirmation
+and do not issue another remove for that item in this run.
+
+For an accepted remove, call:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap confirm-report-memory-retirement --symbol <symbol> --session-id <session_id>
+```
+
+Accept only `ok: true` and `state: "retired"`. An unexpected confirmation
+result is quarantined with `MEMORY_VERIFICATION_FAILED`, without exposing a
+marker or memory text.
+
+For `verification_pending`, retries only confirmation with the same `symbol`
+and `session_id`. Do not call `begin-report-memory-retirement` and do not call
+the Hermes memory remove tool again. If that confirmation is not accepted,
+quarantine with `MEMORY_VERIFICATION_FAILED` and continue unrelated work.
+
+## 5. Safety and reporting
 
 Report only review/session IDs, symbols, revisions, states, counts, and
 allowlisted safe error codes. Never print packet fields, evidence excerpts,
