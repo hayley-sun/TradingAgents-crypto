@@ -15,6 +15,7 @@ from tradingagents.integrations.hermes_report_learning import (
     REPORT_MEMORY_MARKER,
     ReportLearningStore,
 )
+from tradingagents.integrations.schemas import is_valid_session_id
 
 
 ENTRY_DELIMITER = "\n§\n"
@@ -25,6 +26,14 @@ _CAPACITY_ERROR_CODES = frozenset(
         "MEMORY_LIMIT_INVALID",
         "MEMORY_LIMIT_TOO_SMALL",
         "MEMORY_CAPACITY_EXCEEDED",
+    }
+)
+_ABSENCE_ERROR_CODES = frozenset(
+    {
+        "MEMORY_MARKER_INVALID",
+        "MEMORY_PATH_UNREADABLE",
+        "MEMORY_MARKER_DUPLICATE",
+        "MEMORY_VERIFICATION_FAILED",
     }
 )
 
@@ -226,3 +235,66 @@ def verify_report_memory_consistency(
         index_exists,
         index_matches_latest_reflection,
     )
+
+
+@dataclass(frozen=True)
+class ReportMemoryAbsenceVerification:
+    """Safe, read-only result for a completed report marker removal."""
+
+    session_id: str
+    marker_occurrences: int
+    ok: bool
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error_code is not None and self.error_code not in _ABSENCE_ERROR_CODES:
+            raise ValueError("invalid memory absence error code")
+
+    @property
+    def memory_readable(self) -> bool:
+        return self.error_code != "MEMORY_PATH_UNREADABLE"
+
+    def model_dump(self) -> dict[str, int | bool | str | None]:
+        return {
+            "session_id": self.session_id,
+            "marker_occurrences": self.marker_occurrences,
+            "ok": self.ok,
+            "error_code": self.error_code,
+        }
+
+    def model_dump_json(self) -> str:
+        return json.dumps(self.model_dump(), ensure_ascii=True, sort_keys=True)
+
+
+def verify_report_memory_absence(
+    session_id: str,
+    marker: str,
+    memory_path: Path,
+) -> ReportMemoryAbsenceVerification:
+    """Verify that a stable report marker no longer exists in Hermes memory."""
+    if not is_valid_session_id(session_id) or not isinstance(marker, str) or not marker:
+        return ReportMemoryAbsenceVerification(
+            session_id if isinstance(session_id, str) else "",
+            0,
+            False,
+            "MEMORY_MARKER_INVALID",
+        )
+    if not isinstance(memory_path, (Path, str)):
+        return ReportMemoryAbsenceVerification(
+            session_id, 0, False, "MEMORY_PATH_UNREADABLE"
+        )
+    try:
+        memory_text = Path(memory_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError, TypeError, ValueError):
+        return ReportMemoryAbsenceVerification(
+            session_id, 0, False, "MEMORY_PATH_UNREADABLE"
+        )
+    occurrences = memory_text.count(marker)
+    if occurrences != 0:
+        return ReportMemoryAbsenceVerification(
+            session_id,
+            occurrences,
+            False,
+            "MEMORY_MARKER_DUPLICATE" if occurrences > 1 else "MEMORY_VERIFICATION_FAILED",
+        )
+    return ReportMemoryAbsenceVerification(session_id, 0, True)

@@ -9,8 +9,16 @@ from typing import Callable, Literal
 from tradingagents.integrations.hermes_report_learning import ReportLearningStore
 from tradingagents.integrations.hermes_report_memory_verifier import (
     verify_report_memory_consistency,
+    verify_report_memory_absence,
 )
-from tradingagents.integrations.schemas import ReportLearningRecord, ReportLearningRevision, utc_now
+from tradingagents.integrations.hermes_report_retention import ReportMemoryRetirementStore
+from tradingagents.integrations.schemas import (
+    ReportLearningRecord,
+    ReportLearningRevision,
+    ReportMemoryRetirement,
+    is_valid_session_id,
+    utc_now,
+)
 
 
 REPORT_MEMORY_MARKER = "[TradingAgents paper report: {session_id}]"
@@ -35,6 +43,16 @@ MEMORY_ERROR_CODES = frozenset(
         "MEMORY_PATH_UNREADABLE",
     }
 )
+RETIREMENT_MEMORY_ERROR_CODES = frozenset(
+    {
+        "MEMORY_MARKER_MISSING",
+        "MEMORY_MARKER_DUPLICATE",
+        "MEMORY_PATH_UNREADABLE",
+        "MEMORY_RESULT_AMBIGUOUS",
+        "MEMORY_REMOVE_FAILED",
+        "MEMORY_VERIFICATION_FAILED",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +70,22 @@ class ReportMemoryWork:
 class ReportMemoryOperation(ReportMemoryWork):
     content: str
     old_text: str | None
+
+
+@dataclass(frozen=True)
+class ReportMemoryRetirementWork:
+    session_id: str
+    symbol: str
+    trade_date: date
+    revision: Literal[3] = 3
+    maturity_days: int = 15
+    state: str = "pending"
+
+
+@dataclass(frozen=True)
+class ReportMemoryRetirementOperation(ReportMemoryRetirementWork):
+    action: Literal["remove"] = "remove"
+    old_text: str = ""
 
 
 def _work(record: ReportLearningRecord, revision: ReportLearningRevision) -> ReportMemoryWork:
@@ -283,3 +317,247 @@ def quarantine_report_memory(
 def _results_root() -> Path:
     configured = os.getenv("TRADINGAGENTS_RESULTS_DIR")
     return (Path(configured) if configured else Path(__file__).resolve().parents[2] / "results").expanduser().resolve()
+
+
+def _retirement_work(item: ReportMemoryRetirement) -> ReportMemoryRetirementWork:
+    return ReportMemoryRetirementWork(
+        session_id=item.session_id,
+        symbol=item.symbol,
+        trade_date=item.trade_date,
+        state=item.state,
+    )
+
+
+def _retirement_operation(item: ReportMemoryRetirement) -> ReportMemoryRetirementOperation:
+    work = _retirement_work(item)
+    return ReportMemoryRetirementOperation(
+        **work.__dict__,
+        old_text=item.marker,
+    )
+
+
+def list_pending_report_memory_retirements(
+    retirement_store: ReportMemoryRetirementStore,
+    report_store: ReportLearningStore,
+    limit: int = 18,
+) -> list[ReportMemoryRetirementWork]:
+    """Reconcile journals and list bounded, completed-report retirements."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 18:
+        raise ValueError("invalid report memory retirement limit")
+    records = report_store.records()
+    eligible = {
+        record.session_id: record
+        for record in records
+        if record.confirmed_revision == 3
+        and len(record.revisions) >= 3
+        and record.revisions[2].memory_state == "confirmed"
+    }
+    symbols = sorted({record.symbol for record in records})
+    for symbol in symbols:
+        retirement_store.sync_symbol(symbol, records)
+    pending: list[ReportMemoryRetirement] = []
+    for journal in retirement_store.journals():
+        for item in journal.items:
+            if item.state not in {
+                "pending",
+                "memory_call_started",
+                "verification_pending",
+            }:
+                continue
+            if item.session_id not in eligible:
+                continue
+            pending.append(item)
+    pending.sort(
+        key=lambda item: (
+            item.created_at,
+            item.trade_date,
+            item.symbol,
+            item.session_id,
+        )
+    )
+    return [_retirement_work(item) for item in pending[:limit]]
+
+
+def begin_report_memory_retirement(
+    store: ReportMemoryRetirementStore,
+    symbol: str,
+    session_id: str,
+) -> ReportMemoryRetirementOperation:
+    """Claim one retirement and return its persisted marker-only operation."""
+    if not is_valid_session_id(session_id):
+        raise ValueError("invalid report memory retirement session id")
+
+    def transition(journal):
+        if journal is None:
+            raise ValueError("report memory retirement journal unavailable")
+        matches = [item for item in journal.items if item.session_id == session_id]
+        if len(matches) != 1:
+            raise ValueError("report memory retirement item unavailable")
+        item = matches[0]
+        if item.state in {"memory_call_started", "verification_pending"}:
+            return journal
+        if item.state != "pending":
+            raise ValueError("report memory retirement item is not pending")
+        started = item.model_copy(update={"state": "memory_call_started", "updated_at": utc_now()})
+        return journal.model_copy(
+            update={
+                "items": [
+                    started if current.session_id == session_id else current
+                    for current in journal.items
+                ]
+            }
+        )
+
+    journal = store.update(symbol, transition)
+    item = next(item for item in journal.items if item.session_id == session_id)
+    return _retirement_operation(item)
+
+
+def confirm_report_memory_retirement(
+    store: ReportMemoryRetirementStore,
+    symbol: str,
+    session_id: str,
+    verifier: Callable[..., object] | None = None,
+) -> ReportMemoryRetirement:
+    """Verify marker absence and finalize one retirement without project mutations."""
+    if not is_valid_session_id(session_id):
+        raise ValueError("invalid report memory retirement session id")
+
+    def mark_verification_pending(journal):
+        if journal is None:
+            raise ValueError("report memory retirement journal unavailable")
+        matches = [item for item in journal.items if item.session_id == session_id]
+        if len(matches) != 1:
+            raise ValueError("report memory retirement item unavailable")
+        item = matches[0]
+        if item.state in {"verification_pending", "retired"}:
+            return journal
+        if item.state != "memory_call_started":
+            raise ValueError("report memory retirement operation was not started")
+        pending = item.model_copy(
+            update={"state": "verification_pending", "updated_at": utc_now()}
+        )
+        return journal.model_copy(
+            update={
+                "items": [
+                    pending if current.session_id == session_id else current
+                    for current in journal.items
+                ]
+            }
+        )
+
+    journal = store.update(symbol, mark_verification_pending)
+    item = next(item for item in journal.items if item.session_id == session_id)
+    if item.state == "retired":
+        return item
+
+    verification_ok = False
+    error_code = "MEMORY_VERIFICATION_FAILED"
+    try:
+        if verifier is None:
+            memory_path = Path.home() / ".hermes" / "memories" / "MEMORY.md"
+            result = verify_report_memory_absence(session_id, item.marker, memory_path)
+        else:
+            result = verifier(session_id, item.marker)
+        if isinstance(result, bool):
+            verification_ok = result
+        else:
+            verification_ok = (
+                getattr(result, "ok", False) is True
+                and getattr(result, "marker_occurrences", None) == 0
+            )
+            error_code = getattr(result, "error_code", error_code) or error_code
+            if not verification_ok and getattr(result, "marker_occurrences", 0) > 1:
+                error_code = "MEMORY_MARKER_DUPLICATE"
+    except Exception:
+        verification_ok = False
+
+    def finalize(journal):
+        if journal is None:
+            raise ValueError("report memory retirement journal unavailable")
+        current = next(
+            (entry for entry in journal.items if entry.session_id == session_id), None
+        )
+        if current is None:
+            raise ValueError("report memory retirement item unavailable")
+        if current.state == "retired":
+            return journal
+        if current.state != "verification_pending":
+            raise ValueError("report memory retirement confirmation is stale")
+        if verification_ok:
+            replacement = current.model_copy(
+                update={
+                    "state": "retired",
+                    "retired_at": utc_now(),
+                    "updated_at": utc_now(),
+                    "last_error_code": None,
+                }
+            )
+        else:
+            replacement = current.model_copy(
+                update={
+                    "state": "attention_required",
+                    "last_error_code": (
+                        error_code
+                        if error_code in RETIREMENT_MEMORY_ERROR_CODES
+                        else "MEMORY_VERIFICATION_FAILED"
+                    ),
+                    "updated_at": utc_now(),
+                }
+            )
+        return journal.model_copy(
+            update={
+                "items": [
+                    replacement if entry.session_id == session_id else entry
+                    for entry in journal.items
+                ]
+            }
+        )
+
+    final = store.update(symbol, finalize)
+    result = next(item for item in final.items if item.session_id == session_id)
+    return result
+
+
+def quarantine_report_memory_retirement(
+    store: ReportMemoryRetirementStore,
+    symbol: str,
+    session_id: str,
+    error_code: str,
+) -> ReportMemoryRetirement:
+    """Persist an allowlisted retirement failure without changing project artifacts."""
+    if not is_valid_session_id(session_id):
+        raise ValueError("invalid report memory retirement session id")
+    if error_code not in RETIREMENT_MEMORY_ERROR_CODES:
+        raise ValueError("invalid report memory retirement error code")
+
+    def transition(journal):
+        if journal is None:
+            raise ValueError("report memory retirement journal unavailable")
+        item = next(
+            (entry for entry in journal.items if entry.session_id == session_id), None
+        )
+        if item is None:
+            raise ValueError("report memory retirement item unavailable")
+        if item.state == "attention_required" and item.last_error_code == error_code:
+            return journal
+        if item.state == "retired":
+            raise ValueError("retired report memory cannot be quarantined")
+        replacement = item.model_copy(
+            update={
+                "state": "attention_required",
+                "last_error_code": error_code,
+                "updated_at": utc_now(),
+            }
+        )
+        return journal.model_copy(
+            update={
+                "items": [
+                    replacement if entry.session_id == session_id else entry
+                    for entry in journal.items
+                ]
+            }
+        )
+
+    journal = store.update(symbol, transition)
+    return next(item for item in journal.items if item.session_id == session_id)

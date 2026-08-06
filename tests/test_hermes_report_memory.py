@@ -21,8 +21,12 @@ from tradingagents.integrations.hermes_report_memory import (
     MEMORY_ERROR_CODES,
     begin_report_memory,
     confirm_report_memory,
+    begin_report_memory_retirement,
+    confirm_report_memory_retirement,
+    list_pending_report_memory_retirements,
     list_pending_report_memory,
     quarantine_report_memory,
+    quarantine_report_memory_retirement,
 )
 from tradingagents.integrations.hermes_report_retention import (
     ReportMemoryRetirementError,
@@ -38,6 +42,7 @@ from tradingagents.integrations.hermes_report_memory_verifier import (
     ENTRY_DELIMITER,
     verify_report_memory_capacity,
     verify_report_memory_consistency,
+    verify_report_memory_absence,
 )
 from tradingagents.integrations.schemas import (
     AnalysisResult,
@@ -727,6 +732,83 @@ class HermesReportMemoryTests(unittest.TestCase):
 
 
 class HermesReportMemoryRetentionTests(unittest.TestCase):
+    def test_retirement_lifecycle_removes_one_marker_and_confirms_absence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            completed = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            for record in completed:
+                report_store.save(record)
+
+            pending = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )
+            self.assertEqual(len(pending), 2)
+            item = pending[0]
+            operation = begin_report_memory_retirement(
+                retirement_store, item.symbol, item.session_id
+            )
+            self.assertEqual(operation.action, "remove")
+            self.assertEqual(
+                operation.old_text,
+                f"[TradingAgents paper report: {item.session_id}]",
+            )
+
+            memory_path = root / "MEMORY.md"
+            memory_path.write_text(
+                f"other{ENTRY_DELIMITER}[TradingAgents paper report: {item.session_id}]\nlesson",
+                encoding="utf-8",
+            )
+            memory_path.write_text("other", encoding="utf-8")
+            result = confirm_report_memory_retirement(
+                retirement_store,
+                item.symbol,
+                item.session_id,
+                lambda _session_id, marker: verify_report_memory_absence(
+                    _session_id, marker, memory_path
+                ),
+            )
+            self.assertEqual(result.state, "retired")
+
+    def test_retirement_verification_pending_retry_does_not_mutate_memory(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            for record in records:
+                report_store.save(record)
+            item = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )[0]
+            begin_report_memory_retirement(retirement_store, "BTC", item.session_id)
+            calls = []
+
+            def failing_verifier(*args):
+                calls.append(args)
+                return False
+
+            first = confirm_report_memory_retirement(
+                retirement_store, "BTC", item.session_id, failing_verifier
+            )
+            self.assertEqual(first.state, "attention_required")
+            with self.assertRaises(ValueError):
+                confirm_report_memory_retirement(
+                    retirement_store, "BTC", item.session_id, failing_verifier
+                )
+            self.assertEqual(len(calls), 1)
+
     def test_sync_selects_only_oldest_completed_reports_beyond_five(self):
         with TemporaryDirectory() as directory:
             root = Path(directory) / "results" / "hermes"
