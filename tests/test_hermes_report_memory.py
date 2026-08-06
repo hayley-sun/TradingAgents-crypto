@@ -809,6 +809,38 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                 )
             self.assertEqual(len(calls), 1)
 
+    def test_retirement_rejects_non_integer_zero_like_marker_counts(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            for record in records:
+                report_store.save(record)
+
+            class UnsafeZeroLikeResult:
+                ok = True
+                marker_occurrences = False
+
+            item = list_pending_report_memory_retirements(
+                retirement_store, report_store
+            )[0]
+            begin_report_memory_retirement(retirement_store, "BTC", item.session_id)
+            result = confirm_report_memory_retirement(
+                retirement_store,
+                "BTC",
+                item.session_id,
+                lambda *_: UnsafeZeroLikeResult(),
+            )
+
+            self.assertEqual(result.state, "attention_required")
+            self.assertIsNone(result.retired_at)
+
     def test_sync_selects_only_oldest_completed_reports_beyond_five(self):
         with TemporaryDirectory() as directory:
             root = Path(directory) / "results" / "hermes"

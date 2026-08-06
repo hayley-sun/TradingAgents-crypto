@@ -462,12 +462,20 @@ def confirm_report_memory_retirement(
         if isinstance(result, bool):
             verification_ok = result
         else:
+            marker_occurrences = getattr(result, "marker_occurrences", None)
             verification_ok = (
                 getattr(result, "ok", False) is True
-                and getattr(result, "marker_occurrences", None) == 0
+                and isinstance(marker_occurrences, int)
+                and not isinstance(marker_occurrences, bool)
+                and marker_occurrences == 0
             )
             error_code = getattr(result, "error_code", error_code) or error_code
-            if not verification_ok and getattr(result, "marker_occurrences", 0) > 1:
+            if (
+                not verification_ok
+                and isinstance(marker_occurrences, int)
+                and not isinstance(marker_occurrences, bool)
+                and marker_occurrences > 1
+            ):
                 error_code = "MEMORY_MARKER_DUPLICATE"
     except Exception:
         verification_ok = False
