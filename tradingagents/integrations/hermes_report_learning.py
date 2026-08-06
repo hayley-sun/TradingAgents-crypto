@@ -446,7 +446,11 @@ _CREDENTIAL_PATTERNS = (
         r"ACCESS_TOKEN|TOKEN|PASSWORD|PRIVATE_KEY)\s*(?:is\s+|[:=]\s*)\S+",
         re.IGNORECASE,
     ),
-    re.compile(r"\bSECRET\s*=\s*\S+"),
+    re.compile(r"\bSECRET\s*=\s*\S+", re.IGNORECASE),
+    re.compile(
+        r"\bauthorization\s*:\s*bearer\s+\S+",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b",
         re.IGNORECASE,
