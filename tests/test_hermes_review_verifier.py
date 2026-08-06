@@ -538,6 +538,29 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn('workflow_version") == 2', scheduled[archive:t1])
         self.assertIn('len(schedule["items"]) == 9', scheduled[archive:t1])
 
+    def test_runbook_guards_acceptance_date_before_submit(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        scheduled = text[text.index("#### Create and archive v2 acceptance report") :]
+        self.assertIn("validate_acceptance_trade_date()", scheduled)
+        definition = scheduled.index("validate_acceptance_trade_date()")
+        invocation = scheduled.index(
+            'validate_acceptance_trade_date "$ACCEPTANCE_TRADE_DATE"'
+        )
+        submit = scheduled.index(
+            'hermes_daily_report_bootstrap submit --trade-date "$ACCEPTANCE_TRADE_DATE"'
+        )
+        guard = scheduled[definition:invocation]
+
+        self.assertLess(definition, invocation)
+        self.assertLess(invocation, submit)
+        self.assertIn("date.fromisoformat", guard)
+        self.assertIn("parsed.isoformat() != value", guard)
+        self.assertIn("datetime.now(timezone.utc).date()", guard)
+        self.assertIn("timedelta(days=16)", guard)
+        self.assertIn('root / "report_batches"', guard)
+        self.assertIn("batch_path.exists()", guard)
+        self.assertIn("raise SystemExit", guard)
+
     def test_scheduled_skill_requires_nested_mcp_success_and_state_aware_restart(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
         memory_started = skill[

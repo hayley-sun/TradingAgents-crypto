@@ -461,13 +461,42 @@ run_scheduled_job_once_and_pause "$scheduled_review_process_job_id"
 processor smoke 完成并重新 paused 后，才创建一个结果目录中从未使用过的历史日期
 report batch。submit 创建三个异步 session；重复 archive 直到不再返回 active，随后
 用结构化 JSON 检查归档版本和九个尚未到期的 schedule 项。不要复用已有 batch/date，
-也不要在此时运行 scheduled review processor：
+且所选 trade date 必须至少早于当前 UTC 日期 16 天，保证 T+15 已完整结束。以下
+guard 在 submit 前检查全部条件，失败时明确返回非零；不要在此时运行 scheduled
+review processor：
 
 ```bash
 set -e
 ACCEPTANCE_TRADE_DATE='<unused-historical-YYYY-MM-DD>'
-test ! -e "/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/report_batches/$ACCEPTANCE_TRADE_DATE.json"
-test ! -e "/home/ubuntu/workspace/TradingAgents-crypto/results/hermes/review_schedules/$ACCEPTANCE_TRADE_DATE.json"
+validate_acceptance_trade_date() {
+  /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python - "$1" <<'PY'
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+value = sys.argv[1]
+try:
+    parsed = date.fromisoformat(value)
+except ValueError as error:
+    raise SystemExit("ACCEPTANCE_TRADE_DATE must be an ISO YYYY-MM-DD date") from error
+if parsed.isoformat() != value:
+    raise SystemExit("ACCEPTANCE_TRADE_DATE must use canonical ISO YYYY-MM-DD form")
+
+today = datetime.now(timezone.utc).date()
+if parsed > today - timedelta(days=16):
+    raise SystemExit("ACCEPTANCE_TRADE_DATE must have a fully elapsed T+15 UTC date")
+
+root = Path("/home/ubuntu/workspace/TradingAgents-crypto/results/hermes")
+batch_path = root / "report_batches" / f"{value}.json"
+schedule_path = root / "review_schedules" / f"{value}.json"
+if batch_path.exists():
+    raise SystemExit("ACCEPTANCE_TRADE_DATE already has a report batch")
+if schedule_path.exists():
+    raise SystemExit("ACCEPTANCE_TRADE_DATE already has a review schedule")
+print(f"acceptance date ready: {value}; latest allowed: {today - timedelta(days=16)}")
+PY
+}
+validate_acceptance_trade_date "$ACCEPTANCE_TRADE_DATE"
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_daily_report_bootstrap submit --trade-date "$ACCEPTANCE_TRADE_DATE"
 
 archive_state=active
