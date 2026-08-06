@@ -468,8 +468,13 @@ review processor：
 ```bash
 set -e
 ACCEPTANCE_TRADE_DATE='<unused-historical-YYYY-MM-DD>'
+# Test-only overrides are consumed only by extracted guard tests, never deployment.
+unset TRADINGAGENTS_ACCEPTANCE_GUARD_TESTING
+unset TRADINGAGENTS_ACCEPTANCE_TODAY_UTC
+unset TRADINGAGENTS_ACCEPTANCE_RESULTS_DIR
 validate_acceptance_trade_date() {
   /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python - "$1" <<'PY'
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -482,11 +487,26 @@ except ValueError as error:
 if parsed.isoformat() != value:
     raise SystemExit("ACCEPTANCE_TRADE_DATE must use canonical ISO YYYY-MM-DD form")
 
-today = datetime.now(timezone.utc).date()
+testing = os.environ.get("TRADINGAGENTS_ACCEPTANCE_GUARD_TESTING") == "1"
+if testing:
+    today_value = os.environ.get("TRADINGAGENTS_ACCEPTANCE_TODAY_UTC", "")
+    results_value = os.environ.get("TRADINGAGENTS_ACCEPTANCE_RESULTS_DIR", "")
+    try:
+        today = date.fromisoformat(today_value)
+    except ValueError as error:
+        raise SystemExit("test UTC today must be an ISO YYYY-MM-DD date") from error
+    if today.isoformat() != today_value or not results_value:
+        raise SystemExit("test guard overrides are invalid")
+    results_root = Path(results_value)
+else:
+    today = datetime.now(timezone.utc).date()
+    results_root = Path("/home/ubuntu/workspace/TradingAgents-crypto/results")
+if not results_root.is_absolute():
+    raise SystemExit("acceptance results root must be absolute")
 if parsed > today - timedelta(days=16):
     raise SystemExit("ACCEPTANCE_TRADE_DATE must have a fully elapsed T+15 UTC date")
 
-root = Path("/home/ubuntu/workspace/TradingAgents-crypto/results/hermes")
+root = results_root / "hermes"
 batch_path = root / "report_batches" / f"{value}.json"
 schedule_path = root / "review_schedules" / f"{value}.json"
 if batch_path.exists():

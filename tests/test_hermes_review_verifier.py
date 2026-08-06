@@ -1,5 +1,8 @@
 import io
 import json
+import os
+import subprocess
+import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -62,6 +65,14 @@ SCHEDULED_REVIEW_SKILL_PATH = (
     / "tradingagents-scheduled-paper-reviews"
     / "SKILL.md"
 )
+
+
+def scheduled_acceptance_guard_script() -> str:
+    text = RUNBOOK_PATH.read_text(encoding="utf-8")
+    function_start = text.index("validate_acceptance_trade_date() {")
+    heredoc_start = text.index("<<'PY'\n", function_start) + len("<<'PY'\n")
+    heredoc_end = text.index("\nPY\n}", heredoc_start)
+    return text[heredoc_start:heredoc_end]
 
 
 def saved_review(results_root: Path) -> PaperDecisionReview:
@@ -549,17 +560,43 @@ class HermesReviewVerifierTests(unittest.TestCase):
         submit = scheduled.index(
             'hermes_daily_report_bootstrap submit --trade-date "$ACCEPTANCE_TRADE_DATE"'
         )
-        guard = scheduled[definition:invocation]
-
         self.assertLess(definition, invocation)
         self.assertLess(invocation, submit)
-        self.assertIn("date.fromisoformat", guard)
-        self.assertIn("parsed.isoformat() != value", guard)
-        self.assertIn("datetime.now(timezone.utc).date()", guard)
-        self.assertIn("timedelta(days=16)", guard)
-        self.assertIn('root / "report_batches"', guard)
-        self.assertIn("batch_path.exists()", guard)
-        self.assertIn("raise SystemExit", guard)
+
+        cases = (
+            ("noncanonical", "20260804", None, 1, "canonical ISO"),
+            ("today-minus-15", "2026-08-05", None, 1, "fully elapsed T+15"),
+            ("today-minus-16", "2026-08-04", None, 0, "acceptance date ready"),
+            ("batch-exists", "2026-08-04", "report_batches", 1, "already has a report batch"),
+            ("schedule-exists", "2026-08-04", "review_schedules", 1, "already has a review schedule"),
+        )
+        script = scheduled_acceptance_guard_script()
+        for name, trade_date, occupied_dir, expected_code, expected_message in cases:
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                results_root = Path(directory) / "results"
+                if occupied_dir is not None:
+                    occupied = results_root / "hermes" / occupied_dir
+                    occupied.mkdir(parents=True)
+                    (occupied / f"{trade_date}.json").write_text("{}", encoding="ascii")
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "TRADINGAGENTS_ACCEPTANCE_GUARD_TESTING": "1",
+                        "TRADINGAGENTS_ACCEPTANCE_TODAY_UTC": "2026-08-20",
+                        "TRADINGAGENTS_ACCEPTANCE_RESULTS_DIR": str(results_root),
+                    }
+                )
+                result = subprocess.run(
+                    [sys.executable, "-", trade_date],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                    check=False,
+                )
+
+            self.assertEqual(result.returncode, expected_code)
+            self.assertIn(expected_message, result.stdout + result.stderr)
 
     def test_scheduled_skill_requires_nested_mcp_success_and_state_aware_restart(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
