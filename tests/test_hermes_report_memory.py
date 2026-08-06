@@ -766,21 +766,23 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
             btc_items = retirement_store.sync_symbol("BTC", btc_records)
             eth_items = retirement_store.sync_symbol("ETH", eth_records)
             now = utc_now()
-            saved_btc = ReportMemoryRetirementJournal(
-                symbol="BTC",
-                items=[
-                    btc_items[0].model_copy(
-                        update={"state": "retired", "retired_at": now}
-                    ),
-                    btc_items[1].model_copy(
-                        update={
-                            "state": "attention_required",
-                            "last_error_code": "MEMORY_MARKER_DUPLICATE",
-                        }
-                    ),
-                ],
-            )
-            retirement_store.save(saved_btc)
+            def preserve_history(journal):
+                return ReportMemoryRetirementJournal(
+                    symbol="BTC",
+                    items=[
+                        journal.items[0].model_copy(
+                            update={"state": "retired", "retired_at": now}
+                        ),
+                        journal.items[1].model_copy(
+                            update={
+                                "state": "attention_required",
+                                "last_error_code": "MEMORY_MARKER_DUPLICATE",
+                            }
+                        ),
+                    ],
+                )
+
+            retirement_store.update("BTC", preserve_history)
 
             reconciled_btc = retirement_store.sync_symbol("BTC", btc_records)
             reconciled_eth = retirement_store.sync_symbol("ETH", eth_records)
@@ -883,6 +885,8 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                 for number in range(1, 8)
             ]
             retirement_store.sync_symbol("BTC", records)
+            stale_pending = retirement_store.load("BTC")
+            self.assertIsNotNone(stale_pending)
 
             def begin_first(journal):
                 return journal.model_copy(
@@ -900,11 +904,17 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                 )
 
             updated = retirement_store.update("BTC", begin_first)
+            journal_path = retirement_store.path_for("BTC")
+            updated_bytes = journal_path.read_bytes()
+
+            with self.assertRaises(ReportMemoryRetirementError):
+                retirement_store.save(stale_pending)
 
             self.assertEqual(updated.items[0].state, "memory_call_started")
             reloaded = retirement_store.load("BTC")
             self.assertIsNotNone(reloaded)
             self.assertEqual(reloaded.items[0].state, "memory_call_started")
+            self.assertEqual(journal_path.read_bytes(), updated_bytes)
 
     def test_save_revalidates_tampered_journal_before_replacing_bytes(self):
         with TemporaryDirectory() as directory:
@@ -937,6 +947,29 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                         retirement_store.load("BTC").items[0].marker,
                         "[TradingAgents paper report: hermes_00000000000000000000000000000001]",
                     )
+
+    def test_save_creates_and_idempotently_accepts_canonical_journal(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            source_store = ReportMemoryRetirementStore(root / "source")
+            source_store.sync_symbol(
+                "BTC",
+                [
+                    confirmed_report_record(number, date(2026, 7, number))
+                    for number in range(1, 8)
+                ],
+            )
+            journal = source_store.load("BTC")
+            self.assertIsNotNone(journal)
+
+            retirement_store = ReportMemoryRetirementStore(root / "target")
+            retirement_store.save(journal)
+            journal_path = retirement_store.path_for("BTC")
+            created_bytes = journal_path.read_bytes()
+            retirement_store.save(journal)
+
+            self.assertEqual(retirement_store.load("BTC"), journal)
+            self.assertEqual(journal_path.read_bytes(), created_bytes)
 
 
 if __name__ == "__main__":

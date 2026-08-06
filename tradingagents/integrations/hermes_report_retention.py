@@ -127,9 +127,13 @@ class ReportMemoryRetirementStore:
                 raise ReportMemoryRetirementError(
                     "report memory retirement journal symbol mismatch"
                 )
-            self._require_existing_identities(current, proposed)
-            if proposed != current:
-                self._save_unlocked(proposed)
+            if current is not None:
+                if proposed != current:
+                    raise ReportMemoryRetirementError(
+                        "stale report memory retirement journal save"
+                    )
+                return
+            self._save_unlocked(proposed)
 
     def update(
         self,
