@@ -59,6 +59,9 @@ from tradingagents.integrations.schemas import (
 
 DEFAULT_MEMORY_LIMIT = MAX_MEMORY_ITEMS
 MAX_REPORT_ITEMS = 18
+HERMES_MEMORY_PATH = (
+    Path.home() / ".hermes" / "memories" / "MEMORY.md"
+).expanduser().resolve()
 _CAPACITY_ERROR_CODES = frozenset(
     {
         "MEMORY_PATH_UNREADABLE",
@@ -86,6 +89,18 @@ def _retirement_store() -> ReportMemoryRetirementStore:
     return ReportMemoryRetirementStore(
         _results_root() / "hermes" / "report_memory_retirements"
     )
+
+
+def _canonical_hermes_memory_path(value: Path | str) -> Path | None:
+    """Accept only the normalized Hermes built-in memory file path."""
+    if not isinstance(value, (Path, str)):
+        return None
+    try:
+        candidate = Path(value).expanduser().resolve()
+        expected = HERMES_MEMORY_PATH.expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    return expected if candidate == expected else None
 
 
 def _safe_nonnegative_int(value: object) -> int:
@@ -500,7 +515,12 @@ def run_confirm_report_memory_retirement(
     """Read-only verify a retirement, then expose its safe journal state."""
     mode = "confirm-report-memory-retirement"
     canonical_symbol = _canonical_retirement_symbol(symbol)
-    if canonical_symbol is None or not is_valid_session_id(session_id):
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if (
+        canonical_symbol is None
+        or not is_valid_session_id(session_id)
+        or canonical_memory_path is None
+    ):
         return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
     if confirmer is None:
         retirement_store = _retirement_store()
@@ -509,7 +529,7 @@ def run_confirm_report_memory_retirement(
             selected_symbol,
             selected_session,
             verifier=lambda candidate_session, marker: verify_report_memory_absence(
-                candidate_session, marker, memory_path
+                candidate_session, marker, canonical_memory_path
             ),
         )
     item = confirmer(canonical_symbol, session_id)
@@ -568,9 +588,12 @@ def run_report_memory_capacity(
         or memory_char_limit != HERMES_MEMORY_CHAR_LIMIT
     ):
         return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if canonical_memory_path is None:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
     if verifier is None:
         verifier = verify_report_memory_capacity
-    result = verifier(memory_path, memory_char_limit)
+    result = verifier(canonical_memory_path, memory_char_limit)
     error_code = getattr(result, "error_code", None)
     return 0, {
         "ok": getattr(result, "ok", False) is True,
@@ -668,7 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     confirm_retirement_parser.add_argument(
         "--hermes-memory-path",
         type=Path,
-        default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
+        default=HERMES_MEMORY_PATH,
     )
     quarantine_retirement_parser = subparsers.add_parser(
         "quarantine-report-memory-retirement", add_help=False
@@ -680,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
     capacity_parser.add_argument(
         "--hermes-memory-path",
         type=Path,
-        default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
+        default=HERMES_MEMORY_PATH,
     )
     capacity_parser.add_argument(
         "--memory-char-limit", type=int, default=HERMES_MEMORY_CHAR_LIMIT
@@ -738,12 +761,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif parsed.mode == "confirm-report-memory-retirement":
             canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
-            if canonical_symbol is None or not is_valid_session_id(parsed.session_id):
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if (
+                canonical_symbol is None
+                or not is_valid_session_id(parsed.session_id)
+                or canonical_memory_path is None
+            ):
                 raise ValueError("invalid report memory retirement request")
             code, payload = run_confirm_report_memory_retirement(
                 canonical_symbol,
                 parsed.session_id,
-                parsed.hermes_memory_path.expanduser().resolve(),
+                canonical_memory_path,
             )
         elif parsed.mode == "quarantine-report-memory-retirement":
             canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
@@ -759,8 +789,13 @@ def main(argv: list[str] | None = None) -> int:
         elif parsed.mode == "report-memory-capacity":
             if parsed.memory_char_limit != HERMES_MEMORY_CHAR_LIMIT:
                 raise ValueError("invalid report memory capacity limit")
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if canonical_memory_path is None:
+                raise ValueError("invalid report memory capacity path")
             code, payload = run_report_memory_capacity(
-                parsed.hermes_memory_path.expanduser().resolve(),
+                canonical_memory_path,
                 parsed.memory_char_limit,
             )
         else:

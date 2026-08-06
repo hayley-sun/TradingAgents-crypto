@@ -531,7 +531,6 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
     def test_confirm_report_memory_retirement_returns_safe_state_and_uses_absence_verifier(self):
         session_id = "hermes_0123456789abcdef"
         retirement_store = object()
-        memory_path = Path("/tmp/runner-retirement-memory")
         confirmed = SimpleNamespace(
             symbol="BTC",
             session_id=session_id,
@@ -546,22 +545,28 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             verifier(selected_session_id, confirmed.marker)
             return confirmed
 
-        with patch.object(
-            runner, "ReportMemoryRetirementStore", return_value=retirement_store
-        ), patch.object(
-            runner, "confirm_report_memory_retirement", side_effect=confirmer
-        ), patch.object(
-            runner,
-            "verify_report_memory_absence",
-            return_value=SimpleNamespace(ok=True, marker_occurrences=0),
-        ) as verifier:
-            code, payload = runner.run_confirm_report_memory_retirement(
-                "BTC", session_id, memory_path
-            )
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "MEMORY.md"
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", memory_path, create=True
+            ), patch.object(
+                runner, "ReportMemoryRetirementStore", return_value=retirement_store
+            ), patch.object(
+                runner, "confirm_report_memory_retirement", side_effect=confirmer
+            ), patch.object(
+                runner,
+                "verify_report_memory_absence",
+                return_value=SimpleNamespace(ok=True, marker_occurrences=0),
+            ) as verifier:
+                code, payload = runner.run_confirm_report_memory_retirement(
+                    "BTC", session_id, memory_path
+                )
 
         self.assertEqual(code, 0)
         self.assertEqual(seen, [(retirement_store, "BTC", session_id)])
-        verifier.assert_called_once_with(session_id, confirmed.marker, memory_path)
+        verifier.assert_called_once_with(
+            session_id, confirmed.marker, memory_path.resolve()
+        )
         self.assertEqual(
             payload,
             {
@@ -636,21 +641,24 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             memory_path = Path(directory) / "private-memory.md"
             secret = "operator secret memory entry"
             memory_path.write_text(secret, encoding="utf-8")
-            code, payload = runner.run_report_memory_capacity(memory_path, 40000)
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", memory_path, create=True
+            ):
+                code, payload = runner.run_report_memory_capacity(memory_path, 40000)
 
-            self.assertEqual(code, 0)
-            self.assertTrue(payload["ok"])
-            self.assertEqual(payload["configured_limit"], 40000)
-            self.assertEqual(payload["current_chars"], len(secret))
-            self.assertEqual(payload["reserved_report_chars"], 30897)
-            self.assertEqual(payload["available_chars"], 40000 - len(secret))
-            rendered = json.dumps(payload)
-            self.assertNotIn(secret, rendered)
-            self.assertNotIn(str(memory_path), rendered)
-            self.assertNotIn("memory_path", payload)
+                self.assertEqual(code, 0)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["configured_limit"], 40000)
+                self.assertEqual(payload["current_chars"], len(secret))
+                self.assertEqual(payload["reserved_report_chars"], 30897)
+                self.assertEqual(payload["available_chars"], 40000 - len(secret))
+                rendered = json.dumps(payload)
+                self.assertNotIn(secret, rendered)
+                self.assertNotIn(str(memory_path), rendered)
+                self.assertNotIn("memory_path", payload)
 
-            memory_path.write_text("x" * 9001, encoding="utf-8")
-            code, failed = runner.run_report_memory_capacity(memory_path, 40000)
+                memory_path.write_text("x" * 9001, encoding="utf-8")
+                code, failed = runner.run_report_memory_capacity(memory_path, 40000)
 
         self.assertEqual(code, 0)
         self.assertFalse(failed["ok"])
@@ -680,9 +688,13 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
             error_code="/private/path",
         )
 
-        code, payload = runner.run_report_memory_capacity(
-            Path("/tmp/not-accessed"), 40000, lambda *_args: untrusted_result
-        )
+        memory_path = Path("/tmp/not-accessed").resolve()
+        with patch.object(
+            runner, "HERMES_MEMORY_PATH", memory_path, create=True
+        ):
+            code, payload = runner.run_report_memory_capacity(
+                memory_path, 40000, lambda *_args: untrusted_result
+            )
 
         self.assertEqual(code, 0)
         self.assertFalse(payload["ok"])
@@ -690,6 +702,104 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
         self.assertEqual(payload["reserved_report_chars"], 0)
         self.assertEqual(payload["available_chars"], 0)
         self.assertIsNone(payload["error_code"])
+
+    def test_retirement_commands_reject_noncanonical_memory_paths_before_dependencies(self):
+        session_id = "hermes_0123456789abcdef"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical_path = root / "canonical" / "MEMORY.md"
+            alternate_path = root / "alternate-memory.md"
+            symlink_path = root / "memory-link.md"
+            alternate_path.write_text("alternate", encoding="utf-8")
+            symlink_path.symlink_to(alternate_path)
+            rejected_paths = (
+                Path("/dev/null"),
+                alternate_path,
+                root / "nested" / ".." / "wrong-memory.md",
+                symlink_path,
+            )
+            confirm_calls = []
+            capacity_calls = []
+
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", canonical_path, create=True
+            ):
+                for candidate_path in rejected_paths:
+                    with self.subTest(command="confirm", path=candidate_path):
+                        code, payload = runner.run_confirm_report_memory_retirement(
+                            "BTC",
+                            session_id,
+                            candidate_path,
+                            lambda *_args: (
+                                confirm_calls.append(candidate_path)
+                                or SimpleNamespace(state="retired")
+                            ),
+                        )
+                        self.assertEqual(code, 1)
+                        self.assertEqual(
+                            payload["error"]["code"],
+                            "INVALID_SCHEDULED_REVIEW_REQUEST",
+                        )
+                        self.assertNotIn(str(candidate_path), json.dumps(payload))
+                    with self.subTest(command="capacity", path=candidate_path):
+                        code, payload = runner.run_report_memory_capacity(
+                            candidate_path,
+                            40000,
+                            lambda *_args: capacity_calls.append(candidate_path),
+                        )
+                        self.assertEqual(code, 1)
+                        self.assertEqual(
+                            payload["error"]["code"],
+                            "INVALID_SCHEDULED_REVIEW_REQUEST",
+                        )
+                        self.assertNotIn(str(candidate_path), json.dumps(payload))
+
+            self.assertEqual(confirm_calls, [])
+            self.assertEqual(capacity_calls, [])
+
+    def test_main_rejects_noncanonical_retirement_memory_paths_before_runner_call(self):
+        session_id = "hermes_0123456789abcdef"
+        with TemporaryDirectory() as directory:
+            canonical_path = Path(directory) / "canonical" / "MEMORY.md"
+            routes = (
+                (
+                    [
+                        "confirm-report-memory-retirement",
+                        "--symbol",
+                        "BTC",
+                        "--session-id",
+                        session_id,
+                        "--hermes-memory-path",
+                        "/dev/null",
+                    ],
+                    "run_confirm_report_memory_retirement",
+                ),
+                (
+                    [
+                        "report-memory-capacity",
+                        "--hermes-memory-path",
+                        "/dev/null",
+                        "--memory-char-limit",
+                        "40000",
+                    ],
+                    "run_report_memory_capacity",
+                ),
+            )
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", canonical_path, create=True
+            ):
+                for arguments, function_name in routes:
+                    stdout = io.StringIO()
+                    with self.subTest(arguments=arguments), patch.object(
+                        runner, function_name
+                    ) as command, redirect_stdout(stdout):
+                        self.assertEqual(runner.main(arguments), 1)
+                    self.assertEqual(
+                        json.loads(stdout.getvalue())["error"]["code"],
+                        "INVALID_SCHEDULED_REVIEW_REQUEST",
+                    )
+                    self.assertNotIn("/dev/null", stdout.getvalue())
+                    command.assert_not_called()
 
     def test_main_routes_retirement_and_capacity_modes(self):
         session_id = "hermes_0123456789abcdef"
@@ -751,12 +861,15 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
                 ),
             )
 
-            for arguments, function_name, expected_args in routes:
-                with self.subTest(arguments=arguments), patch.object(
-                    runner, function_name, return_value=(0, {"ok": True})
-                ) as command, redirect_stdout(io.StringIO()):
-                    self.assertEqual(runner.main(arguments), 0)
-                command.assert_called_once_with(*expected_args)
+            with patch.object(
+                runner, "HERMES_MEMORY_PATH", memory_path, create=True
+            ):
+                for arguments, function_name, expected_args in routes:
+                    with self.subTest(arguments=arguments), patch.object(
+                        runner, function_name, return_value=(0, {"ok": True})
+                    ) as command, redirect_stdout(io.StringIO()):
+                        self.assertEqual(runner.main(arguments), 0)
+                    command.assert_called_once_with(*expected_args)
 
     def test_bootstrap_loads_only_scheduled_review_environment(self):
         bootstrap = importlib.import_module(
