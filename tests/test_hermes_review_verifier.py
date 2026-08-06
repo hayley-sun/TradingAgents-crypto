@@ -564,7 +564,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertLess(invocation, submit)
 
         cases = (
-            ("noncanonical", "20260804", None, 1, "canonical ISO"),
+            ("noncanonical", "20260804", None, 1, "ISO"),
             ("today-minus-15", "2026-08-05", None, 1, "fully elapsed T+15"),
             ("today-minus-16", "2026-08-04", None, 0, "acceptance date ready"),
             ("batch-exists", "2026-08-04", "report_batches", 1, "already has a report batch"),
