@@ -405,6 +405,359 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertNotIn("/private/raw", stdout.getvalue())
 
+    def test_report_memory_retirement_pending_returns_metadata_only(self):
+        item = SimpleNamespace(
+            symbol="BTC",
+            session_id="hermes_0123456789abcdef",
+            trade_date=date(2026, 8, 1),
+            revision=3,
+            state="pending",
+            marker="[TradingAgents paper report: hermes_0123456789abcdef]",
+            old_text="private marker",
+        )
+
+        code, payload = runner.run_report_memory_retirement_pending(
+            18, lambda _limit: [item]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(
+            payload["items"],
+            [
+                {
+                    "symbol": "BTC",
+                    "session_id": "hermes_0123456789abcdef",
+                    "trade_date": "2026-08-01",
+                    "revision": 3,
+                    "state": "pending",
+                }
+            ],
+        )
+        rendered = json.dumps(payload)
+        self.assertNotIn("marker", rendered)
+        self.assertNotIn("old_text", rendered)
+        self.assertNotIn("private marker", rendered)
+
+    def test_report_memory_retirement_pending_rejects_invalid_limit_before_lister(self):
+        def sentinel(_limit):
+            raise AssertionError("lister accessed")
+
+        for invalid_limit in (True, 0, 19, 1.0):
+            with self.subTest(invalid_limit=invalid_limit):
+                code, payload = runner.run_report_memory_retirement_pending(
+                    invalid_limit, sentinel
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST"
+                )
+
+    def test_begin_report_memory_retirement_returns_only_persisted_remove_marker(self):
+        session_id = "hermes_0123456789abcdef"
+        marker = f"[TradingAgents paper report: {session_id}]"
+        seen = []
+
+        def starter(symbol, selected_session_id):
+            seen.append((symbol, selected_session_id))
+            return SimpleNamespace(
+                symbol=symbol,
+                session_id=selected_session_id,
+                trade_date=date(2026, 8, 1),
+                revision=3,
+                state="memory_call_started",
+                action="remove",
+                old_text=marker,
+            )
+
+        code, payload = runner.run_begin_report_memory_retirement(
+            "btc", session_id, starter
+        )
+
+        self.assertEqual(seen, [("BTC", session_id)])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            payload,
+            {
+                "ok": True,
+                "mode": "begin-report-memory-retirement",
+                "symbol": "BTC",
+                "session_id": session_id,
+                "trade_date": "2026-08-01",
+                "revision": 3,
+                "state": "memory_call_started",
+                "action": "remove",
+                "old_text": marker,
+            },
+        )
+
+    def test_begin_report_memory_retirement_hides_marker_during_verification_retry(self):
+        operation = SimpleNamespace(
+            symbol="BTC",
+            session_id="hermes_0123456789abcdef",
+            trade_date=date(2026, 8, 1),
+            revision=3,
+            state="verification_pending",
+            action="remove",
+            old_text="[TradingAgents paper report: hermes_0123456789abcdef]",
+        )
+
+        code, payload = runner.run_begin_report_memory_retirement(
+            "BTC", operation.session_id, lambda *_args: operation
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["state"], "verification_pending")
+        self.assertEqual(payload["action"], "remove")
+        self.assertNotIn("old_text", payload)
+
+    def test_retirement_begin_rejects_invalid_symbol_or_session_before_starter(self):
+        def sentinel(*_args):
+            raise AssertionError("starter accessed")
+
+        for symbol, session_id in (
+            ("../BTC", "hermes_0123456789abcdef"),
+            ("BTC", "hermes_not-valid"),
+        ):
+            with self.subTest(symbol=symbol, session_id=session_id):
+                code, payload = runner.run_begin_report_memory_retirement(
+                    symbol, session_id, sentinel
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST"
+                )
+
+    def test_confirm_report_memory_retirement_returns_safe_state_and_uses_absence_verifier(self):
+        session_id = "hermes_0123456789abcdef"
+        retirement_store = object()
+        memory_path = Path("/tmp/runner-retirement-memory")
+        confirmed = SimpleNamespace(
+            symbol="BTC",
+            session_id=session_id,
+            revision=3,
+            state="retired",
+            marker="[TradingAgents paper report: hermes_0123456789abcdef]",
+        )
+        seen = []
+
+        def confirmer(store, symbol, selected_session_id, verifier):
+            seen.append((store, symbol, selected_session_id))
+            verifier(selected_session_id, confirmed.marker)
+            return confirmed
+
+        with patch.object(
+            runner, "ReportMemoryRetirementStore", return_value=retirement_store
+        ), patch.object(
+            runner, "confirm_report_memory_retirement", side_effect=confirmer
+        ), patch.object(
+            runner,
+            "verify_report_memory_absence",
+            return_value=SimpleNamespace(ok=True, marker_occurrences=0),
+        ) as verifier:
+            code, payload = runner.run_confirm_report_memory_retirement(
+                "BTC", session_id, memory_path
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [(retirement_store, "BTC", session_id)])
+        verifier.assert_called_once_with(session_id, confirmed.marker, memory_path)
+        self.assertEqual(
+            payload,
+            {
+                "ok": True,
+                "mode": "confirm-report-memory-retirement",
+                "symbol": "BTC",
+                "session_id": session_id,
+                "revision": 3,
+                "state": "retired",
+            },
+        )
+        self.assertNotIn("marker", json.dumps(payload))
+
+    def test_retirement_confirm_rejects_invalid_symbol_or_session_before_confirmer(self):
+        def sentinel(*_args):
+            raise AssertionError("confirmer accessed")
+
+        for symbol, session_id in (
+            ("BTC/ETH", "hermes_0123456789abcdef"),
+            ("BTC", "hermes_bad"),
+        ):
+            with self.subTest(symbol=symbol, session_id=session_id):
+                code, payload = runner.run_confirm_report_memory_retirement(
+                    symbol, session_id, Path("/tmp/not-accessed"), sentinel
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST"
+                )
+
+    def test_quarantine_report_memory_retirement_returns_safe_state(self):
+        session_id = "hermes_0123456789abcdef"
+        seen = []
+
+        def quarantiner(symbol, selected_session_id, error_code):
+            seen.append((symbol, selected_session_id, error_code))
+            return SimpleNamespace(state="attention_required")
+
+        code, payload = runner.run_quarantine_report_memory_retirement(
+            "BTC", session_id, "MEMORY_REMOVE_FAILED", quarantiner
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            seen, [("BTC", session_id, "MEMORY_REMOVE_FAILED")]
+        )
+        self.assertEqual(
+            payload,
+            {
+                "ok": True,
+                "mode": "quarantine-report-memory-retirement",
+                "symbol": "BTC",
+                "session_id": session_id,
+                "revision": 3,
+                "state": "attention_required",
+            },
+        )
+
+    def test_retirement_quarantine_rejects_external_error_before_store_access(self):
+        def sentinel(*_args):
+            raise AssertionError("quarantiner accessed")
+
+        code, payload = runner.run_quarantine_report_memory_retirement(
+            "BTC", "hermes_0123456789abcdef", "EXTERNAL_ERROR", sentinel
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST")
+
+    def test_report_memory_capacity_returns_count_only_success_and_failure(self):
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "private-memory.md"
+            secret = "operator secret memory entry"
+            memory_path.write_text(secret, encoding="utf-8")
+            code, payload = runner.run_report_memory_capacity(memory_path, 40000)
+
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["configured_limit"], 40000)
+            self.assertEqual(payload["current_chars"], len(secret))
+            self.assertEqual(payload["reserved_report_chars"], 30897)
+            self.assertEqual(payload["available_chars"], 40000 - len(secret))
+            rendered = json.dumps(payload)
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(str(memory_path), rendered)
+            self.assertNotIn("memory_path", payload)
+
+            memory_path.write_text("x" * 9001, encoding="utf-8")
+            code, failed = runner.run_report_memory_capacity(memory_path, 40000)
+
+        self.assertEqual(code, 0)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["error_code"], "MEMORY_CAPACITY_EXCEEDED")
+        self.assertNotIn("x" * 100, json.dumps(failed))
+
+    def test_report_memory_capacity_rejects_wrong_limit_before_verifier_or_path_access(self):
+        def sentinel(*_args):
+            raise AssertionError("capacity verifier accessed")
+
+        for invalid_limit in (True, 39999, 40001, 40000.0):
+            with self.subTest(invalid_limit=invalid_limit):
+                code, payload = runner.run_report_memory_capacity(
+                    Path("/tmp/not-accessed"), invalid_limit, sentinel
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    payload["error"]["code"], "INVALID_SCHEDULED_REVIEW_REQUEST"
+                )
+
+    def test_report_memory_capacity_drops_unsafe_verifier_metadata(self):
+        untrusted_result = SimpleNamespace(
+            ok="truthy",
+            current_chars="private memory text",
+            reserved_report_chars=True,
+            available_chars=-1,
+            error_code="/private/path",
+        )
+
+        code, payload = runner.run_report_memory_capacity(
+            Path("/tmp/not-accessed"), 40000, lambda *_args: untrusted_result
+        )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["current_chars"], 0)
+        self.assertEqual(payload["reserved_report_chars"], 0)
+        self.assertEqual(payload["available_chars"], 0)
+        self.assertIsNone(payload["error_code"])
+
+    def test_main_routes_retirement_and_capacity_modes(self):
+        session_id = "hermes_0123456789abcdef"
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "hermes-memory.md"
+            routes = (
+                (
+                    ["report-memory-retirement-pending", "--limit", "1"],
+                    "run_report_memory_retirement_pending",
+                    (1,),
+                ),
+                (
+                    [
+                        "begin-report-memory-retirement",
+                        "--symbol",
+                        "BTC",
+                        "--session-id",
+                        session_id,
+                    ],
+                    "run_begin_report_memory_retirement",
+                    ("BTC", session_id),
+                ),
+                (
+                    [
+                        "confirm-report-memory-retirement",
+                        "--symbol",
+                        "BTC",
+                        "--session-id",
+                        session_id,
+                        "--hermes-memory-path",
+                        str(memory_path),
+                    ],
+                    "run_confirm_report_memory_retirement",
+                    ("BTC", session_id, memory_path.resolve()),
+                ),
+                (
+                    [
+                        "quarantine-report-memory-retirement",
+                        "--symbol",
+                        "BTC",
+                        "--session-id",
+                        session_id,
+                        "--error-code",
+                        "MEMORY_REMOVE_FAILED",
+                    ],
+                    "run_quarantine_report_memory_retirement",
+                    ("BTC", session_id, "MEMORY_REMOVE_FAILED"),
+                ),
+                (
+                    [
+                        "report-memory-capacity",
+                        "--hermes-memory-path",
+                        str(memory_path),
+                        "--memory-char-limit",
+                        "40000",
+                    ],
+                    "run_report_memory_capacity",
+                    (memory_path.resolve(), 40000),
+                ),
+            )
+
+            for arguments, function_name, expected_args in routes:
+                with self.subTest(arguments=arguments), patch.object(
+                    runner, function_name, return_value=(0, {"ok": True})
+                ) as command, redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(arguments), 0)
+                command.assert_called_once_with(*expected_args)
+
     def test_bootstrap_loads_only_scheduled_review_environment(self):
         bootstrap = importlib.import_module(
             "tradingagents.integrations.hermes_scheduled_review_bootstrap"

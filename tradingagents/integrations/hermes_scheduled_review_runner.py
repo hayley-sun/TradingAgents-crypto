@@ -16,19 +16,30 @@ from tradingagents.integrations.hermes_mcp import (
     review_paper_decision_impl,
 )
 from tradingagents.integrations.hermes_report_learning import (
+    HERMES_MEMORY_CHAR_LIMIT,
     ReportLearningStore,
     build_evidence_packet,
     record_review_fact,
 )
 from tradingagents.integrations.hermes_report_memory import (
     MEMORY_ERROR_CODES,
+    RETIREMENT_MEMORY_ERROR_CODES,
     begin_report_memory,
+    begin_report_memory_retirement,
     confirm_report_memory,
+    confirm_report_memory_retirement,
     list_pending_report_memory,
+    list_pending_report_memory_retirements,
     quarantine_report_memory,
+    quarantine_report_memory_retirement,
 )
 from tradingagents.integrations.hermes_report_memory_verifier import (
+    verify_report_memory_absence,
+    verify_report_memory_capacity,
     verify_report_memory_consistency,
+)
+from tradingagents.integrations.hermes_report_retention import (
+    ReportMemoryRetirementStore,
 )
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
 from tradingagents.integrations.hermes_scheduled_reviews import (
@@ -39,16 +50,46 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
     inspect_pending_memory,
     process_due_reviews,
 )
-from tradingagents.integrations.schemas import is_valid_review_id, is_valid_session_id
+from tradingagents.integrations.schemas import (
+    ReportMemoryRetirementJournal,
+    is_valid_review_id,
+    is_valid_session_id,
+)
 
 
 DEFAULT_MEMORY_LIMIT = MAX_MEMORY_ITEMS
 MAX_REPORT_ITEMS = 18
+_CAPACITY_ERROR_CODES = frozenset(
+    {
+        "MEMORY_PATH_UNREADABLE",
+        "MEMORY_LIMIT_INVALID",
+        "MEMORY_LIMIT_TOO_SMALL",
+        "MEMORY_CAPACITY_EXCEEDED",
+    }
+)
 
 
 def _results_root() -> Path:
     configured = os.getenv("TRADINGAGENTS_RESULTS_DIR")
     return (Path(configured) if configured else PROJECT_ROOT / "results").expanduser().resolve()
+
+
+def _canonical_retirement_symbol(value: str) -> str | None:
+    """Normalize one schema-approved retirement journal symbol."""
+    try:
+        return ReportMemoryRetirementJournal(symbol=value).symbol
+    except (TypeError, ValueError):
+        return None
+
+
+def _retirement_store() -> ReportMemoryRetirementStore:
+    return ReportMemoryRetirementStore(
+        _results_root() / "hermes" / "report_memory_retirements"
+    )
+
+
+def _safe_nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def run_process_due(
@@ -387,6 +428,165 @@ def run_quarantine_report_memory(
     }
 
 
+def run_report_memory_retirement_pending(
+    limit: int,
+    lister: Callable[[int], list[Any]] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """List bounded retirement metadata without exposing Hermes markers."""
+    mode = "report-memory-retirement-pending"
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REPORT_ITEMS:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if lister is None:
+        report_store = ReportLearningStore.from_environment()
+        retirement_store = _retirement_store()
+        lister = lambda selected_limit: list_pending_report_memory_retirements(
+            retirement_store, report_store, selected_limit
+        )
+    work = list(lister(limit))[:limit]
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "count": len(work),
+        "items": [
+            {
+                "symbol": item.symbol,
+                "session_id": item.session_id,
+                "trade_date": item.trade_date.isoformat(),
+                "revision": 3,
+                "state": item.state,
+            }
+            for item in work
+        ],
+    }
+
+
+def run_begin_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    starter: Callable[[str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return the single marker needed for one Hermes Agent remove call."""
+    mode = "begin-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    if canonical_symbol is None or not is_valid_session_id(session_id):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if starter is None:
+        retirement_store = _retirement_store()
+        starter = lambda selected_symbol, selected_session: begin_report_memory_retirement(
+            retirement_store, selected_symbol, selected_session
+        )
+    operation = starter(canonical_symbol, session_id)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "trade_date": operation.trade_date.isoformat(),
+        "revision": 3,
+        "state": operation.state,
+        "action": "remove",
+    }
+    if operation.state != "verification_pending":
+        payload["old_text"] = operation.old_text
+    return 0, payload
+
+
+def run_confirm_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    memory_path: Path,
+    confirmer: Callable[[str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Read-only verify a retirement, then expose its safe journal state."""
+    mode = "confirm-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    if canonical_symbol is None or not is_valid_session_id(session_id):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if confirmer is None:
+        retirement_store = _retirement_store()
+        confirmer = lambda selected_symbol, selected_session: confirm_report_memory_retirement(
+            retirement_store,
+            selected_symbol,
+            selected_session,
+            verifier=lambda candidate_session, marker: verify_report_memory_absence(
+                candidate_session, marker, memory_path
+            ),
+        )
+    item = confirmer(canonical_symbol, session_id)
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "revision": 3,
+        "state": item.state,
+    }
+
+
+def run_quarantine_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    error_code: str,
+    quarantiner: Callable[[str, str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Persist a safe, allowlisted retirement failure code."""
+    mode = "quarantine-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    if (
+        canonical_symbol is None
+        or not is_valid_session_id(session_id)
+        or not isinstance(error_code, str)
+        or error_code not in RETIREMENT_MEMORY_ERROR_CODES
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if quarantiner is None:
+        retirement_store = _retirement_store()
+        quarantiner = lambda selected_symbol, selected_session, selected_code: quarantine_report_memory_retirement(
+            retirement_store, selected_symbol, selected_session, selected_code
+        )
+    item = quarantiner(canonical_symbol, session_id, error_code)
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "revision": 3,
+        "state": item.state,
+    }
+
+
+def run_report_memory_capacity(
+    memory_path: Path,
+    memory_char_limit: int,
+    verifier: Callable[[Path, int], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return count-only capacity preflight metadata for Hermes memory."""
+    mode = "report-memory-capacity"
+    if (
+        isinstance(memory_char_limit, bool)
+        or not isinstance(memory_char_limit, int)
+        or memory_char_limit != HERMES_MEMORY_CHAR_LIMIT
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if verifier is None:
+        verifier = verify_report_memory_capacity
+    result = verifier(memory_path, memory_char_limit)
+    error_code = getattr(result, "error_code", None)
+    return 0, {
+        "ok": getattr(result, "ok", False) is True,
+        "mode": mode,
+        "current_chars": _safe_nonnegative_int(getattr(result, "current_chars", 0)),
+        "configured_limit": memory_char_limit,
+        "reserved_report_chars": _safe_nonnegative_int(
+            getattr(result, "reserved_report_chars", 0)
+        ),
+        "available_chars": _safe_nonnegative_int(
+            getattr(result, "available_chars", 0)
+        ),
+        "error_code": error_code if error_code in _CAPACITY_ERROR_CODES else None,
+    }
+
+
 def _error(code: str, mode: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -451,6 +651,40 @@ def main(argv: list[str] | None = None) -> int:
     quarantine_report_memory_parser.add_argument("--session-id", required=True)
     quarantine_report_memory_parser.add_argument("--revision", type=int, required=True)
     quarantine_report_memory_parser.add_argument("--error-code", required=True)
+    retirement_pending_parser = subparsers.add_parser(
+        "report-memory-retirement-pending", add_help=False
+    )
+    retirement_pending_parser.add_argument("--limit", type=int, default=MAX_REPORT_ITEMS)
+    begin_retirement_parser = subparsers.add_parser(
+        "begin-report-memory-retirement", add_help=False
+    )
+    begin_retirement_parser.add_argument("--symbol", required=True)
+    begin_retirement_parser.add_argument("--session-id", required=True)
+    confirm_retirement_parser = subparsers.add_parser(
+        "confirm-report-memory-retirement", add_help=False
+    )
+    confirm_retirement_parser.add_argument("--symbol", required=True)
+    confirm_retirement_parser.add_argument("--session-id", required=True)
+    confirm_retirement_parser.add_argument(
+        "--hermes-memory-path",
+        type=Path,
+        default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
+    )
+    quarantine_retirement_parser = subparsers.add_parser(
+        "quarantine-report-memory-retirement", add_help=False
+    )
+    quarantine_retirement_parser.add_argument("--symbol", required=True)
+    quarantine_retirement_parser.add_argument("--session-id", required=True)
+    quarantine_retirement_parser.add_argument("--error-code", required=True)
+    capacity_parser = subparsers.add_parser("report-memory-capacity", add_help=False)
+    capacity_parser.add_argument(
+        "--hermes-memory-path",
+        type=Path,
+        default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
+    )
+    capacity_parser.add_argument(
+        "--memory-char-limit", type=int, default=HERMES_MEMORY_CHAR_LIMIT
+    )
     try:
         parsed = parser.parse_args(arguments)
         if parsed.mode == "process-due":
@@ -491,6 +725,44 @@ def main(argv: list[str] | None = None) -> int:
             if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
                 raise ValueError("invalid report memory request")
             code, payload = run_quarantine_report_memory(parsed.session_id, parsed.revision, parsed.error_code)
+        elif parsed.mode == "report-memory-retirement-pending":
+            if not 1 <= parsed.limit <= MAX_REPORT_ITEMS:
+                raise ValueError("invalid report memory retirement limit")
+            code, payload = run_report_memory_retirement_pending(parsed.limit)
+        elif parsed.mode == "begin-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            if canonical_symbol is None or not is_valid_session_id(parsed.session_id):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_begin_report_memory_retirement(
+                canonical_symbol, parsed.session_id
+            )
+        elif parsed.mode == "confirm-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            if canonical_symbol is None or not is_valid_session_id(parsed.session_id):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_confirm_report_memory_retirement(
+                canonical_symbol,
+                parsed.session_id,
+                parsed.hermes_memory_path.expanduser().resolve(),
+            )
+        elif parsed.mode == "quarantine-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            if (
+                canonical_symbol is None
+                or not is_valid_session_id(parsed.session_id)
+                or parsed.error_code not in RETIREMENT_MEMORY_ERROR_CODES
+            ):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_quarantine_report_memory_retirement(
+                canonical_symbol, parsed.session_id, parsed.error_code
+            )
+        elif parsed.mode == "report-memory-capacity":
+            if parsed.memory_char_limit != HERMES_MEMORY_CHAR_LIMIT:
+                raise ValueError("invalid report memory capacity limit")
+            code, payload = run_report_memory_capacity(
+                parsed.hermes_memory_path.expanduser().resolve(),
+                parsed.memory_char_limit,
+            )
         else:
             raise ValueError("invalid scheduled review mode")
     except (TypeError, ValueError):
