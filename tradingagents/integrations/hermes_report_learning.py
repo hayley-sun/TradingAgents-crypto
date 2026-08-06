@@ -39,7 +39,11 @@ _MEMORY_MARKER_PREFIX = REPORT_MEMORY_MARKER.split("{session_id}")[0]
 MAX_REPORT_REVISIONS = 3
 EVIDENCE_PACKET_MAX_BYTES = 4096
 REPORT_LESSON_MAX_CHARS = 2400
-HERMES_REPORT_MEMORY_MAX_CHARS = 4000
+HERMES_REPORT_MEMORY_MAX_CHARS = 512
+HERMES_REPORT_MEMORY_MAX_BYTES = 1536
+HERMES_MEMORY_CHAR_LIMIT = 40000
+HERMES_REPORT_ENTRY_RESERVATION = 60
+HERMES_ENTRY_DELIMITER_CHARS = 3
 MAX_REFLECTION_ATTEMPTS = 3
 EVIDENCE_FIELD_ORDER = (
     "report.market",
@@ -622,6 +626,98 @@ def _bounded_lesson(
     return lesson
 
 
+def _compact_memory_entry(
+    record: ReportLearningRecord,
+    revision: int,
+    outcomes: list[ReportLearningOutcome],
+    reflection: ReportReflection,
+    maturity_horizon: int,
+    market_context: str,
+) -> str:
+    """Render the small deterministic derivative stored in Hermes memory.
+
+    The project lesson remains the complete bounded artifact. This payload has
+    fixed required labels and aggressively clipped values so the marker and all
+    outcome identities survive the byte and character limits together.
+    """
+    marker = REPORT_MEMORY_MARKER.format(session_id=record.session_id)
+    outcome_tokens = []
+    for outcome in outcomes:
+        token = (
+            f"T+{outcome.horizon_days} {outcome.verdict} "
+            f"{format(outcome.raw_return_pct, '.6g')}%"
+        )
+        outcome_tokens.append(_clip_text(token, 24, 72))
+    outcome_summary = "; ".join(outcome_tokens)
+
+    verdicts = {outcome.verdict for outcome in outcomes}
+    if verdicts.intersection({"incorrect", "not_scored"}) and reflection.mistakes_or_missed_opportunities:
+        quality_label = "Mistake"
+        quality_value = reflection.mistakes_or_missed_opportunities[0]
+    elif reflection.reasoning_strengths:
+        quality_label = "Strength"
+        quality_value = reflection.reasoning_strengths[0]
+    elif reflection.mistakes_or_missed_opportunities:
+        quality_label = "Mistake"
+        quality_value = reflection.mistakes_or_missed_opportunities[0]
+    else:
+        quality_label = "Strength"
+        quality_value = "None recorded."
+
+    hypothesis = reflection.causal_hypotheses[0]
+    hypothesis_value = (
+        f"{hypothesis.statement} [evidence: {', '.join(hypothesis.evidence)}; "
+        f"confidence: {hypothesis.confidence}]"
+    )
+    next_check = reflection.next_decision_checks[0]
+    lines = [
+        marker,
+        (
+            f"{record.symbol} {record.trade_date.isoformat()} "
+            f"revision {revision} action={record.action}"
+        ),
+        f"Maturity: T+{maturity_horizon}",
+        f"Outcomes: {outcome_summary}",
+        f"Decision-time market context: {_clip_text(market_context, 16, 48)}",
+        f"{quality_label}: {_clip_text(quality_value, 12, 36)}",
+        f"Causal hypothesis: {_clip_text(hypothesis_value, 18, 54)}",
+        f"Next paper-decision check: {_clip_text(next_check, 14, 42)}",
+        (
+            "Disclaimer: paper trading only; hypotheses are uncertain; "
+            "no real-order instruction."
+        ),
+    ]
+
+    # Required labels are intentionally retained. The value clips above leave
+    # enough headroom for the longest valid session marker and UTF-8 expansion.
+    entry = "\n".join(lines)
+    if (
+        len(entry) > HERMES_REPORT_MEMORY_MAX_CHARS
+        or len(entry.encode("utf-8")) > HERMES_REPORT_MEMORY_MAX_BYTES
+    ):
+        # This is a defensive final pass for future label or schema growth. It
+        # clips only variable lines and never touches the marker or labels.
+        variable_positions = (4, 5, 6, 7)
+        for position in variable_positions:
+            line = lines[position]
+            label, separator, value = line.partition(" ")
+            if not separator:
+                continue
+            lines[position] = f"{label} {_clip_text(value, 4, 12)}"
+            entry = "\n".join(lines)
+            if (
+                len(entry) <= HERMES_REPORT_MEMORY_MAX_CHARS
+                and len(entry.encode("utf-8")) <= HERMES_REPORT_MEMORY_MAX_BYTES
+            ):
+                break
+    if (
+        len(entry) > HERMES_REPORT_MEMORY_MAX_CHARS
+        or len(entry.encode("utf-8")) > HERMES_REPORT_MEMORY_MAX_BYTES
+    ):
+        raise ReportLearningError("Hermes report memory entry exceeds limit")
+    return entry
+
+
 def _render_reflection(
     record: ReportLearningRecord,
     revision: int,
@@ -716,20 +812,14 @@ def _render_reflection(
     )
     lesson = _bounded_lesson(required_lines, optional_lines)
     lesson = lesson.replace(_MEMORY_MARKER_PREFIX, "[report marker omitted]")
-    memory_entry = (
-        f"{REPORT_MEMORY_MARKER.format(session_id=record.session_id)}\n"
-        "Paper trading memory only; no real-order instruction.\n"
-        f"{lesson}"
+    memory_entry = _compact_memory_entry(
+        record,
+        revision,
+        outcomes,
+        reflection,
+        maturity_horizon,
+        market_context,
     )
-    if (
-        len(memory_entry) > HERMES_REPORT_MEMORY_MAX_CHARS
-        or len(memory_entry.encode("utf-8")) > HERMES_REPORT_MEMORY_MAX_CHARS
-    ):
-        memory_entry = _clip_text(
-            memory_entry,
-            HERMES_REPORT_MEMORY_MAX_CHARS,
-            HERMES_REPORT_MEMORY_MAX_CHARS,
-        )
     return RenderedReportLesson(lesson=lesson, hermes_memory_entry=memory_entry)
 
 

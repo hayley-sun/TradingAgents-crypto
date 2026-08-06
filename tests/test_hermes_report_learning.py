@@ -626,7 +626,12 @@ class HermesReportLearningTests(unittest.TestCase):
                 )
 
                 self.assertIn(section_text, record.revisions[0].lesson)
-                self.assertIn(section_text, record.revisions[0].hermes_memory_entry)
+                self.assertIn(
+                    hermes_report_learning.REPORT_MEMORY_MARKER.format(
+                        session_id=session.session_id
+                    ),
+                    record.revisions[0].hermes_memory_entry,
+                )
 
     def test_reflection_allows_decision_time_archived_news_context(self):
         with TemporaryDirectory() as directory:
@@ -867,10 +872,63 @@ class HermesReportLearningTests(unittest.TestCase):
         )
         self.assertLessEqual(
             len(rendered.hermes_memory_entry.encode("utf-8")),
-            hermes_report_learning.HERMES_REPORT_MEMORY_MAX_CHARS,
+            hermes_report_learning.HERMES_REPORT_MEMORY_MAX_BYTES,
         )
         self.assertIn("Causal hypotheses:", rendered.lesson)
         self.assertIn("Next paper-decision checks:", rendered.lesson)
+        marker = hermes_report_learning.REPORT_MEMORY_MARKER.format(
+            session_id=record.session_id
+        )
+        self.assertIn(marker, rendered.hermes_memory_entry)
+        self.assertIn("Maturity: T+15", rendered.hermes_memory_entry)
+        self.assertIn("Outcomes:", rendered.hermes_memory_entry)
+        self.assertIn("T+1", rendered.hermes_memory_entry)
+        self.assertIn("T+7", rendered.hermes_memory_entry)
+        self.assertIn("T+15", rendered.hermes_memory_entry)
+        self.assertIn("Decision-time market context:", rendered.hermes_memory_entry)
+        self.assertIn("Causal hypothesis:", rendered.hermes_memory_entry)
+        self.assertIn("Next paper-decision check:", rendered.hermes_memory_entry)
+        self.assertIn("paper trading", rendered.hermes_memory_entry.lower())
+        self.assertGreater(len(rendered.lesson), len(rendered.hermes_memory_entry))
+
+    def test_compact_renderer_keeps_required_sections_when_optional_content_is_tiny(self):
+        record = report_learning_record(horizons=(1,))
+        reflection = record.revisions[0].reflection.model_copy(
+            update={
+                "decision_thesis": "x",
+                "technical_context": "y",
+                "sentiment_context": None,
+                "news_context": None,
+                "fundamental_context": None,
+                "overall_assessment": "z",
+                "reasoning_strengths": ["good"],
+                "mistakes_or_missed_opportunities": [],
+                "causal_hypotheses": [
+                    ReportCausalHypothesis(
+                        statement="hypothesis",
+                        evidence=["report.market"],
+                        confidence="medium",
+                    )
+                ],
+                "next_decision_checks": ["check"],
+            }
+        )
+        record = record.model_copy(
+            update={
+                "revisions": [
+                    record.revisions[0].model_copy(update={"reflection": reflection})
+                ]
+            }
+        )
+
+        rendered = hermes_report_learning.render_report_lesson(record, revision=1)
+
+        self.assertIn("Maturity: T+1", rendered.hermes_memory_entry)
+        self.assertIn("Outcomes:", rendered.hermes_memory_entry)
+        self.assertIn("Decision-time market context:", rendered.hermes_memory_entry)
+        self.assertIn("Causal hypothesis:", rendered.hermes_memory_entry)
+        self.assertIn("Next paper-decision check:", rendered.hermes_memory_entry)
+        self.assertIn("Disclaimer:", rendered.hermes_memory_entry)
 
     def test_index_failure_leaves_ready_report_and_identical_retry_repairs_index(self):
         with TemporaryDirectory() as directory:

@@ -8,12 +8,129 @@ from pydantic import ValidationError
 
 from tradingagents.integrations.hermes_learning import LearningStore
 from tradingagents.integrations.hermes_report_learning import (
+    HERMES_ENTRY_DELIMITER_CHARS,
+    HERMES_MEMORY_CHAR_LIMIT,
+    HERMES_REPORT_ENTRY_RESERVATION,
+    HERMES_REPORT_MEMORY_MAX_CHARS,
     REPORT_MEMORY_MARKER,
     ReportLearningStore,
 )
 
 
 ENTRY_DELIMITER = "\n§\n"
+_HERMES_EXISTING_MEMORY_MAX_CHARS = 9000
+_CAPACITY_ERROR_CODES = frozenset(
+    {
+        "MEMORY_PATH_UNREADABLE",
+        "MEMORY_LIMIT_INVALID",
+        "MEMORY_LIMIT_TOO_SMALL",
+        "MEMORY_CAPACITY_EXCEEDED",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ReportMemoryCapacityVerification:
+    """Metadata-only capacity preflight for a supplied Hermes memory path."""
+
+    current_chars: int
+    configured_limit: int
+    reserved_report_chars: int
+    available_chars: int
+    ok: bool
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error_code is not None and self.error_code not in _CAPACITY_ERROR_CODES:
+            raise ValueError("invalid capacity error code")
+
+    def model_dump(self) -> dict[str, int | bool | str | None]:
+        return {
+            "current_chars": self.current_chars,
+            "configured_limit": self.configured_limit,
+            "reserved_report_chars": self.reserved_report_chars,
+            "available_chars": self.available_chars,
+            "ok": self.ok,
+            "error_code": self.error_code,
+        }
+
+    def model_dump_json(self) -> str:
+        return json.dumps(self.model_dump(), ensure_ascii=True, sort_keys=True)
+
+
+def _capacity_result(
+    *,
+    current_chars: int,
+    configured_limit: int,
+    ok: bool,
+    error_code: str | None = None,
+) -> ReportMemoryCapacityVerification:
+    reserved = (
+        HERMES_REPORT_ENTRY_RESERVATION * HERMES_REPORT_MEMORY_MAX_CHARS
+        + (HERMES_REPORT_ENTRY_RESERVATION - 1) * HERMES_ENTRY_DELIMITER_CHARS
+    )
+    available = max(configured_limit - current_chars, 0) if ok else 0
+    return ReportMemoryCapacityVerification(
+        current_chars=current_chars,
+        configured_limit=configured_limit,
+        reserved_report_chars=reserved,
+        available_chars=available,
+        ok=ok,
+        error_code=error_code,
+    )
+
+
+def verify_report_memory_capacity(
+    memory_path: Path,
+    memory_char_limit: int = HERMES_MEMORY_CHAR_LIMIT,
+) -> ReportMemoryCapacityVerification:
+    """Return count-only capacity metadata without mutating or exposing memory."""
+    if (
+        isinstance(memory_char_limit, bool)
+        or not isinstance(memory_char_limit, int)
+        or memory_char_limit <= 0
+    ):
+        return _capacity_result(
+            current_chars=0,
+            configured_limit=0,
+            ok=False,
+            error_code="MEMORY_LIMIT_INVALID",
+        )
+    if memory_char_limit < HERMES_MEMORY_CHAR_LIMIT:
+        return _capacity_result(
+            current_chars=0,
+            configured_limit=memory_char_limit,
+            ok=False,
+            error_code="MEMORY_LIMIT_TOO_SMALL",
+        )
+    if not isinstance(memory_path, (Path, str)):
+        return _capacity_result(
+            current_chars=0,
+            configured_limit=memory_char_limit,
+            ok=False,
+            error_code="MEMORY_PATH_UNREADABLE",
+        )
+    try:
+        current_chars = len(Path(memory_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, TypeError, ValueError):
+        return _capacity_result(
+            current_chars=0,
+            configured_limit=memory_char_limit,
+            ok=False,
+            error_code="MEMORY_PATH_UNREADABLE",
+        )
+    if current_chars > _HERMES_EXISTING_MEMORY_MAX_CHARS:
+        return _capacity_result(
+            current_chars=current_chars,
+            configured_limit=memory_char_limit,
+            ok=False,
+            error_code="MEMORY_CAPACITY_EXCEEDED",
+        )
+    return _capacity_result(
+        current_chars=current_chars,
+        configured_limit=memory_char_limit,
+        ok=True,
+    )
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,7 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
 from tradingagents.integrations import hermes_scheduled_review_runner as runner
 from tradingagents.integrations.hermes_report_memory_verifier import (
     ENTRY_DELIMITER,
+    verify_report_memory_capacity,
     verify_report_memory_consistency,
 )
 from tradingagents.integrations.schemas import (
@@ -394,6 +395,70 @@ class VersionTwoLifecycleHarness:
 
 
 class HermesReportMemoryTests(unittest.TestCase):
+    def test_report_memory_capacity_returns_count_only_metadata(self):
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text("operator memory\n", encoding="utf-8")
+
+            result = verify_report_memory_capacity(memory_path)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.current_chars, len("operator memory\n"))
+        self.assertEqual(result.configured_limit, 40000)
+        self.assertEqual(result.reserved_report_chars, 30897)
+        self.assertEqual(result.available_chars, 40000 - len("operator memory\n"))
+        serialized = result.model_dump_json()
+        self.assertNotIn("operator memory", serialized)
+        self.assertNotIn(str(memory_path), serialized)
+
+    def test_report_memory_capacity_fails_closed_at_boundaries(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            memory_path = root / "MEMORY.md"
+            memory_path.write_text("x" * 9000, encoding="utf-8")
+            exactly_limit = verify_report_memory_capacity(memory_path)
+            memory_path.write_text("x" * 9001, encoding="utf-8")
+            over_limit = verify_report_memory_capacity(memory_path)
+            too_small = verify_report_memory_capacity(memory_path, 39999)
+
+        self.assertTrue(exactly_limit.ok)
+        self.assertFalse(over_limit.ok)
+        self.assertFalse(too_small.ok)
+        self.assertEqual(exactly_limit.current_chars, 9000)
+        self.assertEqual(over_limit.current_chars, 9001)
+
+    def test_report_memory_capacity_missing_or_unreadable_is_safe_failure(self):
+        with TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing-MEMORY.md"
+            missing_result = verify_report_memory_capacity(missing)
+            unreadable = Path(directory) / "directory-memory"
+            unreadable.mkdir()
+            unreadable_result = verify_report_memory_capacity(unreadable)
+
+        for result in (missing_result, unreadable_result):
+            self.assertFalse(result.ok)
+            self.assertEqual(result.current_chars, 0)
+            self.assertEqual(result.available_chars, 0)
+            serialized = result.model_dump_json()
+            self.assertNotIn("private", serialized)
+            self.assertNotIn(str(result), serialized)
+
+    def test_report_memory_capacity_rejects_malformed_limits_without_reading(self):
+        with TemporaryDirectory() as directory:
+            memory_path = Path(directory) / "MEMORY.md"
+            memory_path.write_text("operator memory", encoding="utf-8")
+
+            results = [
+                verify_report_memory_capacity(memory_path, True),
+                verify_report_memory_capacity(memory_path, "40000"),
+                verify_report_memory_capacity(memory_path, -1),
+            ]
+
+        for result in results:
+            self.assertFalse(result.ok)
+            self.assertEqual(result.current_chars, 0)
+            self.assertEqual(result.available_chars, 0)
+
     def test_v2_report_lifecycle_keeps_one_project_and_memory_entry(self):
         with VersionTwoLifecycleHarness() as harness:
             harness.archive_new_report()
