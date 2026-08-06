@@ -787,6 +787,76 @@ class ReportLearningRecord(_StrictModel):
         return self
 
 
+class ReportMemoryRetirement(_StrictModel):
+    """One durable request to remove a completed report from Hermes memory."""
+
+    session_id: str
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    trade_date: date
+    revision: Literal[3] = 3
+    state: Literal[
+        "pending",
+        "memory_call_started",
+        "verification_pending",
+        "retired",
+        "attention_required",
+    ]
+    last_error_code: str | None = Field(default=None, max_length=100)
+    created_at: datetime
+    updated_at: datetime
+    retired_at: datetime | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        if not is_valid_session_id(value):
+            raise ValueError("invalid session id")
+        return value
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
+
+    @model_validator(mode="after")
+    def require_retirement_timestamp_for_retired_state(
+        self,
+    ) -> "ReportMemoryRetirement":
+        if self.state == "retired" and self.retired_at is None:
+            raise ValueError("retired item requires retirement time")
+        if self.state != "retired" and self.retired_at is not None:
+            raise ValueError("only retired item may have retirement time")
+        return self
+
+
+class ReportMemoryRetirementJournal(_StrictModel):
+    """Permanent per-symbol audit history for Hermes memory retirements."""
+
+    schema_version: Literal[1] = 1
+    symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
+    items: list[ReportMemoryRetirement] = Field(default_factory=list)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().upper()
+
+    @model_validator(mode="after")
+    def require_unique_symbol_scoped_sessions(
+        self,
+    ) -> "ReportMemoryRetirementJournal":
+        session_ids = [item.session_id for item in self.items]
+        if len(session_ids) != len(set(session_ids)):
+            raise ValueError("retirement journal session ids must be unique")
+        if any(item.symbol != self.symbol for item in self.items):
+            raise ValueError("retirement journal item symbol must match journal")
+        return self
+
+
 class ReportLearningIndexEntry(_StrictModel):
     session_id: str
     trade_date: date

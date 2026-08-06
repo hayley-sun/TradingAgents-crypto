@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from tradingagents.integrations import hermes_report_retention
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
 from tradingagents.integrations.hermes_mcp import (
     SessionStore,
@@ -23,6 +24,10 @@ from tradingagents.integrations.hermes_report_memory import (
     list_pending_report_memory,
     quarantine_report_memory,
 )
+from tradingagents.integrations.hermes_report_retention import (
+    ReportMemoryRetirementError,
+    ReportMemoryRetirementStore,
+)
 from tradingagents.integrations.hermes_reports import ReportBatchStore
 from tradingagents.integrations.hermes_scheduled_reviews import (
     ScheduledReviewStore,
@@ -38,6 +43,8 @@ from tradingagents.integrations.schemas import (
     AnalysisSession,
     DailyReportRequest,
     PriceReference,
+    ReportLearningRecord,
+    ReportMemoryRetirementJournal,
     utc_now,
 )
 from tests.test_hermes_report_learning import (
@@ -68,6 +75,36 @@ def report_store_with_ready_revisions(directory: str, *horizons: int):
             valid_reflection_payload(horizons=tuple(horizons[:revision])),
         )
     return report_store
+
+
+def confirmed_report_record(
+    session_number: int,
+    trade_date: date,
+    *,
+    symbol: str = "BTC",
+    horizons: tuple[int, ...] = (1, 7, 15),
+):
+    """Build an immutable report record with all included revisions verified."""
+    record = report_learning_record(
+        session_number=session_number,
+        trade_date=trade_date,
+        horizons=horizons,
+    )
+    now = utc_now()
+    revisions = [
+        revision.model_copy(
+            update={"memory_state": "confirmed", "verified_at": now}
+        )
+        for revision in record.revisions
+    ]
+    return ReportLearningRecord.model_validate(
+        {
+            **record.model_dump(),
+            "symbol": symbol,
+            "confirmed_revision": len(revisions),
+            "revisions": revisions,
+        }
+    )
 
 
 class FakeHermesMemory:
@@ -622,6 +659,144 @@ class HermesReportMemoryTests(unittest.TestCase):
         self.assertEqual(begin_payload["memory_state"], "verification_pending")
         self.assertNotIn("content", begin_payload)
         self.assertNotIn("old_text", begin_payload)
+
+
+class HermesReportMemoryRetentionTests(unittest.TestCase):
+    def test_sync_selects_only_oldest_completed_reports_beyond_five(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            report_store = ReportLearningStore(root / "report_memories")
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            completed = [
+                confirmed_report_record(
+                    number, date(2026, 7, number)
+                )
+                for number in range(1, 8)
+            ]
+            active_t7 = confirmed_report_record(
+                8, date(2026, 7, 8), horizons=(1, 7)
+            )
+            for record in [*completed, active_t7]:
+                report_store.save(record)
+            report_bytes = {
+                path: path.read_bytes()
+                for path in report_store.root.glob("hermes_*.json")
+            }
+
+            items = retirement_store.sync_symbol("btc", report_store.records())
+            repeated = retirement_store.sync_symbol("BTC", report_store.records())
+
+            self.assertEqual(
+                [item.session_id for item in items],
+                [
+                    "hermes_00000000000000000000000000000001",
+                    "hermes_00000000000000000000000000000002",
+                ],
+            )
+            self.assertTrue(all(item.state == "pending" for item in items))
+            self.assertEqual(repeated, items)
+            self.assertEqual(
+                {
+                    path: path.read_bytes()
+                    for path in report_store.root.glob("hermes_*.json")
+                },
+                report_bytes,
+            )
+
+    def test_sync_is_per_symbol_and_preserves_retirement_history(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            btc_records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            eth_records = [
+                confirmed_report_record(
+                    number + 100, date(2026, 7, number), symbol="ETH"
+                )
+                for number in range(1, 8)
+            ]
+
+            btc_items = retirement_store.sync_symbol("BTC", btc_records)
+            eth_items = retirement_store.sync_symbol("ETH", eth_records)
+            now = utc_now()
+            saved_btc = ReportMemoryRetirementJournal(
+                symbol="BTC",
+                items=[
+                    btc_items[0].model_copy(
+                        update={"state": "retired", "retired_at": now}
+                    ),
+                    btc_items[1].model_copy(
+                        update={
+                            "state": "attention_required",
+                            "last_error_code": "MEMORY_MARKER_DUPLICATE",
+                        }
+                    ),
+                ],
+            )
+            retirement_store.save(saved_btc)
+
+            reconciled_btc = retirement_store.sync_symbol("BTC", btc_records)
+            reconciled_eth = retirement_store.sync_symbol("ETH", eth_records)
+
+            self.assertEqual(
+                [(item.session_id, item.state) for item in reconciled_btc],
+                [
+                    (
+                        "hermes_00000000000000000000000000000001",
+                        "retired",
+                    ),
+                    (
+                        "hermes_00000000000000000000000000000002",
+                        "attention_required",
+                    ),
+                ],
+            )
+            self.assertEqual(
+                [item.session_id for item in reconciled_eth],
+                [
+                    "hermes_00000000000000000000000000000065",
+                    "hermes_00000000000000000000000000000066",
+                ],
+            )
+
+    def test_sync_preserves_existing_journal_bytes_when_storage_fails(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            initial_records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            retirement_store.sync_symbol("BTC", initial_records)
+            journal_path = retirement_store.path_for("BTC")
+            original_bytes = journal_path.read_bytes()
+            original_write = hermes_report_retention._atomic_json_write
+
+            def fail_write(_destination, _value):
+                raise OSError("simulated disk failure")
+
+            hermes_report_retention._atomic_json_write = fail_write
+            try:
+                with self.assertRaises(ReportMemoryRetirementError):
+                    retirement_store.sync_symbol(
+                        "BTC",
+                        [
+                            *initial_records,
+                            confirmed_report_record(8, date(2026, 7, 8)),
+                        ],
+                    )
+            finally:
+                hermes_report_retention._atomic_json_write = original_write
+
+            self.assertEqual(journal_path.read_bytes(), original_bytes)
 
 
 if __name__ == "__main__":

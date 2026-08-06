@@ -19,6 +19,8 @@ from tradingagents.integrations.schemas import (
     ReportLearningIndexEntry,
     ReportLearningRecord,
     ReportLearningRevision,
+    ReportMemoryRetirement,
+    ReportMemoryRetirementJournal,
     ReportLearningOutcome,
     ReportOutcomeAssessment,
     ReportReflection,
@@ -34,6 +36,42 @@ from tradingagents.integrations.schemas import (
 
 
 class HermesSchemaTests(unittest.TestCase):
+    def test_report_memory_retirement_models_are_strict_and_coherent(self):
+        now = utc_now()
+        item = ReportMemoryRetirement(
+            session_id="hermes_0123456789abcdef",
+            symbol=" btc ",
+            trade_date="2026-08-05",
+            revision=3,
+            state="pending",
+            created_at=now,
+            updated_at=now,
+        )
+        journal = ReportMemoryRetirementJournal(symbol=" btc ", items=[item])
+
+        self.assertEqual(item.symbol, "BTC")
+        self.assertEqual(item.revision, 3)
+        self.assertEqual(journal.symbol, "BTC")
+        self.assertEqual(journal.items, [item])
+
+        invalid_items = (
+            {**item.model_dump(), "session_id": "../hermes_0123456789abcdef"},
+            {**item.model_dump(), "revision": 2},
+            {**item.model_dump(), "state": "removed"},
+            {**item.model_dump(), "last_error_code": "x" * 101},
+            {**item.model_dump(), "unexpected": True},
+        )
+        for invalid_item in invalid_items:
+            with self.subTest(invalid_item=invalid_item), self.assertRaises(
+                ValidationError
+            ):
+                ReportMemoryRetirement.model_validate(invalid_item)
+
+        with self.assertRaises(ValidationError):
+            ReportMemoryRetirementJournal(symbol="BTC", items=[item, item])
+        with self.assertRaises(ValidationError):
+            ReportMemoryRetirementJournal(symbol="ETH", items=[item])
+
     def test_hermes_modules_remain_compatible_with_python_310_datetime(self):
         project_root = Path(__file__).resolve().parents[1]
         for relative_path in (
