@@ -101,8 +101,10 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-上述 `memory` 配置是部署值。它为 Hermes 内置 memory 的固定容量预留空间；项目
-脚本不会读取、编辑或写入 `MEMORY.md`，只有 Hermes Agent 的内置 memory tool 可以
+上述 `memory` 配置是部署值。它为 Hermes 内置 memory 的固定容量预留空间；项目脚本
+和 verifier 不会直接修改或写入 `MEMORY.md`，也不会暴露 raw memory text。`report-memory-capacity`
+只执行 count-only read-only verification，`confirm-report-memory-retirement` 只执行
+marker-occurrence read-only verification；只有 Hermes Agent 的内置 memory tool 可以
 add、replace 或 remove 条目。
 
 仅设置当前活动 LLM 提供商的密钥，并删除其余 LLM 密钥项。DeepSeek 使用 `DEEPSEEK_API_KEY`；可选替代项为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GOOGLE_API_KEY` 和 `OPENROUTER_API_KEY`。数据提供商使用 `FINNHUB_API_KEY`。CoinGecko 为可选项，可使用 `COINGECKO_DEMO_API_KEY` 或 `COINGECKO_PRO_API_KEY`。`CRYPTOCOMPARE_API_KEY` 仅作为历史价格 fallback 使用。

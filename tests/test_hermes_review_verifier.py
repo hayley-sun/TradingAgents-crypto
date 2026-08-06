@@ -406,6 +406,11 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("持久保留全部复盘索引项", runbook)
         self.assertIn("最近 5 条", runbook)
         self.assertIn("MEMORY.md", runbook)
+        self.assertIn("不会直接修改或写入 `MEMORY.md`", runbook)
+        self.assertIn("count-only read-only verification", runbook)
+        self.assertIn("marker-occurrence read-only verification", runbook)
+        self.assertIn("不会暴露 raw memory text", runbook)
+        self.assertNotIn("脚本不会读取、编辑或写入 `MEMORY.md`", runbook)
 
     def test_scheduled_skill_promotes_legacy_then_report_memory(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
