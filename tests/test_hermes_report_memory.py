@@ -839,6 +839,105 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
 
             self.assertEqual(journal_path.read_bytes(), original_bytes)
 
+    def test_stale_save_cannot_drop_newly_synchronized_retirement(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            initial_records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            retirement_store.sync_symbol("BTC", initial_records)
+            stale_journal = retirement_store.load("BTC")
+            self.assertIsNotNone(stale_journal)
+            self.assertEqual(len(stale_journal.items), 2)
+
+            retirement_store.sync_symbol(
+                "BTC",
+                [
+                    *initial_records,
+                    confirmed_report_record(8, date(2026, 7, 8)),
+                ],
+            )
+            journal_path = retirement_store.path_for("BTC")
+            synchronized_bytes = journal_path.read_bytes()
+
+            with self.assertRaises(ReportMemoryRetirementError):
+                retirement_store.save(stale_journal)
+
+            final_journal = retirement_store.load("BTC")
+            self.assertIsNotNone(final_journal)
+            self.assertEqual(len(final_journal.items), 3)
+            self.assertEqual(journal_path.read_bytes(), synchronized_bytes)
+
+    def test_update_transitions_latest_journal_without_external_stale_mutation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            retirement_store.sync_symbol("BTC", records)
+
+            def begin_first(journal):
+                return journal.model_copy(
+                    update={
+                        "items": [
+                            journal.items[0].model_copy(
+                                update={
+                                    "state": "memory_call_started",
+                                    "updated_at": utc_now(),
+                                }
+                            ),
+                            *journal.items[1:],
+                        ]
+                    }
+                )
+
+            updated = retirement_store.update("BTC", begin_first)
+
+            self.assertEqual(updated.items[0].state, "memory_call_started")
+            reloaded = retirement_store.load("BTC")
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.items[0].state, "memory_call_started")
+
+    def test_save_revalidates_tampered_journal_before_replacing_bytes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "results" / "hermes"
+            retirement_store = ReportMemoryRetirementStore(
+                root / "report_memory_retirements"
+            )
+            records = [
+                confirmed_report_record(number, date(2026, 7, number))
+                for number in range(1, 8)
+            ]
+            retirement_store.sync_symbol("BTC", records)
+            journal_path = retirement_store.path_for("BTC")
+            original_bytes = journal_path.read_bytes()
+
+            for field_name, invalid_value in (
+                ("marker", "[TradingAgents paper report: forged]"),
+                ("session_id", "hermes_not-a-valid-session"),
+            ):
+                with self.subTest(field_name=field_name):
+                    tampered = retirement_store.load("BTC")
+                    self.assertIsNotNone(tampered)
+                    object.__setattr__(tampered.items[0], field_name, invalid_value)
+
+                    with self.assertRaises(ReportMemoryRetirementError):
+                        retirement_store.save(tampered)
+
+                    self.assertEqual(journal_path.read_bytes(), original_bytes)
+                    self.assertEqual(
+                        retirement_store.load("BTC").items[0].marker,
+                        "[TradingAgents paper report: hermes_00000000000000000000000000000001]",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

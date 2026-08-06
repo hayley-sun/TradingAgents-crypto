@@ -791,6 +791,8 @@ class ReportLearningRecord(_StrictModel):
 class ReportMemoryRetirement(_StrictModel):
     """One durable request to remove a completed report from Hermes memory."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     session_id: str
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     trade_date: date
@@ -844,6 +846,8 @@ class ReportMemoryRetirement(_StrictModel):
 
 class ReportMemoryRetirementJournal(_StrictModel):
     """Permanent per-symbol audit history for Hermes memory retirements."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[1] = 1
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")

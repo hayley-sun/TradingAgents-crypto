@@ -3,7 +3,7 @@
 import json
 import os
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -103,9 +103,10 @@ class ReportMemoryRetirementStore:
             ) from error
 
     def _save_unlocked(self, journal: ReportMemoryRetirementJournal) -> None:
+        persisted = self._validated_journal(journal)
         try:
             _atomic_json_write(
-                self.path_for(journal.symbol), journal.model_dump(mode="json")
+                self.path_for(persisted.symbol), persisted.model_dump(mode="json")
             )
         except OSError as error:
             raise ReportMemoryRetirementError(
@@ -113,8 +114,51 @@ class ReportMemoryRetirementStore:
             ) from error
 
     def save(self, journal: ReportMemoryRetirementJournal) -> None:
-        with self.locked(journal.symbol):
-            self._save_unlocked(journal)
+        try:
+            normalized_symbol = self._normalize_symbol(journal.symbol)
+        except ValueError as error:
+            raise ReportMemoryRetirementError(
+                "invalid report memory retirement journal"
+            ) from error
+        with self.locked(normalized_symbol):
+            current = self.load(normalized_symbol)
+            proposed = self._validated_journal(journal)
+            if proposed.symbol != normalized_symbol:
+                raise ReportMemoryRetirementError(
+                    "report memory retirement journal symbol mismatch"
+                )
+            self._require_existing_identities(current, proposed)
+            if proposed != current:
+                self._save_unlocked(proposed)
+
+    def update(
+        self,
+        symbol: str,
+        mutator: Callable[
+            [ReportMemoryRetirementJournal | None], ReportMemoryRetirementJournal
+        ],
+    ) -> ReportMemoryRetirementJournal:
+        """Apply a locked read-modify-write transition to one symbol journal."""
+        try:
+            normalized_symbol = self._normalize_symbol(symbol)
+        except ValueError as error:
+            raise ReportMemoryRetirementError(
+                "invalid report memory retirement journal"
+            ) from error
+        with self.locked(normalized_symbol):
+            current = self.load(normalized_symbol)
+            latest = None if current is None else current.model_copy(deep=True)
+            proposed = self._validated_journal(mutator(latest))
+            if proposed.symbol != normalized_symbol:
+                raise ReportMemoryRetirementError(
+                    "report memory retirement journal symbol mismatch"
+                )
+            self._require_existing_identities(current, proposed)
+            if current is None and not proposed.items:
+                return proposed
+            if proposed != current:
+                self._save_unlocked(proposed)
+            return proposed
 
     @contextmanager
     def locked(self, symbol: str) -> Iterator[None]:
@@ -132,6 +176,53 @@ class ReportMemoryRetirementStore:
             raise ReportMemoryRetirementError(
                 "report memory retirement store unavailable"
             ) from error
+
+    @staticmethod
+    def _validated_journal(
+        journal: ReportMemoryRetirementJournal,
+    ) -> ReportMemoryRetirementJournal:
+        try:
+            return ReportMemoryRetirementJournal.model_validate(
+                journal.model_dump(mode="json")
+            )
+        except (TypeError, ValueError, ValidationError) as error:
+            raise ReportMemoryRetirementError(
+                "invalid report memory retirement journal"
+            ) from error
+
+    @staticmethod
+    def _require_existing_identities(
+        current: ReportMemoryRetirementJournal | None,
+        proposed: ReportMemoryRetirementJournal,
+    ) -> None:
+        if current is None:
+            return
+        current_by_session = {item.session_id: item for item in current.items}
+        proposed_by_session = {item.session_id: item for item in proposed.items}
+        if not current_by_session.keys() <= proposed_by_session.keys():
+            raise ReportMemoryRetirementError(
+                "report memory retirement journal drops existing item"
+            )
+        for session_id, current_item in current_by_session.items():
+            proposed_item = proposed_by_session[session_id]
+            current_identity = (
+                current_item.session_id,
+                current_item.symbol,
+                current_item.trade_date,
+                current_item.revision,
+                current_item.marker,
+            )
+            proposed_identity = (
+                proposed_item.session_id,
+                proposed_item.symbol,
+                proposed_item.trade_date,
+                proposed_item.revision,
+                proposed_item.marker,
+            )
+            if proposed_identity != current_identity:
+                raise ReportMemoryRetirementError(
+                    "report memory retirement item identity changed"
+                )
 
     def sync_symbol(
         self,
@@ -152,10 +243,11 @@ class ReportMemoryRetirementStore:
             key=lambda record: (record.trade_date, record.session_id),
             reverse=True,
         )
-        older_completed = reversed(completed[5:])
+        older_completed = list(reversed(completed[5:]))
 
-        with self.locked(normalized_symbol):
-            journal = self.load(normalized_symbol)
+        def append_candidates(
+            journal: ReportMemoryRetirementJournal | None,
+        ) -> ReportMemoryRetirementJournal:
             existing_items = [] if journal is None else journal.items
             existing_session_ids = {item.session_id for item in existing_items}
             additions = [
@@ -171,11 +263,9 @@ class ReportMemoryRetirementStore:
                 for record in older_completed
                 if record.session_id not in existing_session_ids
             ]
-            if not additions:
-                return list(existing_items)
-            updated = ReportMemoryRetirementJournal(
+            return ReportMemoryRetirementJournal(
                 symbol=normalized_symbol,
                 items=[*existing_items, *additions],
             )
-            self._save_unlocked(updated)
-            return list(updated.items)
+
+        return list(self.update(normalized_symbol, append_candidates).items)
