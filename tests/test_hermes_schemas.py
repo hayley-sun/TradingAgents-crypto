@@ -43,6 +43,7 @@ class HermesSchemaTests(unittest.TestCase):
             symbol=" btc ",
             trade_date="2026-08-05",
             revision=3,
+            marker="[TradingAgents paper report: hermes_0123456789abcdef]",
             state="pending",
             created_at=now,
             updated_at=now,
@@ -57,6 +58,10 @@ class HermesSchemaTests(unittest.TestCase):
         invalid_items = (
             {**item.model_dump(), "session_id": "../hermes_0123456789abcdef"},
             {**item.model_dump(), "revision": 2},
+            {
+                **item.model_dump(),
+                "marker": "[TradingAgents paper report: hermes_deadbeefdeadbeef]",
+            },
             {**item.model_dump(), "state": "removed"},
             {**item.model_dump(), "last_error_code": "x" * 101},
             {**item.model_dump(), "unexpected": True},

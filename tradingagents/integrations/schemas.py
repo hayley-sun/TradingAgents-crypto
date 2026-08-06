@@ -22,6 +22,7 @@ _SESSION_ID_PATTERN = re.compile(r"^hermes_[0-9a-f]{16,64}$")
 _REVIEW_ID_PATTERN = re.compile(r"^review_[0-9a-f]{16,64}$")
 _REPORT_BATCH_ID_PATTERN = re.compile(r"^report_[0-9a-f]{16,64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9]{2,20}$")
+_REPORT_MEMORY_MARKER_TEMPLATE = "[TradingAgents paper report: {session_id}]"
 
 _NonBlankText100 = Annotated[str, Field(min_length=1, max_length=100)]
 _NonBlankText400 = Annotated[str, Field(min_length=1, max_length=400)]
@@ -794,6 +795,7 @@ class ReportMemoryRetirement(_StrictModel):
     symbol: str = Field(pattern=r"^[A-Za-z0-9]{2,20}$")
     trade_date: date
     revision: Literal[3] = 3
+    marker: str = Field(min_length=1, max_length=100)
     state: Literal[
         "pending",
         "memory_call_started",
@@ -819,6 +821,15 @@ class ReportMemoryRetirement(_StrictModel):
         if not isinstance(value, str):
             return value
         return value.strip().upper()
+
+    @field_validator("marker")
+    @classmethod
+    def validate_marker_identity(cls, value: str, info) -> str:
+        session_id = info.data.get("session_id")
+        expected = _REPORT_MEMORY_MARKER_TEMPLATE.format(session_id=session_id)
+        if value != expected:
+            raise ValueError("retirement marker must match session id")
+        return value
 
     @model_validator(mode="after")
     def require_retirement_timestamp_for_retired_state(

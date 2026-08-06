@@ -18,6 +18,9 @@ from tradingagents.integrations.schemas import (
 )
 
 
+REPORT_MEMORY_MARKER = "[TradingAgents paper report: {session_id}]"
+
+
 class ReportMemoryRetirementError(RuntimeError):
     """Raised when the retirement journal cannot be read or written safely."""
 
@@ -60,6 +63,9 @@ class ReportMemoryRetirementStore:
 
     def path_for(self, symbol: str) -> Path:
         return self.root / f"{self._normalize_symbol(symbol)}.json"
+
+    def lock_path_for(self, symbol: str) -> Path:
+        return Path(f"{self.path_for(symbol)}.lock")
 
     def load(self, symbol: str) -> ReportMemoryRetirementJournal | None:
         normalized_symbol = self._normalize_symbol(symbol)
@@ -107,14 +113,14 @@ class ReportMemoryRetirementStore:
             ) from error
 
     def save(self, journal: ReportMemoryRetirementJournal) -> None:
-        with self.locked():
+        with self.locked(journal.symbol):
             self._save_unlocked(journal)
 
     @contextmanager
-    def locked(self) -> Iterator[None]:
+    def locked(self, symbol: str) -> Iterator[None]:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            with (self.root / ".report-memory-retirements.lock").open(
+            with self.lock_path_for(symbol).open(
                 "a", encoding="ascii"
             ) as lock_file:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -148,7 +154,7 @@ class ReportMemoryRetirementStore:
         )
         older_completed = reversed(completed[5:])
 
-        with self.locked():
+        with self.locked(normalized_symbol):
             journal = self.load(normalized_symbol)
             existing_items = [] if journal is None else journal.items
             existing_session_ids = {item.session_id for item in existing_items}
@@ -157,6 +163,7 @@ class ReportMemoryRetirementStore:
                     session_id=record.session_id,
                     symbol=normalized_symbol,
                     trade_date=record.trade_date,
+                    marker=REPORT_MEMORY_MARKER.format(session_id=record.session_id),
                     state="pending",
                     created_at=utc_now(),
                     updated_at=utc_now(),

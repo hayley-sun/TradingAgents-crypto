@@ -696,6 +696,26 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                 ],
             )
             self.assertTrue(all(item.state == "pending" for item in items))
+            expected_markers = [
+                f"[TradingAgents paper report: {item.session_id}]" for item in items
+            ]
+            self.assertEqual([item.marker for item in items], expected_markers)
+            loaded = retirement_store.load("BTC")
+            self.assertIsNotNone(loaded)
+            self.assertEqual([item.marker for item in loaded.items], expected_markers)
+
+            original_marker_template = hermes_report_retention.REPORT_MEMORY_MARKER
+            hermes_report_retention.REPORT_MEMORY_MARKER = "[changed marker: {session_id}]"
+            try:
+                after_template_change = retirement_store.sync_symbol(
+                    "BTC", report_store.records()
+                )
+            finally:
+                hermes_report_retention.REPORT_MEMORY_MARKER = original_marker_template
+
+            self.assertEqual(
+                [item.marker for item in after_template_change], expected_markers
+            )
             self.assertEqual(repeated, items)
             self.assertEqual(
                 {
@@ -704,6 +724,27 @@ class HermesReportMemoryRetentionTests(unittest.TestCase):
                 },
                 report_bytes,
             )
+
+    def test_symbol_scoped_locks_are_normalized_and_not_shared(self):
+        with TemporaryDirectory() as directory:
+            root = (
+                Path(directory)
+                / "results"
+                / "hermes"
+                / "report_memory_retirements"
+            )
+            retirement_store = ReportMemoryRetirementStore(root)
+
+            btc_lock = retirement_store.lock_path_for(" btc ")
+            eth_lock = retirement_store.lock_path_for("ETH")
+
+            self.assertEqual(
+                btc_lock, retirement_store.path_for("BTC").with_suffix(".json.lock")
+            )
+            self.assertNotEqual(btc_lock, eth_lock)
+            with retirement_store.locked("BTC"):
+                self.assertTrue(btc_lock.exists())
+                self.assertFalse((root / ".report-memory-retirements.lock").exists())
 
     def test_sync_is_per_symbol_and_preserves_retirement_history(self):
         with TemporaryDirectory() as directory:
