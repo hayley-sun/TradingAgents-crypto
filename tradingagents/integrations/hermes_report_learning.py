@@ -480,7 +480,7 @@ _UNSUPPORTED_SOURCE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
-_HERMES_ENTRY_DELIMITER_PATTERN = re.compile(r"(?:\r?\n)[ \t]*§[ \t]*(?:\r?\n)")
+_HERMES_ENTRY_DELIMITER_PATTERN = re.compile(r"(?:\n§\n|\r\n§\r\n)")
 
 
 def _reflection_text_values(value) -> Iterator[str]:
