@@ -2,23 +2,30 @@ import asyncio
 import json
 import os
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import chromadb
+from jsonschema import Draft202012Validator
 from chromadb.config import Settings
+import tradingagents.integrations.hermes_mcp as hermes_mcp
 
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.dataflows.crypto_price_references import HistoricalUsdReference
 from tradingagents.integrations.hermes_learning import LearningStore, ReviewStore
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.hermes_reports import ReportBatchStore
 from tradingagents.integrations.hermes_scheduled_reviews import ScheduledReviewStore
 from tradingagents.integrations.schemas import (
     AnalysisRequest,
     AnalysisResult,
     AnalysisSession,
+    PaperDecisionReview,
     PriceReference,
 )
 
@@ -35,6 +42,7 @@ from tradingagents.integrations.hermes_mcp import (
     run_queued_analysis,
     start_daily_report_batch_impl,
     start_analysis,
+    submit_report_reflection_impl,
 )
 
 
@@ -79,6 +87,179 @@ def paired_price_references(entry_price=100.0, review_price=90.0, source="coinge
 
 
 class HermesMcpTests(unittest.TestCase):
+    def valid_reflection_payload(self):
+        return {
+            "decision_thesis": "Buy only after the archived confirmation signal.",
+            "overall_assessment": "The paper decision was disciplined but uncertain.",
+            "outcome_assessments": [{"horizon_days": 1, "assessment": "T+1 was assessed."}],
+            "reasoning_strengths": ["The entry condition was explicit."],
+            "causal_hypotheses": [{"statement": "Momentum may have persisted.", "evidence": ["report.market", "outcome.t1"], "confidence": "medium"}],
+            "mistakes_or_missed_opportunities": ["The analysis lacked an invalidation level."],
+            "next_decision_checks": ["Check confirmation volume."],
+        }
+
+    def test_submit_report_reflection_tool_rejects_unknown_fields(self):
+        tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        self.assertIs(tool.parameters["additionalProperties"], False)
+        self.assertIs(
+            tool.parameters["properties"]["reflection"]["additionalProperties"],
+            False,
+        )
+        _, result = asyncio.run(MCP.call_tool(
+            "submit_report_reflection",
+            {"session_id":"hermes_0123456789abcdef","expected_revision":1,"reflection":self.valid_reflection_payload(),"unexpected":True},
+        ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_submit_report_reflection_tool_rejects_nested_unknown_fields(self):
+        reflection = self.valid_reflection_payload()
+        reflection["unexpected_nested"] = True
+        _, result = asyncio.run(MCP.call_tool(
+            "submit_report_reflection",
+            {
+                "session_id": "hermes_0123456789abcdef",
+                "expected_revision": 1,
+                "reflection": reflection,
+            },
+        ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_submit_report_reflection_schema_resolves_nested_refs(self):
+        tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        arguments = {
+            "session_id": "hermes_0123456789abcdef",
+            "expected_revision": 1,
+            "reflection": self.valid_reflection_payload(),
+        }
+        validator = Draft202012Validator(tool.parameters)
+        self.assertEqual(list(validator.iter_errors(arguments)), [])
+        invalid = dict(arguments)
+        invalid["reflection"] = {
+            **arguments["reflection"],
+            "unexpected_nested": True,
+        }
+        self.assertTrue(list(validator.iter_errors(invalid)))
+
+    def test_submit_report_reflection_tool_rejects_non_strict_revisions_before_storage(self):
+        for revision in (True, 1.0, "1"):
+            with self.subTest(revision=revision), patch.object(
+                hermes_mcp,
+                "SessionStore",
+                side_effect=AssertionError("store accessed"),
+            ):
+                _, result = asyncio.run(MCP.call_tool(
+                    "submit_report_reflection",
+                    {
+                        "session_id": "hermes_0123456789abcdef",
+                        "expected_revision": revision,
+                        "reflection": self.valid_reflection_payload(),
+                    },
+                ))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+
+    def test_attention_required_reflection_rejects_malformed_retry_without_write(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            session_store = SessionStore(root / "sessions")
+            report_store = ReportLearningStore(root / "report_memories")
+            learning_store = LearningStore(root / "memories")
+            request = self.make_request()
+            session = AnalysisSession(
+                session_id="hermes_0123456789abcdef",
+                status="completed",
+                created_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+                request=request,
+                result=AnalysisResult(
+                    reports={"market": "Archived market report."},
+                    investment_plan="plan",
+                    trader_investment_plan="trader plan",
+                    final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                    processed_signal="BUY",
+                ),
+            )
+            session_store.save(session)
+            review_date = request.trade_date + timedelta(days=1)
+            record_review_fact(
+                report_store,
+                session,
+                PaperDecisionReview(
+                    review_id="review_0123456789abcdef0123456789abcdef",
+                    session_id=session.session_id,
+                    symbol=request.symbol,
+                    trade_date=request.trade_date,
+                    review_date=review_date,
+                    horizon_days=1,
+                    action="BUY",
+                    entry_price=PriceReference(
+                        date=request.trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    review_price=PriceReference(
+                        date=review_date, usd_price=101.0, source="coinbase"
+                    ),
+                    raw_return_pct=1.0,
+                    verdict="correct",
+                    created_at=datetime.now(timezone.utc),
+                    hermes_memory_entry="Legacy paper lesson.",
+                ),
+            )
+            unsafe_reflection = self.valid_reflection_payload()
+            unsafe_reflection["overall_assessment"] = (
+                "This outcome was guaranteed."
+            )
+
+            for attempt in range(1, 4):
+                result = submit_report_reflection_impl(
+                    {
+                        "session_id": session.session_id,
+                        "expected_revision": 1,
+                        "reflection": unsafe_reflection,
+                    },
+                    session_store=session_store,
+                    report_store=report_store,
+                    learning_store=learning_store,
+                )
+                snapshot = report_store.load(session.session_id).revisions[0]
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    result["error"]["code"], "REFLECTION_UNSAFE_CONTENT"
+                )
+                self.assertEqual(snapshot.reflection_attempt_count, attempt)
+                self.assertEqual(
+                    snapshot.reflection_state,
+                    "attention_required" if attempt == 3 else "pending",
+                )
+                self.assertEqual(
+                    snapshot.last_error_code, "REFLECTION_UNSAFE_CONTENT"
+                )
+
+            record_path = report_store.path_for(session.session_id)
+            quarantined_bytes = record_path.read_bytes()
+            quarantined_snapshot = report_store.load(session.session_id).revisions[0]
+            malformed_reflection = self.valid_reflection_payload()
+            malformed_reflection.pop("decision_thesis")
+
+            retry = submit_report_reflection_impl(
+                {
+                    "session_id": session.session_id,
+                    "expected_revision": 1,
+                    "reflection": malformed_reflection,
+                },
+                session_store=session_store,
+                report_store=report_store,
+                learning_store=learning_store,
+            )
+            retried_snapshot = report_store.load(session.session_id).revisions[0]
+
+            self.assertFalse(retry["ok"])
+            self.assertEqual(retry["error"]["code"], "REPORT_REFLECTION_STALE")
+            self.assertEqual(record_path.read_bytes(), quarantined_bytes)
+            self.assertEqual(retried_snapshot, quarantined_snapshot)
+
     def make_request(self):
         return AnalysisRequest(
             symbol="BTCUSDT",
@@ -423,9 +604,12 @@ class HermesMcpTests(unittest.TestCase):
                 session_loader=lambda _session_id: session,
             )
             plan = schedule_store.load(date(2026, 7, 29))
+            persisted_batch = batch_store.load(date(2026, 7, 29))
 
         self.assertTrue(result["ok"])
         self.assertIsNotNone(plan)
+        self.assertEqual(plan.workflow_version, 2)
+        self.assertEqual(persisted_batch.archive.scheduled_review_version, 2)
         self.assertEqual([item.horizon_days for item in plan.items], [1, 7, 15])
 
     def test_existing_unmarked_archive_is_not_backfilled(self):
@@ -545,6 +729,21 @@ class HermesMcpTests(unittest.TestCase):
         )
         provider_key.assert_called_once_with("openai")
         cleanup.assert_called_once()
+
+    @patch("tradingagents.integrations.hermes_mcp.LearningStore.from_environment")
+    def test_load_learning_lessons_returns_balanced_five_lessons(self, learning_store_factory):
+        learning_store_factory.return_value.lessons_for.return_value = [
+            "lesson 1",
+            "lesson 2",
+            "lesson 3",
+            "lesson 4",
+            "lesson 5",
+        ]
+
+        lessons = hermes_mcp._load_learning_lessons("BTC")
+
+        self.assertEqual(lessons, ["lesson 1", "lesson 2", "lesson 3", "lesson 4", "lesson 5"])
+        learning_store_factory.return_value.lessons_for.assert_called_once_with("BTC", limit=5)
 
     @patch("tradingagents.integrations.hermes_mcp._cleanup_session_collections")
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
@@ -739,6 +938,41 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(result["data"]["review"]["action"], "SELL")
         self.assertEqual(result["data"]["review"]["verdict"], "correct")
         self.assertIn("Paper-trading research lesson", result["data"]["hermes_memory_entry"])
+
+    def test_review_can_skip_legacy_learning_index(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "hermes"
+            store = SessionStore(root / "sessions")
+            session_id = "hermes_0123456789abcdef"
+            session = store.create(session_id, self.make_request(), status="queued")
+            store.save(
+                session.model_copy(
+                    update={
+                        "status": "completed",
+                        "result": AnalysisResult(
+                            reports={},
+                            investment_plan="plan",
+                            trader_investment_plan="trader plan",
+                            final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                            processed_signal="BUY",
+                        ),
+                    }
+                )
+            )
+            learning_store = LearningStore(root / "memories")
+
+            result = review_paper_decision_impl(
+                {"session_id": session_id, "review_date": "2026-07-29"},
+                store=store,
+                review_store=ReviewStore(root / "reviews"),
+                learning_store=learning_store,
+                price_reference_resolver=paired_price_references(),
+                current_date=date(2026, 7, 29),
+                write_legacy_learning=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(learning_store.root.exists())
 
     def test_review_uses_default_same_source_resolver(self):
         with TemporaryDirectory() as temp_dir:

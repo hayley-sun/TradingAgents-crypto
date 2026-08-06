@@ -48,6 +48,7 @@ class ScheduledReviewProcessReport:
     retryable_count: int
     skipped_count: int
     attention_required_count: int = 0
+    report_fact_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ class ScheduledReviewStore:
                 batch_id=batch.batch_id,
                 trade_date=batch.request.trade_date,
                 created_at=utc_now(),
+                workflow_version=batch.archive.scheduled_review_version or 1,
                 items=items,
             )
             self.save(plan)
@@ -322,7 +324,8 @@ def _successful_review_matches(
 def process_due_reviews(
     store: ScheduledReviewStore,
     current_utc_date: date,
-    reviewer: Callable[[str, date], dict[str, Any]],
+    reviewer: Callable[[str, date, int], dict[str, Any]],
+    fact_recorder: Callable[[PaperDecisionReview], Any] | None = None,
 ) -> ScheduledReviewProcessReport:
     """Process only review dates whose UTC calendar day has fully elapsed."""
     if not isinstance(current_utc_date, date):
@@ -332,72 +335,142 @@ def process_due_reviews(
     retryable_count = 0
     skipped_count = 0
     attention_required_count = 0
+    report_fact_count = 0
+
+    def transition_pending(review_id: str, **updates: Any) -> bool:
+        try:
+            store.transition_item(review_id, "review_pending", **updates)
+        except ScheduledReviewStateConflict:
+            return False
+        return True
+
     with store.processing_lock():
+        plans = store.plans()
+        item_states = {
+            item.review_id: item.state
+            for plan in plans
+            for item in plan.items
+            if item.review_id is not None
+        }
         due_items = sorted(
             (
-                (plan.trade_date, item)
-                for plan in store.plans()
+                (plan, item)
+                for plan in plans
                 for item in plan.items
                 if item.state == "review_pending"
                 and item.review_date < current_utc_date
             ),
             key=lambda candidate: (
                 candidate[1].review_date,
-                candidate[0],
+                candidate[0].trade_date,
                 candidate[1].symbol,
                 candidate[1].horizon_days,
             ),
         )
-        for trade_date, item in due_items:
+        for plan, item in due_items:
+            if plan.workflow_version == 2 and any(
+                candidate.session_id == item.session_id
+                and candidate.horizon_days < item.horizon_days
+                and item_states.get(candidate.review_id) != "completed"
+                for candidate in plan.items
+            ):
+                continue
+            trade_date = plan.trade_date
             due_count += 1
             try:
-                result = reviewer(item.session_id, item.review_date)
+                result = reviewer(
+                    item.session_id, item.review_date, plan.workflow_version
+                )
             except Exception:
+                result = {
+                    "ok": False,
+                    "error": {"code": "SCHEDULED_REVIEW_FAILED"},
+                }
+            if not isinstance(result, dict):
                 result = {
                     "ok": False,
                     "error": {"code": "SCHEDULED_REVIEW_FAILED"},
                 }
             attempts = item.attempt_count + 1
             if _successful_review_matches(result, trade_date, item):
-                store.update_item(
+                if plan.workflow_version == 2:
+                    try:
+                        review = PaperDecisionReview.model_validate(result["data"]["review"])
+                        if fact_recorder is None:
+                            raise RuntimeError("report fact recorder unavailable")
+                        fact_recorder(review)
+                    except Exception:
+                        if not transition_pending(
+                            item.review_id,
+                            attempt_count=attempts,
+                            last_error_code="REPORT_FACT_WRITE_FAILED",
+                            updated_at=utc_now(),
+                        ):
+                            retryable_count += 1
+                            continue
+                        retryable_count += 1
+                        continue
+                    if not transition_pending(
+                        item.review_id,
+                        state="completed",
+                        attempt_count=attempts,
+                        last_error_code=None,
+                        verified_at=utc_now(),
+                        updated_at=utc_now(),
+                    ):
+                        retryable_count += 1
+                        continue
+                    report_fact_count += 1
+                    reviewed_count += 1
+                    item_states[item.review_id] = "completed"
+                    continue
+                if not transition_pending(
                     item.review_id,
                     state="memory_pending",
                     attempt_count=attempts,
                     last_error_code=None,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 reviewed_count += 1
                 continue
 
             if result.get("ok") is True:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     state="attention_required",
                     attempt_count=attempts,
                     last_error_code="REVIEW_IDENTITY_MISMATCH",
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 attention_required_count += 1
                 continue
 
             code = _error_code(result)
             if code in _SKIPPED_REVIEW_ERRORS:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     state="skipped",
                     attempt_count=attempts,
                     last_error_code=code,
                     skip_reason=code,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 skipped_count += 1
             else:
-                store.update_item(
+                if not transition_pending(
                     item.review_id,
                     attempt_count=attempts,
                     last_error_code=code,
                     updated_at=utc_now(),
-                )
+                ):
+                    retryable_count += 1
+                    continue
                 retryable_count += 1
     return ScheduledReviewProcessReport(
         due_count=due_count,
@@ -405,6 +478,7 @@ def process_due_reviews(
         retryable_count=retryable_count,
         skipped_count=skipped_count,
         attention_required_count=attention_required_count,
+        report_fact_count=report_fact_count,
     )
 
 

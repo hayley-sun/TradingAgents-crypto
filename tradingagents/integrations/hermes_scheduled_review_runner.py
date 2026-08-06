@@ -10,7 +10,37 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.integrations.hermes_learning import ReviewStore
-from tradingagents.integrations.hermes_mcp import PROJECT_ROOT, review_paper_decision_impl
+from tradingagents.integrations.hermes_mcp import (
+    PROJECT_ROOT,
+    SessionStore,
+    review_paper_decision_impl,
+)
+from tradingagents.integrations.hermes_report_learning import (
+    HERMES_MEMORY_CHAR_LIMIT,
+    ReportLearningStore,
+    build_evidence_packet,
+    record_review_fact,
+)
+from tradingagents.integrations.hermes_report_memory import (
+    MEMORY_ERROR_CODES,
+    RETIREMENT_MEMORY_ERROR_CODES,
+    begin_report_memory,
+    begin_report_memory_retirement,
+    confirm_report_memory,
+    confirm_report_memory_retirement,
+    list_pending_report_memory,
+    list_pending_report_memory_retirements,
+    quarantine_report_memory,
+    quarantine_report_memory_retirement,
+)
+from tradingagents.integrations.hermes_report_memory_verifier import (
+    verify_report_memory_absence,
+    verify_report_memory_capacity,
+    verify_report_memory_consistency,
+)
+from tradingagents.integrations.hermes_report_retention import (
+    ReportMemoryRetirementStore,
+)
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
 from tradingagents.integrations.hermes_scheduled_reviews import (
     MAX_MEMORY_ITEMS,
@@ -20,15 +50,61 @@ from tradingagents.integrations.hermes_scheduled_reviews import (
     inspect_pending_memory,
     process_due_reviews,
 )
-from tradingagents.integrations.schemas import is_valid_review_id
+from tradingagents.integrations.schemas import (
+    ReportMemoryRetirementJournal,
+    is_valid_review_id,
+    is_valid_session_id,
+)
 
 
 DEFAULT_MEMORY_LIMIT = MAX_MEMORY_ITEMS
+MAX_REPORT_ITEMS = 18
+HERMES_MEMORY_PATH = (
+    Path.home() / ".hermes" / "memories" / "MEMORY.md"
+).expanduser().resolve()
+_CAPACITY_ERROR_CODES = frozenset(
+    {
+        "MEMORY_PATH_UNREADABLE",
+        "MEMORY_LIMIT_INVALID",
+        "MEMORY_LIMIT_TOO_SMALL",
+        "MEMORY_CAPACITY_EXCEEDED",
+    }
+)
 
 
 def _results_root() -> Path:
     configured = os.getenv("TRADINGAGENTS_RESULTS_DIR")
     return (Path(configured) if configured else PROJECT_ROOT / "results").expanduser().resolve()
+
+
+def _canonical_retirement_symbol(value: str) -> str | None:
+    """Normalize one schema-approved retirement journal symbol."""
+    try:
+        return ReportMemoryRetirementJournal(symbol=value).symbol
+    except (TypeError, ValueError):
+        return None
+
+
+def _retirement_store() -> ReportMemoryRetirementStore:
+    return ReportMemoryRetirementStore(
+        _results_root() / "hermes" / "report_memory_retirements"
+    )
+
+
+def _canonical_hermes_memory_path(value: Path | str) -> Path | None:
+    """Accept only the normalized Hermes built-in memory file path."""
+    if not isinstance(value, (Path, str)):
+        return None
+    try:
+        candidate = Path(value).expanduser().resolve()
+        expected = HERMES_MEMORY_PATH.expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    return expected if candidate == expected else None
+
+
+def _safe_nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def run_process_due(
@@ -38,17 +114,28 @@ def run_process_due(
     """Process due project reviews without invoking a Hermes Agent."""
     if processor is None:
         store = ScheduledReviewStore.from_environment()
+        session_store = SessionStore.from_environment()
+        review_store = ReviewStore.from_environment()
+        report_store = ReportLearningStore.from_environment()
 
         def active_processor(as_of_date: date) -> ScheduledReviewProcessReport:
             return process_due_reviews(
                 store,
                 as_of_date,
-                lambda session_id, review_date: review_paper_decision_impl(
+                lambda session_id, review_date, workflow_version: review_paper_decision_impl(
                     {
                         "session_id": session_id,
                         "review_date": review_date.isoformat(),
                     },
+                    store=session_store,
+                    review_store=review_store,
                     current_date=as_of_date,
+                    write_legacy_learning=(workflow_version == 1),
+                ),
+                fact_recorder=lambda review: record_review_fact(
+                    report_store,
+                    session_store.load(review.session_id),
+                    review,
                 ),
             )
 
@@ -63,6 +150,7 @@ def run_process_due(
         "retryable_count": report.retryable_count,
         "skipped_count": report.skipped_count,
         "attention_required_count": report.attention_required_count,
+        "report_fact_count": getattr(report, "report_fact_count", 0),
     }
 
 
@@ -137,6 +225,401 @@ def run_confirm_memory(
     }
 
 
+def run_report_reflection_pending(
+    limit: int,
+    lister: Callable[[int], list[Any]] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """List bounded report-reflection work as metadata without source content."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REPORT_ITEMS:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "report-reflection-pending")
+    if lister is None:
+        store = ReportLearningStore.from_environment()
+        lister = lambda selected_limit: store.records()
+    records = list(lister(limit))
+    candidates = sorted(
+        (
+            (record, revision)
+            for record in records
+            for revision in record.revisions
+            if revision.reflection_state == "pending"
+        ),
+        key=lambda item: (
+            item[1].created_at,
+            item[0].trade_date,
+            item[0].symbol,
+            item[0].session_id,
+            item[1].revision,
+        ),
+    )
+    next_revisions = {
+        record.session_id: record.reflected_revision + 1 for record in records
+    }
+    items: list[dict[str, Any]] = []
+    remaining = candidates
+    while remaining and len(items) < limit:
+        deferred = []
+        progressed = False
+        for record, revision in remaining:
+            if len(items) >= limit:
+                deferred.append((record, revision))
+                continue
+            if revision.revision != next_revisions[record.session_id]:
+                deferred.append((record, revision))
+                continue
+            maturity_days = record.outcomes[revision.revision - 1].horizon_days
+            items.append(
+                {
+                    "session_id": record.session_id,
+                    "symbol": record.symbol,
+                    "trade_date": record.trade_date.isoformat(),
+                    "revision": revision.revision,
+                    "maturity_days": maturity_days,
+                }
+            )
+            next_revisions[record.session_id] += 1
+            progressed = True
+        if not progressed:
+            break
+        remaining = deferred
+    return 0, {
+        "ok": True,
+        "mode": "report-reflection-pending",
+        "count": len(items),
+        "items": items,
+    }
+
+
+def run_report_reflection_evidence(
+    session_id: str,
+    revision: int,
+    loader: Callable[[], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return exactly one bounded evidence packet for a completed report revision."""
+    if (
+        not is_valid_session_id(session_id)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or not 1 <= revision <= 3
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "report-reflection-evidence")
+    if loader is not None:
+        loaded = loader()
+        session, record = loaded
+    else:
+        session_store = SessionStore.from_environment()
+        report_store = ReportLearningStore.from_environment()
+        session = session_store.load(session_id)
+        if session is None:
+            raise LookupError("session not found")
+        record = report_store.load(session_id)
+        if record is None:
+            raise LookupError("report learning record not found")
+    packet = build_evidence_packet(record, session, revision)
+    return 0, {
+        "ok": True,
+        "mode": "report-reflection-evidence",
+        "packet": packet.model_dump(mode="json"),
+    }
+
+
+def run_report_memory_pending(
+    limit: int,
+    lister: Callable[[int], list[Any]] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """List ordered report-memory metadata without exposing memory content."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REPORT_ITEMS:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "report-memory-pending")
+    if lister is None:
+        store = ReportLearningStore.from_environment()
+        lister = lambda selected_limit: list_pending_report_memory(store, selected_limit)
+    work = list(lister(limit))[:limit]
+    return 0, {
+        "ok": True,
+        "mode": "report-memory-pending",
+        "count": len(work),
+        "items": [
+            {
+                "session_id": item.session_id,
+                "symbol": item.symbol,
+                "trade_date": item.trade_date.isoformat(),
+                "revision": item.revision,
+                "maturity_days": item.maturity_days,
+                "action": item.action,
+                "memory_state": item.memory_state,
+            }
+            for item in work
+        ],
+    }
+
+
+def run_begin_report_memory(
+    session_id: str,
+    revision: int,
+    starter: Callable[[str, int], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return the sole runner payload that includes exact memory operation text."""
+    if not is_valid_session_id(session_id) or isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= 3:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "begin-report-memory")
+    if starter is None:
+        store = ReportLearningStore.from_environment()
+        starter = lambda selected_session, selected_revision: begin_report_memory(store, selected_session, selected_revision)
+    operation = starter(session_id, revision)
+    return 0, {
+        "ok": True,
+        "mode": "begin-report-memory",
+        "session_id": operation.session_id,
+        "symbol": operation.symbol,
+        "trade_date": operation.trade_date.isoformat(),
+        "revision": operation.revision,
+        "maturity_days": operation.maturity_days,
+        "action": operation.action,
+        **(
+            {
+                "content": operation.content,
+                "old_text": operation.old_text,
+            }
+            if operation.memory_state != "verification_pending"
+            else {}
+        ),
+        "memory_state": operation.memory_state,
+    }
+
+
+def run_confirm_report_memory(
+    session_id: str,
+    revision: int,
+    memory_path: Path,
+    confirmer: Callable[[str, int], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Verify Hermes memory read-only, then expose project state only."""
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if (
+        not is_valid_session_id(session_id)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or not 1 <= revision <= 3
+        or canonical_memory_path is None
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "confirm-report-memory")
+    if confirmer is None:
+        store = ReportLearningStore.from_environment()
+        results_root = _results_root()
+        confirmer = lambda selected_session, selected_revision: confirm_report_memory(
+            store,
+            selected_session,
+            selected_revision,
+            verifier=lambda *_args: verify_report_memory_consistency(
+                selected_session,
+                selected_revision,
+                results_root,
+                canonical_memory_path,
+            ),
+        )
+    record = confirmer(session_id, revision)
+    snapshot = record.revisions[revision - 1]
+    return 0, {
+        "ok": True,
+        "mode": "confirm-report-memory",
+        "session_id": session_id,
+        "revision": revision,
+        "confirmed_revision": record.confirmed_revision,
+        "memory_state": snapshot.memory_state,
+    }
+
+
+def run_quarantine_report_memory(
+    session_id: str,
+    revision: int,
+    error_code: str,
+    quarantiner: Callable[[str, int, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Quarantine a report-memory operation using an allowlisted code."""
+    if not is_valid_session_id(session_id) or isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= 3:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "quarantine-report-memory")
+    if not isinstance(error_code, str) or error_code not in MEMORY_ERROR_CODES:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", "quarantine-report-memory")
+    if quarantiner is None:
+        store = ReportLearningStore.from_environment()
+        quarantiner = lambda selected_session, selected_revision, selected_code: quarantine_report_memory(
+            store, selected_session, selected_revision, selected_code
+        )
+    record = quarantiner(session_id, revision, error_code)
+    return 0, {
+        "ok": True,
+        "mode": "quarantine-report-memory",
+        "session_id": session_id,
+        "revision": revision,
+        "memory_state": record.revisions[revision - 1].memory_state,
+    }
+
+
+def run_report_memory_retirement_pending(
+    limit: int,
+    lister: Callable[[int], list[Any]] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """List bounded retirement metadata without exposing Hermes markers."""
+    mode = "report-memory-retirement-pending"
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REPORT_ITEMS:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if lister is None:
+        report_store = ReportLearningStore.from_environment()
+        retirement_store = _retirement_store()
+        lister = lambda selected_limit: list_pending_report_memory_retirements(
+            retirement_store, report_store, selected_limit
+        )
+    work = list(lister(limit))[:limit]
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "count": len(work),
+        "items": [
+            {
+                "symbol": item.symbol,
+                "session_id": item.session_id,
+                "trade_date": item.trade_date.isoformat(),
+                "revision": 3,
+                "state": item.state,
+            }
+            for item in work
+        ],
+    }
+
+
+def run_begin_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    starter: Callable[[str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return the single marker needed for one Hermes Agent remove call."""
+    mode = "begin-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    if canonical_symbol is None or not is_valid_session_id(session_id):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if starter is None:
+        retirement_store = _retirement_store()
+        starter = lambda selected_symbol, selected_session: begin_report_memory_retirement(
+            retirement_store, selected_symbol, selected_session
+        )
+    operation = starter(canonical_symbol, session_id)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "trade_date": operation.trade_date.isoformat(),
+        "revision": 3,
+        "state": operation.state,
+        "action": "remove",
+    }
+    if operation.state != "verification_pending":
+        payload["old_text"] = operation.old_text
+    return 0, payload
+
+
+def run_confirm_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    memory_path: Path,
+    confirmer: Callable[[str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Read-only verify a retirement, then expose its safe journal state."""
+    mode = "confirm-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if (
+        canonical_symbol is None
+        or not is_valid_session_id(session_id)
+        or canonical_memory_path is None
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if confirmer is None:
+        retirement_store = _retirement_store()
+        confirmer = lambda selected_symbol, selected_session: confirm_report_memory_retirement(
+            retirement_store,
+            selected_symbol,
+            selected_session,
+            verifier=lambda candidate_session, marker: verify_report_memory_absence(
+                candidate_session, marker, canonical_memory_path
+            ),
+        )
+    item = confirmer(canonical_symbol, session_id)
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "revision": 3,
+        "state": item.state,
+    }
+
+
+def run_quarantine_report_memory_retirement(
+    symbol: str,
+    session_id: str,
+    error_code: str,
+    quarantiner: Callable[[str, str, str], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Persist a safe, allowlisted retirement failure code."""
+    mode = "quarantine-report-memory-retirement"
+    canonical_symbol = _canonical_retirement_symbol(symbol)
+    if (
+        canonical_symbol is None
+        or not is_valid_session_id(session_id)
+        or not isinstance(error_code, str)
+        or error_code not in RETIREMENT_MEMORY_ERROR_CODES
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if quarantiner is None:
+        retirement_store = _retirement_store()
+        quarantiner = lambda selected_symbol, selected_session, selected_code: quarantine_report_memory_retirement(
+            retirement_store, selected_symbol, selected_session, selected_code
+        )
+    item = quarantiner(canonical_symbol, session_id, error_code)
+    return 0, {
+        "ok": True,
+        "mode": mode,
+        "symbol": canonical_symbol,
+        "session_id": session_id,
+        "revision": 3,
+        "state": item.state,
+    }
+
+
+def run_report_memory_capacity(
+    memory_path: Path,
+    memory_char_limit: int,
+    verifier: Callable[[Path, int], Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Return count-only capacity preflight metadata for Hermes memory."""
+    mode = "report-memory-capacity"
+    if (
+        isinstance(memory_char_limit, bool)
+        or not isinstance(memory_char_limit, int)
+        or memory_char_limit != HERMES_MEMORY_CHAR_LIMIT
+    ):
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    canonical_memory_path = _canonical_hermes_memory_path(memory_path)
+    if canonical_memory_path is None:
+        return 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
+    if verifier is None:
+        verifier = verify_report_memory_capacity
+    result = verifier(canonical_memory_path, memory_char_limit)
+    error_code = getattr(result, "error_code", None)
+    return 0, {
+        "ok": getattr(result, "ok", False) is True,
+        "mode": mode,
+        "current_chars": _safe_nonnegative_int(getattr(result, "current_chars", 0)),
+        "configured_limit": memory_char_limit,
+        "reserved_report_chars": _safe_nonnegative_int(
+            getattr(result, "reserved_report_chars", 0)
+        ),
+        "available_chars": _safe_nonnegative_int(
+            getattr(result, "available_chars", 0)
+        ),
+        "error_code": error_code if error_code in _CAPACITY_ERROR_CODES else None,
+    }
+
+
 def _error(code: str, mode: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -179,6 +662,62 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
     )
+    report_pending_parser = subparsers.add_parser("report-reflection-pending", add_help=False)
+    report_pending_parser.add_argument("--limit", type=int, default=MAX_REPORT_ITEMS)
+    report_evidence_parser = subparsers.add_parser("report-reflection-evidence", add_help=False)
+    report_evidence_parser.add_argument("--session-id", required=True)
+    report_evidence_parser.add_argument("--revision", type=int, required=True)
+    report_memory_pending_parser = subparsers.add_parser("report-memory-pending", add_help=False)
+    report_memory_pending_parser.add_argument("--limit", type=int, default=MAX_REPORT_ITEMS)
+    begin_report_memory_parser = subparsers.add_parser("begin-report-memory", add_help=False)
+    begin_report_memory_parser.add_argument("--session-id", required=True)
+    begin_report_memory_parser.add_argument("--revision", type=int, required=True)
+    confirm_report_memory_parser = subparsers.add_parser("confirm-report-memory", add_help=False)
+    confirm_report_memory_parser.add_argument("--session-id", required=True)
+    confirm_report_memory_parser.add_argument("--revision", type=int, required=True)
+    confirm_report_memory_parser.add_argument(
+        "--hermes-memory-path",
+        type=Path,
+        default=Path.home() / ".hermes" / "memories" / "MEMORY.md",
+    )
+    quarantine_report_memory_parser = subparsers.add_parser("quarantine-report-memory", add_help=False)
+    quarantine_report_memory_parser.add_argument("--session-id", required=True)
+    quarantine_report_memory_parser.add_argument("--revision", type=int, required=True)
+    quarantine_report_memory_parser.add_argument("--error-code", required=True)
+    retirement_pending_parser = subparsers.add_parser(
+        "report-memory-retirement-pending", add_help=False
+    )
+    retirement_pending_parser.add_argument("--limit", type=int, default=MAX_REPORT_ITEMS)
+    begin_retirement_parser = subparsers.add_parser(
+        "begin-report-memory-retirement", add_help=False
+    )
+    begin_retirement_parser.add_argument("--symbol", required=True)
+    begin_retirement_parser.add_argument("--session-id", required=True)
+    confirm_retirement_parser = subparsers.add_parser(
+        "confirm-report-memory-retirement", add_help=False
+    )
+    confirm_retirement_parser.add_argument("--symbol", required=True)
+    confirm_retirement_parser.add_argument("--session-id", required=True)
+    confirm_retirement_parser.add_argument(
+        "--hermes-memory-path",
+        type=Path,
+        default=HERMES_MEMORY_PATH,
+    )
+    quarantine_retirement_parser = subparsers.add_parser(
+        "quarantine-report-memory-retirement", add_help=False
+    )
+    quarantine_retirement_parser.add_argument("--symbol", required=True)
+    quarantine_retirement_parser.add_argument("--session-id", required=True)
+    quarantine_retirement_parser.add_argument("--error-code", required=True)
+    capacity_parser = subparsers.add_parser("report-memory-capacity", add_help=False)
+    capacity_parser.add_argument(
+        "--hermes-memory-path",
+        type=Path,
+        default=HERMES_MEMORY_PATH,
+    )
+    capacity_parser.add_argument(
+        "--memory-char-limit", type=int, default=HERMES_MEMORY_CHAR_LIMIT
+    )
     try:
         parsed = parser.parse_args(arguments)
         if parsed.mode == "process-due":
@@ -187,12 +726,99 @@ def main(argv: list[str] | None = None) -> int:
             if not 1 <= parsed.limit <= MAX_MEMORY_ITEMS:
                 raise ValueError("invalid memory limit")
             code, payload = run_memory_pending(parsed.limit)
-        else:
+        elif parsed.mode == "confirm-memory":
             if not is_valid_review_id(parsed.review_id):
                 raise ValueError("invalid review id")
             code, payload = run_confirm_memory(
                 parsed.review_id, parsed.hermes_memory_path.expanduser().resolve()
             )
+        elif parsed.mode == "report-reflection-pending":
+            if not 1 <= parsed.limit <= MAX_REPORT_ITEMS:
+                raise ValueError("invalid report reflection limit")
+            code, payload = run_report_reflection_pending(parsed.limit)
+        elif parsed.mode == "report-reflection-evidence":
+            if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
+                raise ValueError("invalid report reflection evidence request")
+            code, payload = run_report_reflection_evidence(parsed.session_id, parsed.revision)
+        elif parsed.mode == "report-memory-pending":
+            if not 1 <= parsed.limit <= MAX_REPORT_ITEMS:
+                raise ValueError("invalid report memory limit")
+            code, payload = run_report_memory_pending(parsed.limit)
+        elif parsed.mode == "begin-report-memory":
+            if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
+                raise ValueError("invalid report memory request")
+            code, payload = run_begin_report_memory(parsed.session_id, parsed.revision)
+        elif parsed.mode == "confirm-report-memory":
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if (
+                not is_valid_session_id(parsed.session_id)
+                or not 1 <= parsed.revision <= 3
+                or canonical_memory_path is None
+            ):
+                raise ValueError("invalid report memory request")
+            code, payload = run_confirm_report_memory(
+                parsed.session_id,
+                parsed.revision,
+                canonical_memory_path,
+            )
+        elif parsed.mode == "quarantine-report-memory":
+            if not is_valid_session_id(parsed.session_id) or not 1 <= parsed.revision <= 3:
+                raise ValueError("invalid report memory request")
+            code, payload = run_quarantine_report_memory(parsed.session_id, parsed.revision, parsed.error_code)
+        elif parsed.mode == "report-memory-retirement-pending":
+            if not 1 <= parsed.limit <= MAX_REPORT_ITEMS:
+                raise ValueError("invalid report memory retirement limit")
+            code, payload = run_report_memory_retirement_pending(parsed.limit)
+        elif parsed.mode == "begin-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            if canonical_symbol is None or not is_valid_session_id(parsed.session_id):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_begin_report_memory_retirement(
+                canonical_symbol, parsed.session_id
+            )
+        elif parsed.mode == "confirm-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if (
+                canonical_symbol is None
+                or not is_valid_session_id(parsed.session_id)
+                or canonical_memory_path is None
+            ):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_confirm_report_memory_retirement(
+                canonical_symbol,
+                parsed.session_id,
+                canonical_memory_path,
+            )
+        elif parsed.mode == "quarantine-report-memory-retirement":
+            canonical_symbol = _canonical_retirement_symbol(parsed.symbol)
+            if (
+                canonical_symbol is None
+                or not is_valid_session_id(parsed.session_id)
+                or parsed.error_code not in RETIREMENT_MEMORY_ERROR_CODES
+            ):
+                raise ValueError("invalid report memory retirement request")
+            code, payload = run_quarantine_report_memory_retirement(
+                canonical_symbol, parsed.session_id, parsed.error_code
+            )
+        elif parsed.mode == "report-memory-capacity":
+            if parsed.memory_char_limit != HERMES_MEMORY_CHAR_LIMIT:
+                raise ValueError("invalid report memory capacity limit")
+            canonical_memory_path = _canonical_hermes_memory_path(
+                parsed.hermes_memory_path
+            )
+            if canonical_memory_path is None:
+                raise ValueError("invalid report memory capacity path")
+            code, payload = run_report_memory_capacity(
+                canonical_memory_path,
+                parsed.memory_char_limit,
+            )
+        else:
+            raise ValueError("invalid scheduled review mode")
     except (TypeError, ValueError):
         code, payload = 1, _error("INVALID_SCHEDULED_REVIEW_REQUEST", mode)
     except Exception:

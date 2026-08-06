@@ -2,6 +2,14 @@ from langchain_core.messages import AIMessage
 import time
 import json
 
+REPORT_LESSON_INSTRUCTION = (
+    "Treat report-level lessons as evidence-bounded historical hypotheses. Assess whether each lesson "
+    "applies to the current market context, explain any mismatch, and do not let historical outcomes "
+    "override current evidence or mechanically force BUY, SELL, or HOLD. In applying them, assess "
+    "whether each historical lesson applies to the current market context. Treat them as evidence-bounded "
+    "hypotheses rather than rules. Historical lessons must not override current evidence."
+)
+
 
 def create_bull_researcher(llm, memory):
     def bull_node(state) -> dict:
@@ -39,6 +47,8 @@ Company fundamentals report: {fundamentals_report}
 Conversation history of the debate: {history}
 Last bear argument: {current_response}
 Reflections from similar situations and lessons learned: {past_memory_str}
+
+{REPORT_LESSON_INSTRUCTION}
 Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position. You must also address reflections and learn from lessons and mistakes you made in the past.
 """
 

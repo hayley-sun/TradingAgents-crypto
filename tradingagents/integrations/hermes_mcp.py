@@ -33,6 +33,13 @@ from tradingagents.integrations.hermes_learning import (
     ReviewStore,
     review_completed_session,
 )
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningConflict,
+    ReportLearningError,
+    ReportLearningStore,
+    ReportReflectionRejected,
+    submit_report_reflection as _persist_report_reflection,
+)
 from tradingagents.integrations.hermes_reports import (
     ReportArchiveConflict,
     ReportBatchActive,
@@ -51,6 +58,7 @@ from tradingagents.integrations.schemas import (
     DailyReportRequest,
     PriceReference,
     ReviewRequest,
+    ReportReflection,
     ToolError,
     is_valid_session_id,
     utc_now,
@@ -530,13 +538,13 @@ def archive_daily_report_impl(
             )
         loader = session_loader or (session_store or SessionStore.from_environment()).load
         archive = active_batch_store.archive(
-            batch, loader, narrative, scheduled_review_version=1
+            batch, loader, narrative, scheduled_review_version=2
         )
         persisted_batch = active_batch_store.load(requested_date)
         if (
             persisted_batch is not None
             and persisted_batch.archive is not None
-            and persisted_batch.archive.scheduled_review_version == 1
+            and persisted_batch.archive.scheduled_review_version in (1, 2)
         ):
             active_schedule_store = (
                 schedule_store
@@ -606,7 +614,7 @@ def _resolve_review_price_references(
     return entry_price, review_price
 
 
-def _load_review_lessons(symbol: str) -> list[str]:
+def _load_learning_lessons(symbol: str) -> list[str]:
     try:
         return LearningStore.from_environment().lessons_for(symbol, limit=5)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError, ValidationError) as error:
@@ -801,7 +809,7 @@ def _run_analysis_session(
             session.session_id,
         )
         graph_config["log_graph_states"] = False
-        graph_config["hermes_review_lessons"] = _load_review_lessons(request.symbol)
+        graph_config["hermes_review_lessons"] = _load_learning_lessons(request.symbol)
         analysis_started = True
         graph = graph_factory(
             selected_analysts=request.analysts,
@@ -955,6 +963,8 @@ def review_paper_decision_impl(
     learning_store: LearningStore | None = None,
     price_reference_resolver: Any = None,
     current_date: date | None = None,
+    *,
+    write_legacy_learning: bool = True,
 ) -> dict[str, Any]:
     """Review one completed paper-trading decision without an LLM call."""
     try:
@@ -1013,7 +1023,7 @@ def review_paper_decision_impl(
             learning_store
             if learning_store is not None
             else LearningStore.from_environment()
-        )
+        ) if write_legacy_learning else None
     except _SESSION_STORE_CONSTRUCTION_ERRORS:
         return _review_error(
             "REVIEW_STORE_UNAVAILABLE",
@@ -1067,6 +1077,136 @@ def review_paper_decision_impl(
     )
 
 
+def submit_report_reflection_impl(
+    request_data: Mapping[str, Any],
+    session_store: SessionStore | None = None,
+    report_store: ReportLearningStore | None = None,
+    learning_store: LearningStore | None = None,
+) -> dict[str, Any]:
+    """Persist one validated report reflection behind a strict, safe MCP boundary."""
+    if not isinstance(request_data, Mapping):
+        return _report_error(
+            "INVALID_REPORT_REFLECTION",
+            "The report reflection request is invalid.",
+            "Use only session_id, expected_revision, and reflection fields.",
+        )
+    allowed = {"session_id", "expected_revision", "reflection"}
+    if set(request_data) != allowed:
+        return _report_error(
+            "INVALID_REPORT_REFLECTION",
+            "The report reflection request is invalid.",
+            "Use only session_id, expected_revision, and reflection fields.",
+        )
+    session_id = request_data.get("session_id")
+    expected_revision = request_data.get("expected_revision")
+    reflection_data = request_data.get("reflection")
+    if (
+        not is_valid_session_id(session_id)
+        or isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or not 1 <= expected_revision <= 3
+        or not isinstance(reflection_data, Mapping)
+    ):
+        return _report_error(
+            "INVALID_REPORT_REFLECTION",
+            "The report reflection request is invalid.",
+            "Use a valid Hermes session ID, revision, and reflection payload.",
+        )
+
+    try:
+        ReportReflection.model_validate(reflection_data)
+    except ValidationError as validation_error:
+        if any(
+            item.get("type") == "extra_forbidden"
+            for item in validation_error.errors()
+        ):
+            return _report_error(
+                "INVALID_REPORT_REFLECTION",
+                "The report reflection request is invalid.",
+                "Use only the documented reflection fields.",
+            )
+
+    try:
+        active_session_store = session_store or SessionStore.from_environment()
+    except _SESSION_STORE_CONSTRUCTION_ERRORS:
+        return _report_error(
+            "SESSION_STORE_UNAVAILABLE",
+            "The analysis session could not be read.",
+            "Verify the session storage configuration and try again.",
+        )
+    try:
+        session = active_session_store.load(session_id)
+    except (OSError, ValueError, json.JSONDecodeError, ValidationError):
+        return _report_error(
+            "SESSION_UNREADABLE",
+            "The stored analysis session could not be read.",
+            "Retry later or start a new analysis session.",
+        )
+    if session is None:
+        return _report_error(
+            "SESSION_NOT_FOUND",
+            "No analysis session exists for this session ID.",
+            "Check the session ID or start a new analysis.",
+        )
+    if session.status != "completed" or session.result is None:
+        return _report_error(
+            "SESSION_NOT_COMPLETED",
+            "Only completed analysis sessions can receive reflections.",
+            "Wait for a completed paper-trading analysis before reflecting.",
+        )
+
+    try:
+        active_report_store = report_store or ReportLearningStore.from_environment()
+        active_learning_store = learning_store or LearningStore.from_environment()
+    except (OSError, RuntimeError, ValueError):
+        return _report_error(
+            "REPORT_STORE_UNAVAILABLE",
+            "Report reflection storage is currently unavailable.",
+            "Verify the Hermes results directory and try again.",
+        )
+    try:
+        updated = _persist_report_reflection(
+            active_report_store,
+            active_learning_store,
+            session,
+            expected_revision,
+            reflection_data,
+        )
+    except ReportReflectionRejected as error:
+        return _report_error(
+            (
+                "INVALID_REPORT_REFLECTION"
+                if error.error_code == "REFLECTION_SCHEMA_INVALID"
+                else error.error_code
+            ),
+            "The report reflection did not pass bounded validation.",
+            "Correct the reflection fields and try again.",
+        )
+    except ReportLearningConflict:
+        return _report_error(
+            "REPORT_REFLECTION_STALE",
+            "The report reflection revision is stale or unavailable.",
+            "Refresh the pending report reflection and retry the expected revision.",
+        )
+    except (OSError, ValueError, ReportLearningError, LearningStorageError):
+        return _report_error(
+            "REPORT_REFLECTION_STORAGE_FAILED",
+            "The report reflection could not be persisted.",
+            "Verify report and learning storage, then retry the same request.",
+        )
+
+    revision = updated.revisions[expected_revision - 1]
+    return success(
+        {
+            "session_id": updated.session_id,
+            "revision": expected_revision,
+            "reflection_state": revision.reflection_state,
+            "memory_state": revision.memory_state,
+            "disclaimer": PAPER_TRADING_DISCLAIMER,
+        }
+    )
+
+
 @MCP.tool()
 def health_check() -> dict[str, Any]:
     """Report non-sensitive Hermes MCP configuration and storage status."""
@@ -1114,6 +1254,23 @@ def review_paper_decision(
     request_data = {"session_id": session_id, "review_date": review_date}
     request_data.update(unknown_fields)
     return review_paper_decision_impl(request_data)
+
+
+@MCP.tool()
+def submit_report_reflection(
+    session_id: str,
+    expected_revision: int,
+    reflection: Mapping[str, Any],
+    **unknown_fields: Any,
+) -> dict[str, Any]:
+    """Persist one bounded retrospective report reflection."""
+    request_data = {
+        "session_id": session_id,
+        "expected_revision": expected_revision,
+        "reflection": reflection,
+        **unknown_fields,
+    }
+    return submit_report_reflection_impl(request_data)
 
 
 @MCP.tool()
@@ -1198,6 +1355,19 @@ class _ReviewPaperDecisionArguments(ArgModelBase):
         return self.model_dump()
 
 
+class _SubmitReportReflectionArguments(ArgModelBase):
+    """Preserve raw reflection fields so the strict boundary can reject extras."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    session_id: str
+    expected_revision: Any
+    reflection: dict[str, Any]
+
+    def model_dump_one_level(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
 class _DailyReportBatchArguments(ArgModelBase):
     """Preserve raw batch fields so DailyReportRequest rejects unknown inputs."""
 
@@ -1258,6 +1428,20 @@ def _configure_review_paper_decision_tool() -> None:
     tool.parameters["additionalProperties"] = False
 
 
+def _configure_submit_report_reflection_tool() -> None:
+    tool = MCP._tool_manager.get_tool("submit_report_reflection")
+    if tool is None:
+        raise RuntimeError("submit_report_reflection tool registration is unavailable")
+
+    tool.fn_metadata.arg_model = _SubmitReportReflectionArguments
+    tool.parameters = _SubmitReportReflectionArguments.model_json_schema()
+    reflection_schema = ReportReflection.model_json_schema()
+    tool.parameters.setdefault("$defs", {}).update(reflection_schema.pop("$defs", {}))
+    tool.parameters["properties"]["reflection"] = reflection_schema
+    tool.parameters["properties"]["expected_revision"] = {"type": "integer"}
+    tool.parameters["additionalProperties"] = False
+
+
 def _configure_daily_report_tool(name: str, arguments: type[ArgModelBase]) -> None:
     tool = MCP._tool_manager.get_tool(name)
     if tool is None:
@@ -1270,6 +1454,7 @@ def _configure_daily_report_tool(name: str, arguments: type[ArgModelBase]) -> No
 
 _configure_analyze_crypto_tool()
 _configure_review_paper_decision_tool()
+_configure_submit_report_reflection_tool()
 _configure_daily_report_tool("start_daily_report_batch", _DailyReportBatchArguments)
 _configure_daily_report_tool("get_daily_report_batch", _DailyReportLookupArguments)
 _configure_daily_report_tool("archive_daily_report", _DailyReportArchiveArguments)

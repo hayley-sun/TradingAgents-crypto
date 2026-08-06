@@ -11,6 +11,10 @@ from tradingagents.integrations.hermes_learning import (
     review_completed_session,
 )
 from tradingagents.integrations.hermes_review_verifier import verify_review_consistency
+from tradingagents.integrations.hermes_report_learning import (
+    ReportLearningStore,
+    record_review_fact,
+)
 from tradingagents.integrations.hermes_scheduled_reviews import (
     ScheduledReviewConfirmationError,
     ScheduledReviewStore,
@@ -46,6 +50,7 @@ def archived_batch(
     trade_date: date = date(2026, 8, 5),
     batch_id: str = "report_0123456789abcdef",
     session_ids: dict[str, str] = SESSION_IDS,
+    workflow_version: int | None = None,
 ) -> DailyReportBatch:
     item_statuses = statuses or {symbol: "completed" for symbol in session_ids}
     request = DailyReportRequest(
@@ -82,11 +87,266 @@ def archived_batch(
                 )
                 for symbol in session_ids
             ],
+            scheduled_review_version=workflow_version,
         ),
     )
 
 
 class HermesScheduledReviewTests(unittest.TestCase):
+    def test_new_archive_creates_v2_plan(self):
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch(workflow_version=2))
+
+        self.assertEqual(plan.workflow_version, 2)
+
+    def test_v2_due_review_completes_fact_without_memory_pending(self):
+        seen = []
+
+        def reviewer(_session_id, _review_date, version):
+            self.assertEqual(version, 2)
+            item = plan.items[0]
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
+                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="legacy lesson",
+            )
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch(workflow_version=2))
+            report = process_due_reviews(
+                store,
+                date(2026, 8, 7),
+                reviewer,
+                fact_recorder=lambda review: seen.append(review.review_id),
+            )
+            item = store.find_item(plan.items[0].review_id)[1]
+
+        self.assertEqual(seen, [plan.items[0].review_id])
+        self.assertEqual(item.state, "completed")
+        self.assertEqual(report.report_fact_count, 1)
+
+    def test_v1_due_review_keeps_memory_pending(self):
+        def reviewer(_session_id, _review_date, _version):
+            item = plan.items[0]
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
+                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="legacy lesson",
+            )
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch())
+            process_due_reviews(store, date(2026, 8, 7), reviewer)
+            item = store.find_item(plan.items[0].review_id)[1]
+
+        self.assertEqual(item.state, "memory_pending")
+
+    def test_v2_fact_recording_failure_remains_retryable(self):
+        def reviewer(_session_id, _review_date, _version):
+            item = plan.items[0]
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
+                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="legacy lesson",
+            )
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(archived_batch(workflow_version=2))
+            report = process_due_reviews(
+                store,
+                date(2026, 8, 7),
+                reviewer,
+                fact_recorder=lambda _review: (_ for _ in ()).throw(OSError("private")),
+            )
+            item = store.find_item(plan.items[0].review_id)[1]
+
+        self.assertEqual(item.state, "review_pending")
+        self.assertEqual(item.last_error_code, "REPORT_FACT_WRITE_FAILED")
+        self.assertEqual(report.retryable_count, 1)
+        self.assertEqual(report.report_fact_count, 0)
+
+    def test_v2_later_horizon_waits_for_same_session_and_other_sessions_continue(self):
+        session_ids = {
+            "BTC": SESSION_IDS["BTC"],
+            "ETH": SESSION_IDS["ETH"],
+        }
+        calls = []
+        fail_btc_t1 = True
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ScheduledReviewStore(root / "review_schedules")
+            report_store = ReportLearningStore(root / "report_memories")
+            batch = archived_batch(
+                session_ids=session_ids,
+                workflow_version=2,
+            )
+            plan = store.create_or_load(batch)
+            sessions = {
+                item.session_id: AnalysisSession(
+                    session_id=item.session_id,
+                    status="completed",
+                    created_at=utc_now(),
+                    completed_at=utc_now(),
+                    request=batch.request.for_symbol(item.symbol),
+                    result=AnalysisResult(
+                        reports={"market": "Archived market evidence."},
+                        investment_plan="plan",
+                        trader_investment_plan="trader plan",
+                        final_trade_decision="FINAL TRANSACTION PROPOSAL: BUY",
+                        processed_signal="BUY",
+                    ),
+                )
+                for item in batch.items
+            }
+
+            def reviewer(session_id, review_date, _version):
+                nonlocal fail_btc_t1
+                item = next(
+                    candidate
+                    for candidate in plan.items
+                    if candidate.session_id == session_id
+                    and candidate.review_date == review_date
+                )
+                calls.append((item.symbol, item.horizon_days))
+                if item.symbol == "BTC" and item.horizon_days == 1 and fail_btc_t1:
+                    return {"ok": False, "error": {"code": "PRICE_DATA_UNAVAILABLE"}}
+                review = PaperDecisionReview(
+                    review_id=item.review_id,
+                    session_id=item.session_id,
+                    symbol=item.symbol,
+                    trade_date=plan.trade_date,
+                    review_date=item.review_date,
+                    horizon_days=item.horizon_days,
+                    action="BUY",
+                    entry_price=PriceReference(
+                        date=plan.trade_date, usd_price=100.0, source="coinbase"
+                    ),
+                    review_price=PriceReference(
+                        date=item.review_date, usd_price=110.0, source="coinbase"
+                    ),
+                    raw_return_pct=10.0,
+                    verdict="correct",
+                    created_at=utc_now(),
+                    hermes_memory_entry=(
+                        f"Exact {item.symbol} T+{item.horizon_days} lesson."
+                    ),
+                )
+                return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+            def fact_recorder(review):
+                record_review_fact(report_store, sessions[review.session_id], review)
+
+            process_due_reviews(
+                store, date(2026, 8, 14), reviewer, fact_recorder=fact_recorder
+            )
+            first_calls = list(calls)
+            first_btc = [
+                item
+                for item in store.load(plan.trade_date).items
+                if item.symbol == "BTC"
+            ]
+            first_eth = [
+                item
+                for item in store.load(plan.trade_date).items
+                if item.symbol == "ETH"
+            ]
+
+            fail_btc_t1 = False
+            calls.clear()
+            process_due_reviews(
+                store, date(2026, 8, 14), reviewer, fact_recorder=fact_recorder
+            )
+            second_calls = list(calls)
+            btc_record = report_store.load(session_ids["BTC"])
+
+        self.assertEqual(
+            [(item.state, item.last_error_code) for item in first_eth],
+            [("completed", None), ("completed", None), ("review_pending", None)],
+        )
+        self.assertEqual(first_calls, [("BTC", 1), ("ETH", 1), ("ETH", 7)])
+        self.assertEqual([item.state for item in first_btc], ["review_pending"] * 3)
+        self.assertEqual(second_calls, [("BTC", 1), ("BTC", 7)])
+        self.assertEqual(
+            [outcome.horizon_days for outcome in btc_record.outcomes], [1, 7]
+        )
+
+    def test_state_conflict_does_not_overwrite_external_transition(self):
+        def reviewer(_session_id, _review_date, _version):
+            item = plan.items[0]
+            store.transition_item(
+                item.review_id,
+                "review_pending",
+                state="attention_required",
+                last_error_code="EXTERNAL_REVIEW",
+                updated_at=utc_now(),
+            )
+            review = PaperDecisionReview(
+                review_id=item.review_id,
+                session_id=item.session_id,
+                symbol=item.symbol,
+                trade_date=plan.trade_date,
+                review_date=item.review_date,
+                horizon_days=item.horizon_days,
+                action="BUY",
+                entry_price=PriceReference(date=plan.trade_date, usd_price=100.0, source="coinbase"),
+                review_price=PriceReference(date=item.review_date, usd_price=110.0, source="coinbase"),
+                raw_return_pct=10.0,
+                verdict="correct",
+                created_at=utc_now(),
+                hermes_memory_entry="legacy lesson",
+            )
+            return {"ok": True, "data": {"review": review.model_dump(mode="json")}}
+
+        with TemporaryDirectory() as directory:
+            store = ScheduledReviewStore(Path(directory) / "review_schedules")
+            plan = store.create_or_load(
+                archived_batch(session_ids={"BTC": SESSION_IDS["BTC"]})
+            )
+            report = process_due_reviews(store, date(2026, 8, 7), reviewer)
+            item = store.find_item(plan.items[0].review_id)[1]
+
+        self.assertEqual(item.state, "attention_required")
+        self.assertEqual(item.last_error_code, "EXTERNAL_REVIEW")
+        self.assertEqual(report.retryable_count, 1)
+
     def test_non_skipped_item_requires_session_and_review_ids(self):
         with self.assertRaises(ValidationError):
             ScheduledReviewItem(
@@ -136,7 +396,7 @@ class HermesScheduledReviewTests(unittest.TestCase):
     def test_review_date_must_be_fully_elapsed(self):
         calls = []
 
-        def reviewer(session_id, review_date):
+        def reviewer(session_id, review_date, _version):
             calls.append((session_id, review_date))
             plan = store.load(date(2026, 8, 5))
             item = next(
@@ -200,7 +460,7 @@ class HermesScheduledReviewTests(unittest.TestCase):
         }
         calls = []
 
-        def reviewer(session_id, review_date):
+        def reviewer(session_id, review_date, _version):
             calls.append((session_id, review_date))
             item = next(
                 candidate
@@ -244,7 +504,7 @@ class HermesScheduledReviewTests(unittest.TestCase):
         )
 
     def test_price_failure_remains_retryable(self):
-        def failing_reviewer(_session_id, _review_date):
+        def failing_reviewer(_session_id, _review_date, _version):
             return {
                 "ok": False,
                 "error": {"code": "PRICE_DATA_UNAVAILABLE"},
@@ -292,7 +552,7 @@ class HermesScheduledReviewTests(unittest.TestCase):
             process_due_reviews(
                 store,
                 date(2026, 8, 7),
-                lambda _session_id, _review_date: {
+                lambda _session_id, _review_date, _version: {
                     "ok": True,
                     "data": {
                         "review": mismatched_review.model_dump(mode="json")
@@ -522,7 +782,7 @@ class HermesScheduledReviewTests(unittest.TestCase):
                 for item in batch.items
             }
 
-            def reviewer(session_id, review_date):
+            def reviewer(session_id, review_date, _version):
                 review = review_completed_session(
                     sessions[session_id],
                     review_date,

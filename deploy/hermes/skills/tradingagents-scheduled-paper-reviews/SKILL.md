@@ -5,39 +5,177 @@ description: Use when the attached Hermes Cron explicitly requests scheduled Tra
 
 # TradingAgents Scheduled Paper Reviews
 
-Run this workflow only when the attached Hermes Cron prompt explicitly requests
-scheduled paper-review memory promotion. This is research and paper trading only,
-never a real order.
+Run this fixed, bounded protocol only when the attached Hermes Cron explicitly
+requests scheduled TradingAgents paper-review memory promotion. This is research
+and paper trading only, never a real order.
 
-1. Run exactly this project command once to obtain bounded pending work:
+## 1. Drain legacy review memory (v1)
 
-   ```bash
-   /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
-   ```
+Run exactly once:
 
-2. Continue only when the command returns JSON with `ok: true`. If
-   `unavailable_count` is nonzero, report that total and the bounded
-   `unavailable_review_ids` sample without trying memory add, confirmation, or
-   repair for them. Continue with the valid items in `items`, in order. Do not
-   search or read raw Hermes memory.
-3. For each item, call the Hermes built-in memory tool exactly once with
-   `action=add`, target `memory`, and the exact `hermes_memory_entry` as content.
-   Do not rewrite, summarize, combine, or decorate the entry.
-4. If the memory tool returns `Entry added` or `Entry already exists`, run this
-   confirmation command with that item's exact review ID:
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
+```
 
-   ```bash
-   /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap confirm-memory --review-id <review_id>
-   ```
+Continue only for JSON with `ok: true`. Report `unavailable_count` and the
+bounded `unavailable_review_ids` sample, and do not add or confirm unavailable
+items. Continue with the valid items in `items`, in order. For each valid entry,
+call the Hermes built-in memory tool exactly once with
+`memory(action=add,target=memory,content=<exact hermes_memory_entry>)`.
+Do not rewrite, summarize, combine, decorate, or print the entry. Only `Entry
+added` or `Entry already exists` permits the matching read-only confirmation:
 
-5. Treat only confirmation JSON with `ok: true` and `state: completed` as
-   success. Report the review ID, symbol, horizon, and state without printing
-   the memory entry.
-6. For any other memory-tool result, do not call add again for that item in the
-   same run and do not confirm it. Continue with independent later items.
-7. On confirmation failure, do not retry, edit files, or attempt a repair in
-   this run. The project quarantines the item for operator investigation.
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap confirm-memory --review-id <review_id>
+```
 
-Never edit Hermes `MEMORY.md` with terminal, shell, or file-writing tools. Never
-expose credentials, connect exchange credentials, place orders, send external
-messages, or turn a paper-review lesson into trading instructions.
+Accept only confirmation JSON with `ok: true` and `state: completed`. For any
+other memory-tool response, do not call confirmation; leave the item in `memory_pending`.
+Report only the safe error, and let an operator or a later run handle it. A
+confirmation failure moves the project item to
+`attention_required`. Do not retry, repair, or process either failed item again
+in this run. Continue with independent later legacy items.
+
+## 2. Reflect bounded report evidence (v2)
+
+List metadata only, at most 18 items:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+```
+
+For each returned `session_id` and `revision`, fetch exactly one packet:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-evidence --session-id <session_id> --revision <revision>
+```
+
+Use only that packet to produce one strict structured reflection. Do not search,
+fetch another packet, infer missing facts, or include raw report/evidence text
+in a summary. Call
+`mcp__tradingagents_crypto__submit_report_reflection` once with the packet's
+`session_id`, `revision` as `expected_revision`, and the structured reflection.
+Continue only when the response `ok` is exactly `true`,
+`data.reflection_state` is exactly `"ready"`, and `data.memory_state` is either `"add_pending"` or `"replace_pending"`.
+Missing or unknown response nesting is failure:
+report only the safe error, do not call report-memory commands for that item,
+and continue with independent items.
+
+## 3. Promote one report memory entry at a time
+
+List report-memory metadata, bounded to 18:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-pending --limit 18
+```
+
+Inspect each listed item's `memory_state` before starting it. For
+`add_pending`, `replace_pending`, or `memory_call_started`, run exactly once:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap begin-report-memory --session-id <session_id> --revision <revision>
+```
+
+Inspect only its returned `memory_state`, `action`, `content`, and (for
+replacement) `old_text`:
+
+- For `add_pending`, `replace_pending`, or `memory_call_started`,
+  `begin-report-memory` is idempotent and returns the same operation after a
+  restart. Call Hermes built-in memory exactly once using the returned `action`,
+  `content`, and `old_text` fields. T+1 must be
+  `memory(action=add,target=memory,content=...)`. T+7 and T+15 must be
+  `memory(action=replace,target=memory,old_text=<stable marker>,content=...)`.
+- For `verification_pending`, do not call `begin-report-memory` again and do not
+  mutate Hermes memory. This recovery state does not return `content` or `old_text`.
+  Call
+  `confirm-report-memory --session-id <session_id> --revision <revision>`
+  directly; this is crash recovery after the mutation and prevents a second
+  Hermes mutation.
+
+For an add, accept only `Entry added` or `Entry already exists`. For a replace,
+accept only Hermes's successful `Entry replaced` result. The result must match
+the requested action; an ambiguous, missing, or other result is quarantined
+without printing content:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap quarantine-report-memory --session-id <session_id> --revision <revision> --error-code REPORT_MEMORY_RESULT_AMBIGUOUS
+```
+
+After an accepted mutation, call the read-only
+`confirm-report-memory --session-id <session_id> --revision <revision>` command
+and accept only `ok: true`. On verification failure, confirmation already persists `attention_required`;
+report the safe status for operator investigation.
+Do not call `quarantine-report-memory` after a confirmation failure, and never
+call a memory mutation again for that revision in the same run. Process later
+independent items.
+
+## 4. Retire bounded completed report memory
+
+Run this step only after all report-memory promotions in section 3, including
+their direct `verification_pending` confirmations. Retirement is independent:
+an unavailable or quarantined retirement must not block active report
+replacements or later work for another symbol.
+
+List retirement metadata only, bounded to 18:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+```
+
+Accept only JSON with `ok: true` and `items`. If the list result is unexpected,
+report its safe error and continue the run; it contains no reliable item
+identity to quarantine. For each returned `pending` or `memory_call_started`
+item, begin the operation exactly once:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap begin-report-memory-retirement --symbol <symbol> --session-id <session_id>
+```
+
+Accept only `ok: true`, `action: "remove"`, `state: "memory_call_started"`,
+and the returned stable `old_text` marker. This is the only command that
+returns a marker. Do not print, summarize, repeat, or otherwise expose the
+marker. On any unexpected begin result, run the safe quarantine command with
+`MEMORY_RESULT_AMBIGUOUS`, report only its safe result, and continue later
+independent work:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap quarantine-report-memory-retirement --symbol <symbol> --session-id <session_id> --error-code MEMORY_RESULT_AMBIGUOUS
+```
+
+For a listed item with an unknown state, use the same command with
+`MEMORY_RESULT_AMBIGUOUS`; it has a safe identity but no valid protocol branch.
+For an accepted begin result, call the Hermes built-in tool exactly once:
+`memory(action=remove,target=memory,old_text=<returned marker>)`. Accept only
+the literal success `Entry removed`. For a missing, ambiguous, or any other
+remove result, quarantine with `MEMORY_REMOVE_FAILED`; do not call confirmation
+and do not issue another remove for that item in this run.
+
+For an accepted remove, call:
+
+```bash
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap confirm-report-memory-retirement --symbol <symbol> --session-id <session_id>
+```
+
+Accept only `ok: true` and `state: "retired"`. An unexpected confirmation
+result is quarantined with `MEMORY_VERIFICATION_FAILED`, without exposing a
+marker or memory text.
+
+For `verification_pending`, retries only confirmation with the same `symbol`
+and `session_id`. Do not call `begin-report-memory-retirement` and do not call
+the Hermes memory remove tool again. If that confirmation is not accepted,
+quarantine with `MEMORY_VERIFICATION_FAILED` and continue unrelated work.
+
+## 5. Safety and reporting
+
+Report only review/session IDs, symbols, revisions, states, counts, and
+allowlisted safe error codes. Never print packet fields, evidence excerpts,
+memory content, credentials, or filesystem paths. Never invoke the Hermes memory
+tool to read or search long-term memory. Never edit Hermes `MEMORY.md` with a
+shell, editor, terminal, or file-writing command; only the Hermes built-in
+memory tool may mutate memory.
+
+Do not perform external search or news retrieval, exchange access, credential
+handling, real trading, order placement, or external messages. Do not turn a
+paper-review lesson into trading instructions. Keep legacy and report queues
+bounded and independent; an unavailable or quarantined item must not block the
+rest of the run.
