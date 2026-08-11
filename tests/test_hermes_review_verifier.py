@@ -427,6 +427,28 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertNotIn("memory(action=read", skill)
         self.assertNotIn("edit MEMORY.md", skill)
 
+    def test_scheduled_skill_defers_rejected_reflection_retries(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        reflection = skill[
+            skill.index("## 2. Reflect bounded report evidence (v2)") :
+            skill.index("## 3. Promote one report memory entry at a time")
+        ]
+
+        self.assertIn("one evidence fetch and one submit", reflection)
+        self.assertIn("Do not fetch, regenerate, or submit", reflection)
+        self.assertIn("same `session_id` and `revision`", reflection)
+        self.assertIn("current Agent run", reflection)
+        self.assertIn("may have contributed", reflection)
+        self.assertIn("is consistent with", reflection)
+        self.assertIn("could indicate", reflection)
+        self.assertIn("certainty", reflection)
+        self.assertIn("real-order", reflection)
+        self.assertIn("credential", reflection)
+        self.assertIn("prompt-injection", reflection)
+        self.assertIn("unsupported external-source", reflection)
+        self.assertIn("marker", reflection)
+        self.assertIn("delimiter", reflection)
+
     def test_runbook_documents_v2_cutover_and_single_entry_acceptance(self):
         text = RUNBOOK_PATH.read_text(encoding="utf-8")
 
