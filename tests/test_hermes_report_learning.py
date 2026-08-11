@@ -489,6 +489,44 @@ class HermesReportLearningTests(unittest.TestCase):
                 first_bytes,
             )
 
+    def test_rejected_reflection_defers_when_utc_date_moves_backward(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            payload = valid_reflection_payload()
+            payload["overall_assessment"] = "This outcome was guaranteed."
+
+            with self.assertRaises(
+                hermes_report_learning.ReportReflectionRejected
+            ):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    payload,
+                    attempt_date=date(2026, 8, 12),
+                )
+            first_bytes = report_store.path_for(session.session_id).read_bytes()
+
+            with self.assertRaises(
+                hermes_report_learning.ReportReflectionRetryDeferred
+            ):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    payload,
+                    attempt_date=date(2026, 8, 11),
+                )
+
+            persisted = report_store.load(session.session_id)
+            self.assertEqual(persisted.revisions[0].reflection_attempt_count, 1)
+            self.assertEqual(
+                report_store.path_for(session.session_id).read_bytes(),
+                first_bytes,
+            )
+
     def test_rejected_reflection_quarantines_after_three_utc_dates(self):
         with TemporaryDirectory() as directory:
             report_store, index_store, session = pending_report_fixture(directory)

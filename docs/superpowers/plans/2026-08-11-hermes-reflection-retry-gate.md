@@ -357,7 +357,10 @@ if type(selected_attempt_date) is not date:
 Inside the existing locked pending-revision branch, after confirming `reflection_state == "pending"` and before `ReportReflection.model_validate`, add:
 
 ```python
-if snapshot.last_reflection_attempt_date == selected_attempt_date:
+if (
+    snapshot.last_reflection_attempt_date is not None
+    and selected_attempt_date <= snapshot.last_reflection_attempt_date
+):
     raise ReportReflectionRetryDeferred(
         "report reflection retry deferred until a later UTC date"
     )

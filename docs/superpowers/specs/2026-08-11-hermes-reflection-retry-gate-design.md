@@ -64,7 +64,7 @@ last_reflection_attempt_date: date | None = None
 
 在解析和 bounded validation 反思内容之前，在 report-store 排他锁内检查 snapshot：
 
-- 若 `reflection_state=pending` 且 `last_reflection_attempt_date == D`，抛出 `ReportReflectionRetryDeferred` domain exception；
+- 若 `reflection_state=pending` 且当前日期不晚于 `last_reflection_attempt_date`，抛出 `ReportReflectionRetryDeferred` domain exception；这也安全阻断主机 UTC 时钟回拨后的较早日期；
 - 不验证反思正文；
 - 不增加 attempt count；
 - 不更新 error code、timestamps、index 或 memory state；

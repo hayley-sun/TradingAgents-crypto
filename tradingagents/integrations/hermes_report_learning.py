@@ -943,7 +943,11 @@ def submit_report_reflection(
                 raise ReportLearningConflict(
                     "report learning revision is not the next pending snapshot"
                 )
-            if snapshot.last_reflection_attempt_date == selected_attempt_date:
+            if (
+                snapshot.last_reflection_attempt_date is not None
+                and selected_attempt_date
+                <= snapshot.last_reflection_attempt_date
+            ):
                 raise ReportReflectionRetryDeferred(
                     "report reflection retry deferred until a later UTC date"
                 )
