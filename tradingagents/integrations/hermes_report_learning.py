@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import fcntl
@@ -86,6 +86,10 @@ class ReportReflectionRejected(ReportLearningError):
             raise ValueError("invalid reflection error code")
         super().__init__("report reflection rejected")
         self.error_code = error_code
+
+
+class ReportReflectionRetryDeferred(ReportLearningError):
+    """The pending revision already consumed its UTC-date attempt."""
 
 
 @dataclass(frozen=True)
@@ -865,6 +869,7 @@ def _save_reflection_rejection(
     revision: int,
     snapshot: ReportLearningRevision,
     error: ReportReflectionRejected,
+    attempt_date: date,
 ) -> None:
     now = utc_now()
     attempts = min(
@@ -878,6 +883,7 @@ def _save_reflection_rejection(
                 else "pending"
             ),
             "reflection_attempt_count": attempts,
+            "last_reflection_attempt_date": attempt_date,
             "last_error_code": error.error_code,
             "updated_at": now,
         }
@@ -893,8 +899,17 @@ def submit_report_reflection(
     session: AnalysisSession,
     expected_revision: int,
     reflection_data,
+    *,
+    attempt_date: date | None = None,
 ) -> ReportLearningRecord:
     """Validate and persist one reflection, then index its deterministic lesson."""
+    selected_attempt_date = (
+        datetime.now(timezone.utc).date()
+        if attempt_date is None
+        else attempt_date
+    )
+    if type(selected_attempt_date) is not date:
+        raise ValueError("invalid report reflection attempt date")
     with report_store.locked():
         current = report_store.load(session.session_id)
         if current is None:
@@ -928,6 +943,14 @@ def submit_report_reflection(
                 raise ReportLearningConflict(
                     "report learning revision is not the next pending snapshot"
                 )
+            if (
+                snapshot.last_reflection_attempt_date is not None
+                and selected_attempt_date
+                <= snapshot.last_reflection_attempt_date
+            ):
+                raise ReportReflectionRetryDeferred(
+                    "report reflection retry deferred until a later UTC date"
+                )
             try:
                 ReportReflection.model_validate(reflection_data)
             except (TypeError, ValueError, ValidationError) as validation_error:
@@ -938,6 +961,7 @@ def submit_report_reflection(
                     expected_revision,
                     snapshot,
                     rejected,
+                    selected_attempt_date,
                 )
                 raise rejected from validation_error
             packet = build_evidence_packet(current, session, expected_revision)
@@ -964,6 +988,7 @@ def submit_report_reflection(
                     expected_revision,
                     snapshot,
                     error,
+                    selected_attempt_date,
                 )
                 raise
 

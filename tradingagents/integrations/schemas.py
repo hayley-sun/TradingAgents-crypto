@@ -660,6 +660,7 @@ class ReportLearningRevision(_StrictModel):
     ]
     source_fields: list[ReportSourceMetadata] = Field(min_length=1, max_length=8)
     reflection_attempt_count: int = Field(default=0, ge=0)
+    last_reflection_attempt_date: date | None = None
     last_error_code: str | None = Field(default=None, max_length=100)
     reflection: ReportReflection | None = None
     lesson: str | None = Field(default=None, max_length=6000)

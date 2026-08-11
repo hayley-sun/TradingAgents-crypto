@@ -692,6 +692,20 @@ memory tool 返回 ambiguous、unaccepted 或与 action 不匹配的结果时，
 不得用 shell 修复。若确认已把状态持久化为 `verification_pending` 后进程崩溃，
 恢复时直接再次调用 `confirm-report-memory`，不得执行第二次 Hermes mutation。
 
+### Reflection retry gate 恢复
+
+`REPORT_REFLECTION_RETRY_DEFERRED` 表示同一 `session_id`/`revision` 已在当前 UTC
+日期消耗一次 bounded reflection attempt。同一 UTC 日期最多消耗一次；当前 Agent
+run 不得重新运行同一 item，也不得重新 fetch evidence、生成或提交 reflection。
+第一次和第二次 rejected attempt 保持 `pending`，只能由后续 UTC 日期的 scheduled
+run 各尝试一次；只有三个不同 UTC 日期均失败才进入 `attention_required`。
+
+若验收项已进入 `attention_required`，保持 `attention_required` artifact 不变，
+不得直接修改 `report_memories/<session_id>.json`、不得补写 Hermes memory、不得删除
+report、review、index、schedule 或 session。四个 Cron job 必须继续保持 paused。
+修复并重新部署后选择新的未使用历史日期，从 v2 submit 开始重新执行完整
+T+1/T+7/T+15 验收；原失败 artifact 永久保留供审计，并且不计为成功验收报告。
+
 全部旧 v1 与新 v2 验收通过后，才移除仍为 paused 的旧 job，然后恢复两个
 replacement job：
 

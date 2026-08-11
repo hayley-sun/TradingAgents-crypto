@@ -539,6 +539,38 @@ class HermesSchemaTests(unittest.TestCase):
         self.assertEqual(revision.hermes_memory_entry, " ")
         self.assertEqual(reflection.technical_context, " ")
 
+    def test_report_learning_attempt_date_is_backward_compatible(self):
+        now = utc_now()
+        revision = ReportLearningRevision(
+            revision=1,
+            outcome_review_ids=["review_0123456789abcdef"],
+            reflection_state="pending",
+            memory_state="blocked",
+            source_fields=[
+                ReportSourceMetadata(
+                    name="report.market",
+                    sha256="a" * 64,
+                    truncated=False,
+                )
+            ],
+            created_at=now,
+            updated_at=now,
+        )
+        self.assertTrue(hasattr(revision, "last_reflection_attempt_date"))
+        legacy_payload = revision.model_dump(mode="json")
+        legacy_payload.pop("last_reflection_attempt_date")
+
+        restored = ReportLearningRevision.model_validate(legacy_payload)
+        attempted = restored.model_copy(
+            update={"last_reflection_attempt_date": date(2026, 8, 11)}
+        )
+
+        self.assertIsNone(restored.last_reflection_attempt_date)
+        self.assertEqual(
+            attempted.model_dump(mode="json")["last_reflection_attempt_date"],
+            "2026-08-11",
+        )
+
     def test_report_learning_json_schema_exposes_string_bounds(self):
         source_name = ReportSourceMetadata.model_json_schema()["properties"]["name"]
         self.assertEqual(

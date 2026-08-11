@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import unittest
@@ -125,9 +126,13 @@ class HermesMcpTests(unittest.TestCase):
         ))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+        self.assertIn(
+            "current Agent run", result["error"]["suggested_action"]
+        )
 
     def test_submit_report_reflection_schema_resolves_nested_refs(self):
         tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        self.assertNotIn("attempt_date", tool.parameters["properties"])
         arguments = {
             "session_id": "hermes_0123456789abcdef",
             "expected_revision": 1,
@@ -160,7 +165,11 @@ class HermesMcpTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
 
-    def test_attention_required_reflection_rejects_malformed_retry_without_write(self):
+    def test_same_day_reflection_retry_is_deferred_without_write(self):
+        self.assertIn(
+            "attempt_date",
+            inspect.signature(submit_report_reflection_impl).parameters,
+        )
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "hermes"
             session_store = SessionStore(root / "sessions")
@@ -211,39 +220,47 @@ class HermesMcpTests(unittest.TestCase):
                 "This outcome was guaranteed."
             )
 
-            for attempt in range(1, 4):
-                result = submit_report_reflection_impl(
-                    {
-                        "session_id": session.session_id,
-                        "expected_revision": 1,
-                        "reflection": unsafe_reflection,
-                    },
-                    session_store=session_store,
-                    report_store=report_store,
-                    learning_store=learning_store,
-                )
-                snapshot = report_store.load(session.session_id).revisions[0]
-
-                self.assertFalse(result["ok"])
-                self.assertEqual(
-                    result["error"]["code"], "REFLECTION_UNSAFE_CONTENT"
-                )
-                self.assertEqual(snapshot.reflection_attempt_count, attempt)
-                self.assertEqual(
-                    snapshot.reflection_state,
-                    "attention_required" if attempt == 3 else "pending",
-                )
-                self.assertEqual(
-                    snapshot.last_error_code, "REFLECTION_UNSAFE_CONTENT"
-                )
-
+            first = submit_report_reflection_impl(
+                {
+                    "session_id": session.session_id,
+                    "expected_revision": 1,
+                    "reflection": unsafe_reflection,
+                },
+                session_store=session_store,
+                report_store=report_store,
+                learning_store=learning_store,
+                attempt_date=date(2026, 8, 11),
+            )
             record_path = report_store.path_for(session.session_id)
-            quarantined_bytes = record_path.read_bytes()
-            quarantined_snapshot = report_store.load(session.session_id).revisions[0]
+            first_bytes = record_path.read_bytes()
+            same_day = submit_report_reflection_impl(
+                {
+                    "session_id": session.session_id,
+                    "expected_revision": 1,
+                    "reflection": unsafe_reflection,
+                },
+                session_store=session_store,
+                report_store=report_store,
+                learning_store=learning_store,
+                attempt_date=date(2026, 8, 11),
+            )
+            snapshot = report_store.load(session.session_id).revisions[0]
+
+            self.assertEqual(first["error"]["code"], "REFLECTION_UNSAFE_CONTENT")
+            self.assertIn("Do not submit", first["error"]["suggested_action"])
+            self.assertEqual(
+                same_day["error"]["code"],
+                "REPORT_REFLECTION_RETRY_DEFERRED",
+            )
+            self.assertIn(
+                "current Agent run", same_day["error"]["suggested_action"]
+            )
+            self.assertEqual(snapshot.reflection_attempt_count, 1)
+            self.assertEqual(record_path.read_bytes(), first_bytes)
+
             malformed_reflection = self.valid_reflection_payload()
             malformed_reflection.pop("decision_thesis")
-
-            retry = submit_report_reflection_impl(
+            schema_rejected = submit_report_reflection_impl(
                 {
                     "session_id": session.session_id,
                     "expected_revision": 1,
@@ -252,13 +269,32 @@ class HermesMcpTests(unittest.TestCase):
                 session_store=session_store,
                 report_store=report_store,
                 learning_store=learning_store,
+                attempt_date=date(2026, 8, 12),
             )
-            retried_snapshot = report_store.load(session.session_id).revisions[0]
+            schema_rejected_bytes = record_path.read_bytes()
+            schema_deferred = submit_report_reflection_impl(
+                {
+                    "session_id": session.session_id,
+                    "expected_revision": 1,
+                    "reflection": malformed_reflection,
+                },
+                session_store=session_store,
+                report_store=report_store,
+                learning_store=learning_store,
+                attempt_date=date(2026, 8, 12),
+            )
+            snapshot = report_store.load(session.session_id).revisions[0]
 
-            self.assertFalse(retry["ok"])
-            self.assertEqual(retry["error"]["code"], "REPORT_REFLECTION_STALE")
-            self.assertEqual(record_path.read_bytes(), quarantined_bytes)
-            self.assertEqual(retried_snapshot, quarantined_snapshot)
+            self.assertEqual(
+                schema_rejected["error"]["code"], "INVALID_REPORT_REFLECTION"
+            )
+            self.assertEqual(snapshot.last_error_code, "REFLECTION_SCHEMA_INVALID")
+            self.assertEqual(snapshot.reflection_attempt_count, 2)
+            self.assertEqual(
+                schema_deferred["error"]["code"],
+                "REPORT_REFLECTION_RETRY_DEFERRED",
+            )
+            self.assertEqual(record_path.read_bytes(), schema_rejected_bytes)
 
     def make_request(self):
         return AnalysisRequest(

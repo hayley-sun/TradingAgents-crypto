@@ -38,6 +38,7 @@ from tradingagents.integrations.hermes_report_learning import (
     ReportLearningError,
     ReportLearningStore,
     ReportReflectionRejected,
+    ReportReflectionRetryDeferred,
     submit_report_reflection as _persist_report_reflection,
 )
 from tradingagents.integrations.hermes_reports import (
@@ -356,6 +357,12 @@ def _report_error(code: str, message: str, suggested_action: str) -> dict[str, A
     return failure(
         ToolError(code=code, message=message, suggested_action=suggested_action)
     )
+
+
+_REPORT_REFLECTION_NO_CURRENT_RUN_RETRY = (
+    "Do not submit this session and revision again in the current Agent run. "
+    "Leave the item pending for a later scheduled run and continue independent items."
+)
 
 
 def _report_batch_store_from_environment() -> ReportBatchStore:
@@ -1082,6 +1089,8 @@ def submit_report_reflection_impl(
     session_store: SessionStore | None = None,
     report_store: ReportLearningStore | None = None,
     learning_store: LearningStore | None = None,
+    *,
+    attempt_date: date | None = None,
 ) -> dict[str, Any]:
     """Persist one validated report reflection behind a strict, safe MCP boundary."""
     if not isinstance(request_data, Mapping):
@@ -1112,19 +1121,6 @@ def submit_report_reflection_impl(
             "The report reflection request is invalid.",
             "Use a valid Hermes session ID, revision, and reflection payload.",
         )
-
-    try:
-        ReportReflection.model_validate(reflection_data)
-    except ValidationError as validation_error:
-        if any(
-            item.get("type") == "extra_forbidden"
-            for item in validation_error.errors()
-        ):
-            return _report_error(
-                "INVALID_REPORT_REFLECTION",
-                "The report reflection request is invalid.",
-                "Use only the documented reflection fields.",
-            )
 
     try:
         active_session_store = session_store or SessionStore.from_environment()
@@ -1171,6 +1167,13 @@ def submit_report_reflection_impl(
             session,
             expected_revision,
             reflection_data,
+            attempt_date=attempt_date,
+        )
+    except ReportReflectionRetryDeferred:
+        return _report_error(
+            "REPORT_REFLECTION_RETRY_DEFERRED",
+            "The report reflection already consumed its UTC-date attempt.",
+            _REPORT_REFLECTION_NO_CURRENT_RUN_RETRY,
         )
     except ReportReflectionRejected as error:
         return _report_error(
@@ -1180,7 +1183,7 @@ def submit_report_reflection_impl(
                 else error.error_code
             ),
             "The report reflection did not pass bounded validation.",
-            "Correct the reflection fields and try again.",
+            _REPORT_REFLECTION_NO_CURRENT_RUN_RETRY,
         )
     except ReportLearningConflict:
         return _report_error(
@@ -1264,10 +1267,20 @@ def submit_report_reflection(
     **unknown_fields: Any,
 ) -> dict[str, Any]:
     """Persist one bounded retrospective report reflection."""
+    try:
+        validated_reflection = ReportReflection.model_validate(reflection).model_dump(
+            mode="python"
+        )
+    except (TypeError, ValueError, ValidationError):
+        return _report_error(
+            "INVALID_REPORT_REFLECTION",
+            "The report reflection request is invalid.",
+            _REPORT_REFLECTION_NO_CURRENT_RUN_RETRY,
+        )
     request_data = {
         "session_id": session_id,
         "expected_revision": expected_revision,
-        "reflection": reflection,
+        "reflection": validated_reflection,
         **unknown_fields,
     }
     return submit_report_reflection_impl(request_data)
@@ -1356,7 +1369,7 @@ class _ReviewPaperDecisionArguments(ArgModelBase):
 
 
 class _SubmitReportReflectionArguments(ArgModelBase):
-    """Preserve raw reflection fields so the strict boundary can reject extras."""
+    """Preserve raw reflection fields for a structured boundary response."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
