@@ -126,9 +126,13 @@ class HermesMcpTests(unittest.TestCase):
         ))
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "INVALID_REPORT_REFLECTION")
+        self.assertIn(
+            "current Agent run", result["error"]["suggested_action"]
+        )
 
     def test_submit_report_reflection_schema_resolves_nested_refs(self):
         tool = MCP._tool_manager.get_tool("submit_report_reflection")
+        self.assertNotIn("attempt_date", tool.parameters["properties"])
         arguments = {
             "session_id": "hermes_0123456789abcdef",
             "expected_revision": 1,

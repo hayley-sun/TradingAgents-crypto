@@ -113,7 +113,8 @@ MCP 仍在进入 store 前拒绝无法归属的 envelope，例如无效 session 
 FastMCP 的 decorated tool wrapper 继续按公开 `ReportReflection` schema 校验外部 RPC
 payload，并把 nested unknown fields 等 malformed RPC 输入映射为结构化
 `INVALID_REPORT_REFLECTION`；这类请求尚未进入持久化边界，因此不消耗 bounded
-attempt。内部 `submit_report_reflection_impl` 的有效 identity/mapping 路径不再提前执行
+attempt，但响应仍使用同一条 no-current-run-retry 指令。内部
+`submit_report_reflection_impl` 的有效 identity/mapping 路径不再提前执行
 该 schema special case，进入核心后发生的 schema rejection 仍受 UTC-date gate 约束。
 
 ## Skill Contract

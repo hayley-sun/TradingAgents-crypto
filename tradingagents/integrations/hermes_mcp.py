@@ -1275,7 +1275,7 @@ def submit_report_reflection(
         return _report_error(
             "INVALID_REPORT_REFLECTION",
             "The report reflection request is invalid.",
-            "Use only the documented reflection fields.",
+            _REPORT_REFLECTION_NO_CURRENT_RUN_RETRY,
         )
     request_data = {
         "session_id": session_id,
