@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import multiprocessing
 import unittest
@@ -186,6 +187,29 @@ def _concurrent_report_fact(
         AnalysisSession.model_validate(session_payload),
         PaperDecisionReview.model_validate(review_payload),
     )
+
+
+def _concurrent_rejected_reflection(root, session_payload, start, results):
+    from tradingagents.integrations import hermes_report_learning as report_module
+    from tradingagents.integrations.hermes_learning import LearningStore
+    from tradingagents.integrations.schemas import AnalysisSession
+
+    start.wait(timeout=5)
+    payload = valid_reflection_payload()
+    payload["overall_assessment"] = "This outcome was guaranteed."
+    try:
+        report_module.submit_report_reflection(
+            report_module.ReportLearningStore(Path(root) / "reports"),
+            LearningStore(Path(root) / "index"),
+            AnalysisSession.model_validate(session_payload),
+            1,
+            payload,
+            attempt_date=date(2026, 8, 11),
+        )
+    except report_module.ReportReflectionRejected:
+        results.put("rejected")
+    except report_module.ReportReflectionRetryDeferred:
+        results.put("deferred")
 
 
 def report_learning_record(
@@ -414,17 +438,76 @@ class HermesReportLearningTests(unittest.TestCase):
             "REFLECTION_EVIDENCE_INVALID",
         )
 
-    def test_rejected_reflection_is_quarantined_after_three_atomic_attempts(self):
+    def test_rejected_reflection_consumes_only_one_attempt_per_utc_date(self):
+        self.assertIn(
+            "attempt_date",
+            inspect.signature(
+                hermes_report_learning.submit_report_reflection
+            ).parameters,
+        )
+        self.assertTrue(
+            hasattr(hermes_report_learning, "ReportReflectionRetryDeferred")
+        )
         with TemporaryDirectory() as directory:
             report_store, index_store, session = pending_report_fixture(directory)
             payload = valid_reflection_payload()
             payload["overall_assessment"] = "This outcome was guaranteed."
-            for attempt in range(1, 4):
+
+            with self.assertRaises(
+                hermes_report_learning.ReportReflectionRejected
+            ):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    payload,
+                    attempt_date=date(2026, 8, 11),
+                )
+            first_bytes = report_store.path_for(session.session_id).read_bytes()
+
+            with self.assertRaises(
+                hermes_report_learning.ReportReflectionRetryDeferred
+            ):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    payload,
+                    attempt_date=date(2026, 8, 11),
+                )
+
+            persisted = report_store.load(session.session_id)
+            self.assertEqual(persisted.revisions[0].reflection_attempt_count, 1)
+            self.assertEqual(
+                persisted.revisions[0].last_reflection_attempt_date,
+                date(2026, 8, 11),
+            )
+            self.assertEqual(
+                report_store.path_for(session.session_id).read_bytes(),
+                first_bytes,
+            )
+
+    def test_rejected_reflection_quarantines_after_three_utc_dates(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            payload = valid_reflection_payload()
+            payload["overall_assessment"] = "This outcome was guaranteed."
+            for attempt, attempt_date in enumerate(
+                (date(2026, 8, 11), date(2026, 8, 12), date(2026, 8, 13)),
+                start=1,
+            ):
                 with self.assertRaises(
                     hermes_report_learning.ReportReflectionRejected
                 ):
                     hermes_report_learning.submit_report_reflection(
-                        report_store, index_store, session, 1, payload
+                        report_store,
+                        index_store,
+                        session,
+                        1,
+                        payload,
+                        attempt_date=attempt_date,
                     )
                 persisted = report_store.load(session.session_id)
                 self.assertEqual(
@@ -438,6 +521,66 @@ class HermesReportLearningTests(unittest.TestCase):
                     persisted.revisions[0].last_error_code,
                     "REFLECTION_UNSAFE_CONTENT",
                 )
+
+    def test_valid_reflection_succeeds_on_later_utc_date(self):
+        with TemporaryDirectory() as directory:
+            report_store, index_store, session = pending_report_fixture(directory)
+            unsafe = valid_reflection_payload()
+            unsafe["overall_assessment"] = "This outcome was guaranteed."
+
+            with self.assertRaises(
+                hermes_report_learning.ReportReflectionRejected
+            ):
+                hermes_report_learning.submit_report_reflection(
+                    report_store,
+                    index_store,
+                    session,
+                    1,
+                    unsafe,
+                    attempt_date=date(2026, 8, 11),
+                )
+            ready = hermes_report_learning.submit_report_reflection(
+                report_store,
+                index_store,
+                session,
+                1,
+                valid_reflection_payload(),
+                attempt_date=date(2026, 8, 12),
+            )
+
+            self.assertEqual(ready.reflected_revision, 1)
+            self.assertEqual(ready.revisions[0].reflection_state, "ready")
+            self.assertEqual(ready.revisions[0].memory_state, "add_pending")
+            self.assertEqual(
+                index_store.load("BTC").report_entries[0].session_id,
+                session.session_id,
+            )
+
+    def test_concurrent_rejections_consume_one_utc_date_attempt(self):
+        with TemporaryDirectory() as directory:
+            report_store, _index_store, session = pending_report_fixture(directory)
+            context = multiprocessing.get_context("fork")
+            start = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_concurrent_rejected_reflection,
+                    args=(directory, session.model_dump(mode="json"), start, results),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=10)
+
+            outcomes = sorted(results.get(timeout=2) for _ in processes)
+            persisted = report_store.load(session.session_id)
+
+        self.assertEqual(outcomes, ["deferred", "rejected"])
+        self.assertTrue(all(process.exitcode == 0 for process in processes))
+        self.assertEqual(persisted.revisions[0].reflection_attempt_count, 1)
 
     def test_submit_reflection_is_idempotent_and_indexes_ready_lesson(self):
         with TemporaryDirectory() as directory:
