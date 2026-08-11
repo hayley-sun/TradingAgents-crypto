@@ -511,6 +511,13 @@ def submit_report_reflection_impl(
 
 Remove the early `ReportReflection.model_validate` block that special-cases `extra_forbidden`. Keep envelope checks for exact top-level keys, valid identity, revision, and mapping reflection. Pass `attempt_date=attempt_date` to `_persist_report_reflection`.
 
+Keep the decorated external FastMCP wrapper schema-compatible by validating its nested
+`reflection` argument as `ReportReflection` and returning a structured
+`INVALID_REPORT_REFLECTION` response for malformed RPC payloads. Do not expose
+`attempt_date` in the tool schema. Direct calls to `submit_report_reflection_impl` with a
+valid identity and mapping continue into the core so persisted schema rejections use the
+UTC-date gate.
+
 Catch deferred before the general rejected exception:
 
 ```python

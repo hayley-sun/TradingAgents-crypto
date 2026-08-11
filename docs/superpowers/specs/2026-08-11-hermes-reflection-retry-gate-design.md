@@ -110,6 +110,12 @@ Leave the item pending for a later scheduled run and continue independent items.
 
 MCP 仍在进入 store 前拒绝无法归属的 envelope，例如无效 session ID、无效 revision 或非 mapping reflection。对于已经具有有效 session ID/revision 且 reflection 是 mapping 的请求，reflection schema validation 下沉到持久化核心；当前针对 extra fields 的前置 `ReportReflection.model_validate` 分支移除。这样 schema rejection 会像其它 bounded rejection 一样原子记录日期和 attempt，同时对外仍映射为 `INVALID_REPORT_REFLECTION`。
 
+FastMCP 的 decorated tool wrapper 继续按公开 `ReportReflection` schema 校验外部 RPC
+payload，并把 nested unknown fields 等 malformed RPC 输入映射为结构化
+`INVALID_REPORT_REFLECTION`；这类请求尚未进入持久化边界，因此不消耗 bounded
+attempt。内部 `submit_report_reflection_impl` 的有效 identity/mapping 路径不再提前执行
+该 schema special case，进入核心后发生的 schema rejection 仍受 UTC-date gate 约束。
+
 ## Skill Contract
 
 `tradingagents-scheduled-paper-reviews` Skill 的 report reflection 段落必须：
