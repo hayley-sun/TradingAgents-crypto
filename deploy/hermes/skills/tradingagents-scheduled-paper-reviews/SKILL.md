@@ -58,7 +58,21 @@ For each returned `session_id` and `revision`, fetch exactly one packet:
 
 Use only that packet to produce one strict structured reflection. Do not search,
 fetch another packet, infer missing facts, or include raw report/evidence text
-in a summary. Call
+in a summary. `causal_hypotheses[].evidence` must exist on every hypothesis and
+must be a non-empty list of strings. Treat it as invalid when it is missing,
+`null`, not a list, or empty. Every string in that list must be an exact copy of
+one `packet.fields[].name`; matching is case-sensitive. Never put a field's
+`excerpt`, `sha256`, natural-language description, alias, or any value not
+present in the current packet's field names into `evidence`. Before submitting,
+build the allowed set from the current `packet.fields[].name` values and
+validate the evidence structure and every reference against it. If the
+structure is invalid or any reference does not match, reject the generated
+reflection locally, do not call `submit_report_reflection`, report only a safe
+local validation error with the allowlisted code
+`REFLECTION_EVIDENCE_INVALID`, and stop processing that item for the current
+Agent run.
+
+Call
 `mcp__tradingagents_crypto__submit_report_reflection` once with the packet's
 `session_id`, `revision` as `expected_revision`, and the structured reflection.
 Continue only when the response `ok` is exactly `true`,
