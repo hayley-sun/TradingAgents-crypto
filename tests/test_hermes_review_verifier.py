@@ -449,6 +449,34 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("marker", reflection)
         self.assertIn("delimiter", reflection)
 
+    def test_scheduled_skill_requires_exact_packet_field_evidence_references(self):
+        skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
+        reflection = skill[
+            skill.index("## 2. Reflect bounded report evidence (v2)") :
+            skill.index("## 3. Promote one report memory entry at a time")
+        ]
+        normalized_reflection = " ".join(reflection.split())
+
+        self.assertIn("`causal_hypotheses[].evidence`", reflection)
+        self.assertIn("must exist on every hypothesis", normalized_reflection)
+        self.assertIn("non-empty list of strings", normalized_reflection)
+        self.assertIn("missing, `null`, not a list, or empty", normalized_reflection)
+        self.assertIn(
+            "exact copy of one `packet.fields[].name`", normalized_reflection
+        )
+        self.assertIn("case-sensitive", reflection)
+        self.assertIn("`excerpt`", reflection)
+        self.assertIn("`sha256`", reflection)
+        self.assertIn("natural-language description", reflection)
+        self.assertIn("alias", reflection)
+        self.assertIn("Before submitting", normalized_reflection)
+        self.assertIn(
+            "reject the generated reflection locally", normalized_reflection
+        )
+        self.assertIn("`REFLECTION_EVIDENCE_INVALID`", reflection)
+        self.assertIn("do not call", normalized_reflection)
+        self.assertIn("`submit_report_reflection`", reflection)
+
     def test_runbook_documents_v2_cutover_and_single_entry_acceptance(self):
         text = RUNBOOK_PATH.read_text(encoding="utf-8")
 
