@@ -10,7 +10,13 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 EventKind = Literal["report", "execution_failure", "missing_archive"]
@@ -43,6 +49,27 @@ class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def _require_aware_datetime(value: datetime) -> datetime:
+    if value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value
+
+
+def _open_without_following_symlinks(path: str, flags: int) -> int:
+    return os.open(path, flags | os.O_NOFOLLOW)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_descriptor = os.open(path, flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
 class NotificationEvent(_FrozenModel):
     event_id: str
     kind: EventKind
@@ -53,6 +80,11 @@ class NotificationEvent(_FrozenModel):
     job_name: str | None = None
     job_id: str | None = None
     execution_id: str | None = None
+
+    @field_validator("created_at")
+    @classmethod
+    def require_aware_created_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value)
 
     @model_validator(mode="after")
     def require_exact_kind_fields(self) -> Self:
@@ -74,6 +106,13 @@ class DeliveryRecord(_FrozenModel):
     delivered_at: datetime | None = None
     last_result: str | None = None
 
+    @field_validator("next_attempt_at", "delivered_at")
+    @classmethod
+    def require_aware_delivery_times(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        return _require_aware_datetime(value) if value is not None else None
+
 
 class NotificationState(_FrozenModel):
     schema_version: Literal[1] = 1
@@ -82,6 +121,11 @@ class NotificationState(_FrozenModel):
     seen_execution_ids: dict[str, list[str]]
     seen_report_event_ids: list[str]
     deliveries: dict[str, DeliveryRecord]
+
+    @field_validator("initialized_at")
+    @classmethod
+    def require_aware_initialized_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value)
 
 
 def retry_delay(attempt_count: int) -> timedelta:
@@ -95,6 +139,7 @@ def initialized_state(
     execution_ids: dict[str, list[str]],
     report_event_ids: list[str],
 ) -> NotificationState:
+    _require_aware_datetime(now)
     return NotificationState(
         initialized_at=now,
         execution_cursors={
@@ -109,6 +154,7 @@ def initialized_state(
 def prune_delivered(
     state: NotificationState, now: datetime
 ) -> NotificationState:
+    _require_aware_datetime(now)
     cutoff = now - timedelta(days=90)
     deliveries = {
         event_id: delivery
@@ -144,7 +190,11 @@ class NotificationStateStore:
 
     def load_optional(self) -> NotificationState | None:
         try:
-            with self.path.open(encoding="ascii") as state_file:
+            with open(
+                self.path,
+                encoding="ascii",
+                opener=_open_without_following_symlinks,
+            ) as state_file:
                 return NotificationState.model_validate(json.load(state_file))
         except FileNotFoundError:
             return None
@@ -174,6 +224,7 @@ class NotificationStateStore:
             os.replace(temporary_path, self.path)
             temporary_path = None
             os.chmod(self.path, 0o600)
+            _fsync_directory(self.root)
         except (OSError, TypeError, ValueError, ValidationError) as error:
             raise NotificationStateError(STATE_ERROR_MESSAGE) from error
         finally:

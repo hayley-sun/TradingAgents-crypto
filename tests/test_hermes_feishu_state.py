@@ -1,7 +1,8 @@
+import os
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from stat import S_IMODE
+from stat import S_IMODE, S_ISDIR
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
     NotificationAlreadyRunning,
     NotificationEvent,
+    NotificationState,
     NotificationStateError,
     NotificationStateStore,
     initialized_state,
@@ -31,6 +33,43 @@ def report_event(event_id="report:2026-08-18:" + "a" * 64):
 
 
 class FeishuNotificationStateTests(unittest.TestCase):
+    def test_models_reject_naive_runtime_datetimes(self):
+        aware = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        naive = aware.replace(tzinfo=None)
+        event_values = report_event().model_dump()
+        state_values = initialized_state(aware, {}, []).model_dump()
+        invalid_models = {
+            "created_at": lambda: NotificationEvent.model_validate(
+                {**event_values, "created_at": naive}
+            ),
+            "initialized_at": lambda: NotificationState.model_validate(
+                {**state_values, "initialized_at": naive}
+            ),
+            "next_attempt_at": lambda: DeliveryRecord(
+                event=report_event(), next_attempt_at=naive
+            ),
+            "delivered_at": lambda: DeliveryRecord(
+                event=report_event(), next_attempt_at=aware, delivered_at=naive
+            ),
+        }
+
+        for field_name, build_model in invalid_models.items():
+            with self.subTest(field_name=field_name), self.assertRaises(
+                ValidationError
+            ):
+                build_model()
+
+    def test_state_operations_reject_naive_now(self):
+        aware = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        naive = aware.replace(tzinfo=None)
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            initialized_state(naive, {}, [])
+
+        state = initialized_state(aware, {}, [])
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            prune_delivered(state, naive)
+
     def test_state_rejects_event_with_wrong_fields(self):
         with self.assertRaises(ValidationError):
             NotificationEvent(
@@ -60,6 +99,15 @@ class FeishuNotificationStateTests(unittest.TestCase):
 
             self.assertIsNone(store.load_optional())
 
+    def test_load_optional_rejects_dangling_state_symlink(self):
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "feishu_notifications")
+            store.root.mkdir(mode=0o700)
+            store.path.symlink_to(store.root / "missing-state.json")
+
+            with self.assertRaises(NotificationStateError):
+                store.load_optional()
+
     def test_atomic_failure_preserves_valid_bytes(self):
         with TemporaryDirectory() as directory:
             store = NotificationStateStore(Path(directory) / "feishu_notifications")
@@ -76,6 +124,54 @@ class FeishuNotificationStateTests(unittest.TestCase):
                     )
 
             self.assertEqual(store.path.read_bytes(), before)
+
+    def test_save_fsyncs_directory_after_atomic_replace(self):
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "feishu_notifications")
+            state = initialized_state(
+                datetime(2026, 8, 18, tzinfo=timezone.utc), {}, []
+            )
+            events = []
+            real_fsync = os.fsync
+            real_replace = os.replace
+
+            def record_fsync(file_descriptor):
+                is_directory = S_ISDIR(os.fstat(file_descriptor).st_mode)
+                descriptor_kind = (
+                    "directory" if is_directory else "file"
+                )
+                events.append(f"fsync:{descriptor_kind}")
+                real_fsync(file_descriptor)
+
+            def record_replace(source, destination):
+                events.append("replace")
+                real_replace(source, destination)
+
+            with patch("os.fsync", side_effect=record_fsync), patch(
+                "os.replace", side_effect=record_replace
+            ):
+                store.save(state)
+
+            self.assertEqual(events, ["fsync:file", "replace", "fsync:directory"])
+
+    def test_directory_fsync_failure_raises_safe_state_error(self):
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "feishu_notifications")
+            state = initialized_state(
+                datetime(2026, 8, 18, tzinfo=timezone.utc), {}, []
+            )
+            real_fsync = os.fsync
+
+            def fail_directory_fsync(file_descriptor):
+                if S_ISDIR(os.fstat(file_descriptor).st_mode):
+                    raise OSError("directory sync failure")
+                real_fsync(file_descriptor)
+
+            with patch("os.fsync", side_effect=fail_directory_fsync):
+                with self.assertRaises(NotificationStateError) as raised:
+                    store.save(state)
+
+            self.assertEqual(str(raised.exception), "notification state unavailable")
 
     def test_second_lock_raises_already_running(self):
         with TemporaryDirectory() as directory:
