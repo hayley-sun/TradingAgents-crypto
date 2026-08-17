@@ -361,8 +361,6 @@ def _load_report_batches(results_root: Path) -> tuple[DailyReportBatch, ...]:
             expected_name = f"{batch.request.trade_date.isoformat()}.json"
             if path.name != expected_name or batch.request.trade_date in seen_dates:
                 raise ValueError("invalid canonical batch")
-            if not _is_aware(batch.created_at):
-                raise ValueError("naive batch timestamp")
             seen_dates.add(batch.request.trade_date)
             batches.append(batch)
         return tuple(sorted(batches, key=lambda batch: batch.request.trade_date))

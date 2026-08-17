@@ -988,6 +988,7 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         cases = (
             "batch date mismatch",
             "archive date mismatch",
+            "naive archive timestamp",
             "malformed JSON",
             "schema invalid",
             "missing report",
@@ -1009,6 +1010,10 @@ class HermesFeishuNotifierTests(unittest.TestCase):
                 elif case == "archive date mismatch":
                     payload = batch.model_dump(mode="json")
                     payload["archive"]["filename"] = "2026-08-15.md"
+                    batch_path.write_text(json.dumps(payload), encoding="ascii")
+                elif case == "naive archive timestamp":
+                    payload = batch.model_dump(mode="json")
+                    payload["archive"]["archived_at"] = "2026-08-14T00:00:00"
                     batch_path.write_text(json.dumps(payload), encoding="ascii")
                 elif case == "malformed JSON":
                     batch_path.write_text("{unsafe-json", encoding="ascii")
@@ -1118,6 +1123,109 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assertEqual(event.job_name, "daily_archive")
         self.assertEqual(event.job_id, ARCHIVE_JOB_ID)
         self.assertEqual(event.execution_id, "e" * 32)
+
+    def test_naive_batch_created_at_does_not_block_missing_archive_discovery(self):
+        trade_date = date(2026, 8, 14)
+        batch = report_batch(trade_date, b"", archive=False).model_copy(
+            update={"created_at": datetime(2026, 8, 14)}
+        )
+        execution = cron_execution(
+            "1" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(root, batch)
+            archives = load_verified_archives(root)
+            events = discover_missing_archive_events(
+                root,
+                (execution,),
+                archives,
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assertEqual(archives, ())
+        self.assertEqual([event.trade_date for event in events], [trade_date])
+
+    def test_archived_batch_suppresses_missing_archive_for_shanghai_date(self):
+        trade_date = date(2026, 8, 14)
+        report_bytes = b"# Archived\n"
+        execution = cron_execution(
+            "2" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(
+                root, report_batch(trade_date, report_bytes), report_bytes
+            )
+            archives = load_verified_archives(root)
+            events = discover_missing_archive_events(
+                root,
+                (execution,),
+                archives,
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assertEqual(events, ())
+
+    def test_missing_archive_uses_shanghai_date_across_utc_rollover(self):
+        trade_date = date(2026, 8, 14)
+        execution = cron_execution(
+            "3" * 32,
+            "completed",
+            datetime(2026, 8, 13, 16, 30, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(root, report_batch(trade_date, b"", archive=False))
+            events = discover_missing_archive_events(
+                root,
+                (execution,),
+                (),
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assertEqual([event.trade_date for event in events], [trade_date])
+
+    def test_missing_archive_discovery_validates_other_canonical_dates_first(self):
+        marker = "other-date-marker-must-never-escape"
+        trade_date = date(2026, 8, 14)
+        execution = cron_execution(
+            "4" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(root, report_batch(trade_date, b"", archive=False))
+            (root / "hermes" / "report_batches" / "2026-08-15.json").write_text(
+                marker, encoding="ascii"
+            )
+
+            with self.assertRaises(ReportDiscoveryError) as raised:
+                discover_missing_archive_events(
+                    root,
+                    (execution,),
+                    (),
+                    empty_notification_state(),
+                    job_name="daily_archive",
+                    daily_archive_job_id=ARCHIVE_JOB_ID,
+                )
+
+        self.assert_safe_report_error(raised.exception, marker)
 
     def test_missing_archive_discovery_is_exact_date_deduplicated_and_fail_closed(self):
         trade_date = date(2026, 8, 14)
