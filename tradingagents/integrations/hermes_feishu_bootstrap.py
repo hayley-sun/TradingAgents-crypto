@@ -41,11 +41,14 @@ def _emit_failure() -> int:
         raise
     except Exception:
         return 1
+    output = line + "\n"
     try:
-        sys.stdout.write(line + "\n")
+        written = sys.stdout.write(output)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
+        return 1
+    if type(written) is not int or written != len(output):
         return 1
     return 1
 

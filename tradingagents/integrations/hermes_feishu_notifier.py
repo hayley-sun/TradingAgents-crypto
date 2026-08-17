@@ -1437,13 +1437,14 @@ def _serialize_payload(payload: dict[str, object]) -> str:
 
 
 def _write_line(line: str) -> bool:
+    output = line + "\n"
     try:
-        sys.stdout.write(line + "\n")
+        written = sys.stdout.write(output)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         return False
-    return True
+    return type(written) is int and written == len(output)
 
 
 def _emit_failure(mode: str) -> int:

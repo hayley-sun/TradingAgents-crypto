@@ -3301,6 +3301,40 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
         self.assertEqual(writer.calls, 1)
         self.assertTrue(writer.prefix)
 
+    def test_nonfull_stdout_write_returns_failure_without_retry(self):
+        class IntSubclass(int):
+            pass
+
+        responses = {
+            "short": lambda length: length - 1,
+            "none": lambda _length: None,
+            "bool": lambda _length: True,
+            "int_subclass": lambda length: IntSubclass(length),
+        }
+        for response_name, response in responses.items():
+            with self.subTest(response=response_name):
+                class ShortWriter:
+                    def __init__(self):
+                        self.calls = 0
+                        self.prefix = ""
+                        self.requested = ""
+
+                    def write(self, value):
+                        self.calls += 1
+                        self.requested = value
+                        self.prefix = value[:8]
+                        return response(len(value))
+
+                writer = ShortWriter()
+                code = self._run_with_writer(
+                    (0, {"ok": True, "mode": "run"}), writer
+                )
+
+                self.assertEqual(code, 1)
+                self.assertEqual(writer.calls, 1)
+                self.assertTrue(writer.prefix)
+                self.assertNotEqual(writer.prefix, writer.requested)
+
     def test_test_mode_sends_once_only_after_confirmation(self):
         now = datetime(2026, 8, 17, tzinfo=timezone.utc)
         config = notifier_config()
@@ -3483,6 +3517,33 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(writer.calls, 1)
+
+    def test_short_bootstrap_stdout_write_is_not_retried(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        class ShortWriter:
+            def __init__(self):
+                self.calls = 0
+                self.prefix = ""
+
+            def write(self, value):
+                self.calls += 1
+                self.prefix = value[:8]
+                return len(value) - 1
+
+        writer = ShortWriter()
+        with (
+            patch.object(
+                bootstrap, "load_private_config", side_effect=RuntimeError("failure")
+            ),
+            patch("sys.stdout", writer),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            code = bootstrap.main(["run"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(writer.calls, 1)
+        self.assertTrue(writer.prefix)
 
     def test_startup_failures_are_constant_safe_json_and_do_not_import_after_config_failure(self):
         from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
