@@ -544,6 +544,26 @@ class FeishuClientTests(unittest.TestCase):
                 self.assertEqual(transport.calls, [])
                 self.assertNotIn(str(value), str(caught.exception).lower())
 
+    def test_client_maps_deeply_nested_outbound_json_to_safe_error(self):
+        nested = "leaf"
+        for _depth in range(10_000):
+            nested = [nested]
+        transport = FakeTransport(TransportResponse(200, b'{"code":0}', None))
+        client = FeishuClient(config_fixture(), transport=transport)
+
+        try:
+            client.send({"msg_type": "interactive", "nested": nested})
+        except Exception as error:
+            raised = error
+        else:
+            raised = None
+
+        self.assertIsInstance(raised, FeishuDeliveryError)
+        self.assertEqual(raised.result, "http_error")
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(raised.__context__)
+        self.assertNotIn("recursion", str(raised).lower())
+
     def test_client_rejects_nonstandard_json_constants_in_response(self):
         for constant in (b"NaN", b"Infinity", b"-Infinity"):
             response = b'{"code":0,"value":' + constant + b"}"
@@ -560,6 +580,32 @@ class FeishuClientTests(unittest.TestCase):
                 self.assertNotIn(
                     constant.decode("ascii"), str(caught.exception)
                 )
+
+    def test_client_maps_deeply_nested_response_json_to_safe_error(self):
+        depth = 10_000
+        response = (
+            b'{"code":0,"value":'
+            + b"[" * depth
+            + b"0"
+            + b"]" * depth
+            + b"}"
+        )
+        self.assertLess(len(response), 65_536)
+        transport = FakeTransport(TransportResponse(200, response, None))
+        client = FeishuClient(config_fixture(), transport=transport)
+
+        try:
+            client.send({"msg_type": "interactive", "card": {}})
+        except Exception as error:
+            raised = error
+        else:
+            raised = None
+
+        self.assertIsInstance(raised, FeishuDeliveryError)
+        self.assertEqual(raised.result, "invalid_response")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertIsNone(raised.__context__)
+        self.assertNotIn("recursion", str(raised).lower())
 
 
 class RequestsTransportTests(unittest.TestCase):

@@ -376,7 +376,7 @@ def render_test_card(event_id: str, now: datetime) -> dict[str, Any]:
 def _serialize_payload(payload: dict[str, Any]) -> bytes | None:
     try:
         return _strict_json_bytes(payload)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
 
 
@@ -442,7 +442,7 @@ class FeishuClient:
             decoded = json.loads(
                 response.body, parse_constant=_reject_nonstandard_json_constant
             )
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             decoded = None
         if not isinstance(decoded, dict) or "code" not in decoded:
             raise FeishuDeliveryError("invalid_response")
