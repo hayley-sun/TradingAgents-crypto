@@ -7,20 +7,32 @@ import stat
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, TypeGuard
+from typing import Any, Literal, Protocol, TypeGuard
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from tradingagents.integrations.hermes_feishu_client import (
+    EXPECTED_JOB_NAMES,
+    FeishuDeliveryError,
     ReportCardData,
     ReportCardItem,
+    render_failure_card,
+    render_missing_archive_card,
+    render_report_card,
+    render_test_card,
 )
 from tradingagents.integrations.hermes_feishu_state import (
+    DeliveryRecord,
+    NotificationAlreadyRunning,
     NotificationEvent,
     NotificationState,
+    NotificationStateError,
+    initialized_state,
+    prune_delivered,
+    retry_delay,
 )
 from tradingagents.integrations.schemas import DailyReportBatch
 
@@ -556,35 +568,13 @@ def discover_missing_archive_events(
     ):
         raise ReportDiscoveryError()
     inventory = _load_report_inventory(results_root)
-    archived_dates = {archive.trade_date for archive in inventory.archives}
-    events: list[NotificationEvent] = []
-    known_event_ids = set(state.deliveries)
-    seen_execution_ids: set[str] = set()
-    for row in sorted(rows, key=lambda item: item.claimed_at):
-        if row.execution_id in seen_execution_ids:
-            continue
-        seen_execution_ids.add(row.execution_id)
-        trade_date = row.claimed_at.astimezone(SHANGHAI).date()
-        event_id = f"missing_archive:{row.job_id}:{row.execution_id}"
-        if (
-            trade_date not in inventory.unarchived_dates
-            or trade_date in archived_dates
-            or event_id in known_event_ids
-        ):
-            continue
-        events.append(
-            NotificationEvent(
-                event_id=event_id,
-                kind="missing_archive",
-                created_at=row.claimed_at,
-                trade_date=trade_date,
-                batch_state="unarchived",
-                job_name=job_name,
-                job_id=row.job_id,
-                execution_id=row.execution_id,
-            )
-        )
-    return tuple(events)
+    return _discover_missing_archive_events_from_inventory(
+        inventory,
+        rows,
+        state,
+        job_name=job_name,
+        daily_archive_job_id=daily_archive_job_id,
+    )
 
 
 def discover_execution_events(
@@ -669,3 +659,566 @@ def discover_execution_events(
         tuple(failure_events),
         tuple(completed_archive_rows),
     )
+
+
+SAFE_DELIVERY_RESULTS = frozenset(
+    {
+        "timeout",
+        "connection_error",
+        "response_too_large",
+        "http_error",
+        "redirect_rejected",
+        "rate_limited",
+        "invalid_response",
+        "feishu_error",
+    }
+)
+
+
+class _CardClient(Protocol):
+    def send(self, payload: dict[str, Any]) -> None: ...
+
+
+def _require_aware_now(now: object) -> datetime:
+    if not _is_aware(now):
+        raise ValueError("notification time unavailable")
+    return now
+
+
+def _configured_jobs(config: object) -> tuple[tuple[str, str], ...]:
+    try:
+        jobs = config.jobs
+        items = tuple(sorted(jobs.items()))
+        invalid = (
+            {name for name, _job_id in items} != EXPECTED_JOB_NAMES
+            or len(items) != len(EXPECTED_JOB_NAMES)
+            or len({job_id for _name, job_id in items}) != len(items)
+            or any(
+                not isinstance(name, str) or not _is_job_id(job_id)
+                for name, job_id in items
+            )
+        )
+    except Exception:
+        raise ExecutionDiscoveryError() from None
+    if invalid:
+        raise ExecutionDiscoveryError()
+    return items
+
+
+def _normalize_report_inventory(value: object) -> _ReportInventory:
+    try:
+        if isinstance(value, _ReportInventory):
+            archives = value.archives
+            unarchived_dates = value.unarchived_dates
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            archives = tuple(value)
+            unarchived_dates = frozenset()
+        else:
+            raise TypeError("invalid inventory")
+        if any(not isinstance(item, VerifiedArchive) for item in archives):
+            raise TypeError("invalid archive")
+        if any(type(item) is not date for item in unarchived_dates):
+            raise TypeError("invalid unarchived date")
+        if any(
+            type(archive.trade_date) is not date
+            or re.fullmatch(r"[0-9a-f]{64}", archive.report_sha256) is None
+            or not _is_aware(archive.archived_at)
+            for archive in archives
+        ):
+            raise ValueError("invalid archive")
+        snapshots = _snapshot_archives(archives)
+        if (
+            len({archive.trade_date for archive in snapshots}) != len(snapshots)
+            or len({archive.event_id for archive in snapshots}) != len(snapshots)
+        ):
+            raise ValueError("duplicate archive")
+        return _ReportInventory(snapshots, frozenset(unarchived_dates))
+    except Exception:
+        raise ReportDiscoveryError() from None
+
+
+def _load_inventory(
+    archive_loader: Callable[[], object],
+) -> _ReportInventory:
+    try:
+        value = archive_loader()
+    except Exception:
+        raise ReportDiscoveryError() from None
+    return _normalize_report_inventory(value)
+
+
+def _load_execution_histories(
+    config: object,
+    execution_loader: Callable[[str], Sequence[CronExecution]],
+) -> tuple[tuple[str, str, tuple[CronExecution, ...]], ...]:
+    histories: list[tuple[str, str, tuple[CronExecution, ...]]] = []
+    for job_name, job_id in _configured_jobs(config):
+        try:
+            rows = tuple(execution_loader(job_id))
+        except Exception:
+            raise ExecutionDiscoveryError() from None
+        if (
+            len(rows) > MAX_EXECUTION_ROWS
+            or any(not _valid_execution(row, job_id) for row in rows)
+            or len({row.execution_id for row in rows}) != len(rows)
+        ):
+            raise ExecutionDiscoveryError()
+        histories.append((job_name, job_id, _normalize_rows(rows)))
+    return tuple(histories)
+
+
+def _baseline_state(
+    histories: Sequence[tuple[str, str, tuple[CronExecution, ...]]],
+    inventory: _ReportInventory,
+    now: datetime,
+) -> NotificationState:
+    execution_ids: dict[str, list[str]] = {}
+    cursors: dict[str, str | None] = {}
+    for _job_name, job_id, rows in histories:
+        ids = [row.execution_id for row in rows]
+        execution_ids[job_id] = ids
+        prefix_length = 0
+        while (
+            prefix_length < len(rows)
+            and rows[prefix_length].status in NONTERMINAL_EXECUTION_STATUSES
+        ):
+            prefix_length += 1
+        if any(
+            row.status in NONTERMINAL_EXECUTION_STATUSES
+            for row in rows[prefix_length:]
+        ):
+            raise ExecutionDiscoveryError()
+        cursors[job_id] = (
+            rows[prefix_length].execution_id
+            if prefix_length < len(rows)
+            else None
+        )
+    state = initialized_state(
+        now,
+        execution_ids,
+        [archive.event_id for archive in inventory.archives],
+    )
+    return state.model_copy(update={"execution_cursors": cursors})
+
+
+def _initialize_payload(
+    state: NotificationState, *, already_initialized: bool
+) -> dict[str, object]:
+    return {
+        "ok": True,
+        "mode": "initialize",
+        "already_initialized": already_initialized,
+        "execution_count": sum(
+            len(execution_ids)
+            for execution_ids in state.seen_execution_ids.values()
+        ),
+        "report_count": len(state.seen_report_event_ids),
+    }
+
+
+def initialize_notifier(
+    store: object,
+    config: object,
+    execution_loader: Callable[[str], Sequence[CronExecution]],
+    archive_loader: Callable[[], object],
+    now: datetime,
+) -> tuple[NotificationState, dict[str, object]]:
+    """Persist a no-send baseline from one coherent source snapshot."""
+
+    checked_now = _require_aware_now(now)
+    with store.lock():
+        existing = store.load_optional()
+        if existing is not None:
+            return existing, _initialize_payload(
+                existing, already_initialized=True
+            )
+        histories = _load_execution_histories(config, execution_loader)
+        inventory = _load_inventory(archive_loader)
+        state = _baseline_state(histories, inventory, checked_now)
+        store.save(state)
+        return state, _initialize_payload(state, already_initialized=False)
+
+
+def _discover_missing_archive_events_from_inventory(
+    inventory: _ReportInventory,
+    completed_archive_rows: Sequence[CronExecution],
+    state: NotificationState,
+    *,
+    job_name: str,
+    daily_archive_job_id: str,
+) -> tuple[NotificationEvent, ...]:
+    if not isinstance(job_name, str) or not job_name or not _is_job_id(
+        daily_archive_job_id
+    ):
+        raise ReportDiscoveryError()
+    rows = tuple(completed_archive_rows)
+    if any(
+        not _valid_execution(row, daily_archive_job_id)
+        or row.status != "completed"
+        for row in rows
+    ):
+        raise ReportDiscoveryError()
+    archived_dates = {archive.trade_date for archive in inventory.archives}
+    events: list[NotificationEvent] = []
+    known_event_ids = set(state.deliveries)
+    seen_execution_ids: set[str] = set()
+    for row in sorted(rows, key=lambda item: item.claimed_at):
+        if row.execution_id in seen_execution_ids:
+            continue
+        seen_execution_ids.add(row.execution_id)
+        trade_date = row.claimed_at.astimezone(SHANGHAI).date()
+        event_id = f"missing_archive:{row.job_id}:{row.execution_id}"
+        if (
+            trade_date not in inventory.unarchived_dates
+            or trade_date in archived_dates
+            or event_id in known_event_ids
+        ):
+            continue
+        events.append(
+            NotificationEvent(
+                event_id=event_id,
+                kind="missing_archive",
+                created_at=row.claimed_at,
+                trade_date=trade_date,
+                batch_state="unarchived",
+                job_name=job_name,
+                job_id=row.job_id,
+                execution_id=row.execution_id,
+            )
+        )
+    return tuple(events)
+
+
+def discover_all_events(
+    state: NotificationState,
+    config: object,
+    execution_loader: Callable[[str], Sequence[CronExecution]],
+    archive_loader: Callable[[], object],
+) -> tuple[NotificationState, tuple[NotificationEvent, ...], _ReportInventory]:
+    """Discover every source in memory before returning updated cursors."""
+
+    histories = _load_execution_histories(config, execution_loader)
+    inventory = _load_inventory(archive_loader)
+    working = state
+    events: list[NotificationEvent] = []
+    completed_archive_rows: list[CronExecution] = []
+    archive_job_id = dict(_configured_jobs(config))["daily_archive"]
+    for job_name, job_id, rows in histories:
+        working, failures, completed = discover_execution_events(
+            working,
+            job_name,
+            job_id,
+            rows,
+            daily_archive_job_id=archive_job_id,
+        )
+        events.extend(failures)
+        completed_archive_rows.extend(completed)
+    events.extend(discover_report_events(working, inventory.archives))
+    events.extend(
+        _discover_missing_archive_events_from_inventory(
+            inventory,
+            completed_archive_rows,
+            working,
+            job_name="daily_archive",
+            daily_archive_job_id=archive_job_id,
+        )
+    )
+    unique_events = {event.event_id: event for event in events}
+    return (
+        working,
+        tuple(unique_events[event_id] for event_id in sorted(unique_events)),
+        inventory,
+    )
+
+
+def add_pending_events(
+    state: NotificationState,
+    events: Sequence[NotificationEvent],
+    now: datetime,
+) -> NotificationState:
+    checked_now = _require_aware_now(now)
+    deliveries = dict(state.deliveries)
+    seen_report_event_ids = set(state.seen_report_event_ids)
+    for event in sorted(events, key=lambda item: item.event_id):
+        if event.event_id not in deliveries:
+            deliveries[event.event_id] = DeliveryRecord(
+                event=event, next_attempt_at=checked_now
+            )
+        if event.kind == "report":
+            seen_report_event_ids.add(event.event_id)
+    return state.model_copy(
+        update={
+            "deliveries": deliveries,
+            "seen_report_event_ids": sorted(seen_report_event_ids),
+        }
+    )
+
+
+def due_event_ids(state: NotificationState, now: datetime) -> tuple[str, ...]:
+    checked_now = _require_aware_now(now)
+    return tuple(
+        event_id
+        for event_id, record in sorted(state.deliveries.items())
+        if record.delivered_at is None
+        and record.next_attempt_at <= checked_now
+    )
+
+
+def begin_attempt(
+    state: NotificationState, event_id: str, now: datetime
+) -> NotificationState:
+    checked_now = _require_aware_now(now)
+    record = state.deliveries[event_id]
+    attempt_count = record.attempt_count + 1
+    deliveries = dict(state.deliveries)
+    deliveries[event_id] = record.model_copy(
+        update={
+            "attempt_count": attempt_count,
+            "next_attempt_at": checked_now + retry_delay(attempt_count),
+        }
+    )
+    return state.model_copy(update={"deliveries": deliveries})
+
+
+def record_delivery_success(
+    state: NotificationState, event_id: str, now: datetime
+) -> NotificationState:
+    checked_now = _require_aware_now(now)
+    deliveries = dict(state.deliveries)
+    deliveries[event_id] = deliveries[event_id].model_copy(
+        update={"delivered_at": checked_now, "last_result": "delivered"}
+    )
+    return state.model_copy(update={"deliveries": deliveries})
+
+
+def _record_failure_result(
+    state: NotificationState,
+    event_id: str,
+    now: datetime,
+    result: str,
+    retry_after_seconds: object = None,
+) -> NotificationState:
+    checked_now = _require_aware_now(now)
+    deliveries = dict(state.deliveries)
+    record = deliveries[event_id]
+    next_attempt_at = record.next_attempt_at
+    if (
+        type(retry_after_seconds) is int
+        and 0 <= retry_after_seconds <= 86_400
+    ):
+        extension = checked_now + timedelta(seconds=retry_after_seconds)
+        cap = checked_now + timedelta(hours=24)
+        next_attempt_at = min(max(next_attempt_at, extension), cap)
+    deliveries[event_id] = record.model_copy(
+        update={
+            "last_result": result,
+            "next_attempt_at": next_attempt_at,
+        }
+    )
+    return state.model_copy(update={"deliveries": deliveries})
+
+
+def record_delivery_failure(
+    state: NotificationState,
+    event_id: str,
+    now: datetime,
+    error: FeishuDeliveryError,
+) -> NotificationState:
+    result = (
+        error.result
+        if isinstance(error.result, str)
+        and error.result in SAFE_DELIVERY_RESULTS
+        else "delivery_error"
+    )
+    return _record_failure_result(
+        state,
+        event_id,
+        now,
+        result,
+        error.retry_after_seconds,
+    )
+
+
+def render_persisted_event(
+    event: NotificationEvent,
+    archives: _ReportInventory | Sequence[VerifiedArchive],
+) -> dict[str, Any]:
+    if event.kind == "execution_failure":
+        return render_failure_card(event)
+    if event.kind == "missing_archive":
+        return render_missing_archive_card(event)
+    inventory = _normalize_report_inventory(archives)
+    matching = [
+        archive
+        for archive in inventory.archives
+        if archive.event_id == event.event_id
+        and archive.trade_date == event.trade_date
+        and archive.report_sha256 == event.report_sha256
+    ]
+    if len(matching) != 1:
+        raise ReportDiscoveryError()
+    current = matching[0]
+    previous = current.previous
+    return render_report_card(
+        current.to_card_data(event.event_id),
+        previous.to_card_data(previous.event_id) if previous else None,
+    )
+
+
+def _run_payload(
+    *,
+    ok: bool,
+    discovered: int,
+    delivered: int,
+    pending: int,
+    result: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ok": ok,
+        "mode": "run",
+        "discovered": discovered,
+        "delivered": delivered,
+        "pending": pending,
+    }
+    if result is not None:
+        payload["result"] = result
+    return payload
+
+
+def _pending_count(state: NotificationState) -> int:
+    return sum(
+        record.delivered_at is None for record in state.deliveries.values()
+    )
+
+
+def run_notifier_once(
+    store: object,
+    config: object,
+    client: _CardClient,
+    execution_loader: Callable[[str], Sequence[CronExecution]],
+    archive_loader: Callable[[], object],
+    now: datetime,
+) -> tuple[int, dict[str, object]]:
+    """Discover and attempt due notifications under one nonblocking lock."""
+
+    try:
+        checked_now = _require_aware_now(now)
+    except ValueError:
+        return 1, _run_payload(
+            ok=False,
+            discovered=0,
+            delivered=0,
+            pending=0,
+            result="invalid_time",
+        )
+
+    discovered_count = 0
+    delivered_count = 0
+    last_state: NotificationState | None = None
+    try:
+        with store.lock():
+            state = store.load_optional()
+            if state is None:
+                return 1, _run_payload(
+                    ok=False,
+                    discovered=0,
+                    delivered=0,
+                    pending=0,
+                    result="uninitialized",
+                )
+            last_state = state
+            try:
+                discovered_state, events, inventory = discover_all_events(
+                    state,
+                    config,
+                    execution_loader,
+                    archive_loader,
+                )
+            except (ExecutionDiscoveryError, ReportDiscoveryError):
+                return 1, _run_payload(
+                    ok=False,
+                    discovered=0,
+                    delivered=0,
+                    pending=_pending_count(state),
+                    result="discovery_error",
+                )
+            discovered_count = len(events)
+            state = add_pending_events(discovered_state, events, checked_now)
+            store.save(state)
+            last_state = state
+
+            delivery_failed = False
+            for event_id in due_event_ids(state, checked_now):
+                state = begin_attempt(state, event_id, checked_now)
+                store.save(state)
+                last_state = state
+                record = state.deliveries[event_id]
+                try:
+                    card = render_persisted_event(record.event, inventory)
+                except ReportDiscoveryError:
+                    state = _record_failure_result(
+                        state,
+                        event_id,
+                        checked_now,
+                        "report_unavailable",
+                    )
+                    store.save(state)
+                    last_state = state
+                    delivery_failed = True
+                    continue
+                try:
+                    client.send(card)
+                except FeishuDeliveryError as error:
+                    state = record_delivery_failure(
+                        state, event_id, checked_now, error
+                    )
+                    store.save(state)
+                    last_state = state
+                    delivery_failed = True
+                    continue
+                state = record_delivery_success(state, event_id, checked_now)
+                store.save(state)
+                last_state = state
+                delivered_count += 1
+
+            state = prune_delivered(state, checked_now)
+            store.save(state)
+            last_state = state
+            code = 1 if delivery_failed else 0
+            return code, _run_payload(
+                ok=not delivery_failed,
+                discovered=discovered_count,
+                delivered=delivered_count,
+                pending=_pending_count(state),
+            )
+    except NotificationAlreadyRunning:
+        return 0, _run_payload(
+            ok=True,
+            discovered=0,
+            delivered=0,
+            pending=0,
+            result="already_running",
+        )
+    except NotificationStateError:
+        return 1, _run_payload(
+            ok=False,
+            discovered=discovered_count,
+            delivered=delivered_count,
+            pending=_pending_count(last_state) if last_state else 0,
+            result="state_error",
+        )
+
+
+def send_test_card(
+    config: object, client: _CardClient, now: datetime
+) -> dict[str, object]:
+    """Send one isolated configuration acceptance card."""
+
+    del config
+    checked_now = _require_aware_now(now)
+    utc_now = checked_now.astimezone(timezone.utc)
+    event_id = f"test:{utc_now.isoformat()}"
+    client.send(render_test_card(event_id, checked_now))
+    return {"ok": True, "mode": "test", "event_id": event_id}

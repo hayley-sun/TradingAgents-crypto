@@ -11,7 +11,11 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import tradingagents.integrations.hermes_feishu_notifier as notifier
-from tradingagents.integrations.hermes_feishu_client import ReportCardData
+from tradingagents.integrations.hermes_feishu_client import (
+    FeishuDeliveryError,
+    FeishuNotifierConfig,
+    ReportCardData,
+)
 from tradingagents.integrations.hermes_feishu_notifier import (
     CronExecution,
     ExecutionDiscoveryError,
@@ -25,6 +29,9 @@ from tradingagents.integrations.hermes_feishu_notifier import (
 )
 from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
+    NotificationEvent,
+    NotificationStateError,
+    NotificationStateStore,
     initialized_state,
 )
 from tradingagents.integrations.schemas import (
@@ -160,6 +167,32 @@ def run_header(index, *, claimed_at=None):
         f"{index:032x}  completed  job={JOB_ID}  source=schedule  "
         f"{occurred_at.isoformat()}"
     )
+
+
+def notifier_config():
+    return FeishuNotifierConfig(
+        version=1,
+        webhook_url=(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/"
+            "0123456789abcdef"
+        ),
+        signing_secret="test-secret",
+        jobs=NOTIFIER_JOBS,
+    )
+
+
+def execution_histories(now, *, status="completed"):
+    return {
+        job_id: (
+            cron_execution(
+                f"{index:032x}",
+                status,
+                now - timedelta(minutes=index),
+                job_id=job_id,
+            ),
+        )
+        for index, job_id in enumerate(NOTIFIER_JOBS.values(), start=1)
+    }
 
 
 class HermesFeishuNotifierTests(unittest.TestCase):
@@ -1498,6 +1531,779 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         rendered = repr(error)
         for marker in forbidden_markers:
             self.assertNotIn(marker, rendered)
+
+
+class HermesFeishuOrchestrationTests(unittest.TestCase):
+    NOW = datetime(2026, 8, 17, 4, 0, tzinfo=timezone.utc)
+
+    def failure_event(self, *, execution_id="f" * 32):
+        job_id = NOTIFIER_JOBS["review_memory"]
+        return NotificationEvent(
+            event_id=f"failure:{job_id}:{execution_id}",
+            kind="execution_failure",
+            created_at=self.NOW,
+            job_name="review_memory",
+            job_id=job_id,
+            execution_id=execution_id,
+        )
+
+    def test_initialize_persists_baseline_without_network(self):
+        histories = execution_histories(self.NOW)
+        archive_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_bytes = b"# Baseline\n"
+            persist_report_batch(
+                root,
+                report_batch(date(2026, 8, 16), report_bytes),
+                report_bytes,
+            )
+            inventory = notifier._load_report_inventory(root)
+            store = NotificationStateStore(root / "notifier-state")
+
+            state, payload = notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: archive_calls.append(True) or inventory,
+                self.NOW,
+            )
+
+            persisted = store.load()
+        self.assertEqual(state, persisted)
+        self.assertEqual(state.deliveries, {})
+        self.assertEqual(
+            state.seen_report_event_ids, [inventory.archives[0].event_id]
+        )
+        self.assertEqual(set(state.seen_execution_ids), set(NOTIFIER_JOBS.values()))
+        self.assertEqual(payload, {
+            "ok": True,
+            "mode": "initialize",
+            "already_initialized": False,
+            "execution_count": 4,
+            "report_count": 1,
+        })
+        self.assertEqual(len(archive_calls), 1)
+
+    def test_repeated_initialize_is_byte_stable_and_does_not_reload_sources(self):
+        histories = execution_histories(self.NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            before = store.path.read_bytes()
+
+            state, payload = notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda _job_id: self.fail("execution source was reloaded"),
+                lambda: self.fail("archive source was reloaded"),
+                self.NOW + timedelta(minutes=1),
+            )
+
+            after = store.path.read_bytes()
+        self.assertEqual(before, after)
+        self.assertEqual(state.deliveries, {})
+        self.assertEqual(payload["already_initialized"], True)
+        self.assertEqual(payload["execution_count"], 4)
+        self.assertEqual(payload["report_count"], 0)
+
+    def test_initialize_source_failure_creates_no_state(self):
+        marker = "source-secret-must-never-escape"
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+
+            with self.assertRaises(ExecutionDiscoveryError) as raised:
+                notifier.initialize_notifier(
+                    store,
+                    notifier_config(),
+                    lambda _job_id: (_ for _ in ()).throw(RuntimeError(marker)),
+                    lambda: (),
+                    self.NOW,
+                )
+
+            self.assertFalse(store.path.exists())
+        self.assertNotIn(marker, repr(raised.exception))
+
+    def test_initialize_keeps_leading_running_row_observable(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        running_id = "a" * 32
+        baseline_id = "b" * 32
+        histories[job_id] = (
+            cron_execution(
+                running_id,
+                "running",
+                self.NOW,
+                job_id=job_id,
+            ),
+            cron_execution(
+                baseline_id,
+                "completed",
+                self.NOW - timedelta(minutes=1),
+                job_id=job_id,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            state, _payload = notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+            self.assertEqual(state.execution_cursors[job_id], baseline_id)
+            current = dict(histories)
+            current[job_id] = (
+                dataclasses.replace(histories[job_id][0], status="failed"),
+                histories[job_id][1],
+            )
+
+            class RecordingClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def send(inner_self, _payload):
+                    inner_self.calls += 1
+
+            client = RecordingClient()
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: current[source_job_id],
+                lambda: (),
+                self.NOW + timedelta(minutes=1),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["discovered"], 1)
+        self.assertEqual(client.calls, 1)
+
+    def test_initialize_rejects_interleaved_nonterminal_baseline(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        histories[job_id] = (
+            cron_execution(
+                "c" * 32,
+                "completed",
+                self.NOW,
+                job_id=job_id,
+            ),
+            cron_execution(
+                "d" * 32,
+                "running",
+                self.NOW - timedelta(minutes=1),
+                job_id=job_id,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            with self.assertRaises(ExecutionDiscoveryError):
+                notifier.initialize_notifier(
+                    store,
+                    notifier_config(),
+                    lambda source_job_id: histories[source_job_id],
+                    lambda: (),
+                    self.NOW,
+                )
+            self.assertFalse(store.path.exists())
+
+    def test_run_source_failure_preserves_state_bytes_and_skips_network(self):
+        histories = execution_histories(self.NOW)
+        marker = "loader-secret-must-never-escape"
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            before = store.path.read_bytes()
+            calls = []
+
+            class NoSendClient:
+                def send(self, _payload):
+                    calls.append(True)
+
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                NoSendClient(),
+                lambda _job_id: (_ for _ in ()).throw(RuntimeError(marker)),
+                lambda: self.fail("report source must not run after failure"),
+                self.NOW + timedelta(minutes=1),
+            )
+            after = store.path.read_bytes()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["result"], "discovery_error")
+        self.assertNotIn(marker, repr(payload))
+        self.assertEqual(before, after)
+        self.assertEqual(calls, [])
+
+    def test_run_uses_exactly_one_report_inventory(self):
+        histories = execution_histories(self.NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            archive_calls = []
+            code, _payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                type("NoSendClient", (), {"send": lambda *_args: None})(),
+                lambda job_id: histories[job_id],
+                lambda: archive_calls.append(True) or (),
+                self.NOW + timedelta(minutes=1),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(archive_calls, [True])
+
+    def test_uninitialized_and_locked_runs_are_safe_noops(self):
+        source_calls = []
+
+        class NoSendClient:
+            def send(self, _payload):
+                source_calls.append("send")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                NoSendClient(),
+                lambda _job_id: source_calls.append("execution"),
+                lambda: source_calls.append("archive"),
+                self.NOW,
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["result"], "uninitialized")
+            self.assertEqual(source_calls, [])
+
+            histories = execution_histories(self.NOW)
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            with store.lock():
+                code, payload = notifier.run_notifier_once(
+                    store,
+                    notifier_config(),
+                    NoSendClient(),
+                    lambda _job_id: source_calls.append("execution"),
+                    lambda: source_calls.append("archive"),
+                    self.NOW,
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"], "already_running")
+        self.assertEqual(source_calls, [])
+
+    def test_retry_attempts_one_through_six_use_bounded_schedule(self):
+        state = notifier.add_pending_events(
+            empty_notification_state(), (self.failure_event(),), self.NOW
+        )
+        expected_minutes = [5, 10, 20, 40, 60, 60]
+        actual_minutes = []
+        for expected in expected_minutes:
+            state = notifier.begin_attempt(state, self.failure_event().event_id, self.NOW)
+            record = state.deliveries[self.failure_event().event_id]
+            actual_minutes.append(
+                int((record.next_attempt_at - self.NOW).total_seconds() / 60)
+            )
+            self.assertEqual(record.attempt_count, len(actual_minutes))
+            self.assertEqual(actual_minutes[-1], expected)
+
+        self.assertEqual(actual_minutes, expected_minutes)
+
+    def test_retry_after_extends_never_shortens_and_is_capped(self):
+        event = self.failure_event()
+        pending = notifier.add_pending_events(
+            empty_notification_state(), (event,), self.NOW
+        )
+        attempted = notifier.begin_attempt(pending, event.event_id, self.NOW)
+        short = notifier.record_delivery_failure(
+            attempted,
+            event.event_id,
+            self.NOW,
+            FeishuDeliveryError("rate_limited", 10),
+        )
+        extended = notifier.record_delivery_failure(
+            attempted,
+            event.event_id,
+            self.NOW,
+            FeishuDeliveryError("rate_limited", 3600),
+        )
+        capped = notifier.record_delivery_failure(
+            attempted,
+            event.event_id,
+            self.NOW,
+            FeishuDeliveryError("rate_limited", 86400),
+        )
+        invalid = notifier.record_delivery_failure(
+            attempted,
+            event.event_id,
+            self.NOW,
+            FeishuDeliveryError("rate_limited", True),
+        )
+
+        baseline = self.NOW + timedelta(minutes=5)
+        self.assertEqual(short.deliveries[event.event_id].next_attempt_at, baseline)
+        self.assertEqual(
+            extended.deliveries[event.event_id].next_attempt_at,
+            self.NOW + timedelta(hours=1),
+        )
+        self.assertEqual(
+            capped.deliveries[event.event_id].next_attempt_at,
+            self.NOW + timedelta(hours=24),
+        )
+        self.assertEqual(invalid.deliveries[event.event_id].next_attempt_at, baseline)
+
+    def test_not_yet_due_and_delivered_records_are_skipped(self):
+        event = self.failure_event()
+        state = notifier.add_pending_events(
+            empty_notification_state(), (event,), self.NOW
+        )
+        state = notifier.begin_attempt(state, event.event_id, self.NOW)
+        self.assertEqual(
+            notifier.due_event_ids(state, self.NOW + timedelta(minutes=4)), ()
+        )
+        self.assertEqual(
+            notifier.due_event_ids(state, self.NOW + timedelta(minutes=5)),
+            (event.event_id,),
+        )
+        delivered = notifier.record_delivery_success(
+            state, event.event_id, self.NOW
+        )
+        self.assertEqual(
+            notifier.due_event_ids(delivered, self.NOW + timedelta(days=1)), ()
+        )
+
+    def test_save_failure_before_send_makes_zero_network_calls(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        with tempfile.TemporaryDirectory() as directory:
+            real_store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                real_store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+            current = dict(histories)
+            current[job_id] = (
+                cron_execution(
+                    "e" * 32,
+                    "failed",
+                    self.NOW + timedelta(minutes=1),
+                    job_id=job_id,
+                ),
+                *histories[job_id],
+            )
+            before = real_store.path.read_bytes()
+
+            class FailingStore:
+                def lock(inner_self):
+                    return real_store.lock()
+
+                def load_optional(inner_self):
+                    return real_store.load_optional()
+
+                def save(inner_self, _state):
+                    raise NotificationStateError("safe")
+
+            calls = []
+            code, payload = notifier.run_notifier_once(
+                FailingStore(),
+                notifier_config(),
+                type(
+                    "RecordingClient",
+                    (),
+                    {"send": lambda _self, card: calls.append(card)},
+                )(),
+                lambda source_job_id: current[source_job_id],
+                lambda: (),
+                self.NOW + timedelta(minutes=2),
+            )
+            after = real_store.path.read_bytes()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["result"], "state_error")
+        self.assertEqual(calls, [])
+        self.assertEqual(before, after)
+
+    def test_unexpected_client_crash_retries_same_event_id(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        failure_id = "9" * 32
+        current = dict(histories)
+        current[job_id] = (
+            cron_execution(
+                failure_id,
+                "failed",
+                self.NOW + timedelta(minutes=1),
+                job_id=job_id,
+            ),
+            *histories[job_id],
+        )
+        event_id = f"failure:{job_id}:{failure_id}"
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+
+            class CrashingClient:
+                def send(self, _payload):
+                    raise KeyboardInterrupt()
+
+            attempt_at = self.NOW + timedelta(minutes=2)
+            with self.assertRaises(KeyboardInterrupt):
+                notifier.run_notifier_once(
+                    store,
+                    notifier_config(),
+                    CrashingClient(),
+                    lambda source_job_id: current[source_job_id],
+                    lambda: (),
+                    attempt_at,
+                )
+            crashed = store.load()
+            self.assertEqual(crashed.deliveries[event_id].attempt_count, 1)
+            self.assertIsNone(crashed.deliveries[event_id].delivered_at)
+
+            calls = []
+            retry_at = attempt_at + timedelta(minutes=5)
+            code, _payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                type(
+                    "RecordingClient",
+                    (),
+                    {"send": lambda _self, card: calls.append(card)},
+                )(),
+                lambda source_job_id: current[source_job_id],
+                lambda: (),
+                retry_at,
+            )
+            retried = store.load()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls and len(calls), 1)
+        self.assertEqual(list(retried.deliveries), [event_id])
+        self.assertEqual(retried.deliveries[event_id].attempt_count, 2)
+        self.assertEqual(retried.deliveries[event_id].delivered_at, retry_at)
+
+    def test_report_render_uses_nearest_previous_and_missing_exact_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for trade_date, content in (
+                (date(2026, 8, 14), b"# Prior\n"),
+                (date(2026, 8, 16), b"# Current\n"),
+            ):
+                persist_report_batch(
+                    root, report_batch(trade_date, content), content
+                )
+            inventory = notifier._load_report_inventory(root)
+            event = discover_report_events(
+                empty_notification_state(), inventory.archives
+            )[-1]
+
+            card = notifier.render_persisted_event(event, inventory)
+
+        self.assertIn("2026-08-14", repr(card))
+        self.assertIn("2026-08-16", repr(card))
+        with self.assertRaises(ReportDiscoveryError):
+            notifier.render_persisted_event(event, ())
+
+    def test_report_id_is_durable_before_send_and_delivered_report_does_not_resend(self):
+        histories = execution_histories(self.NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = NotificationStateStore(root / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            report_bytes = b"# Newly archived\n"
+            persist_report_batch(
+                root,
+                report_batch(date(2026, 8, 17), report_bytes),
+                report_bytes,
+            )
+            inventory = notifier._load_report_inventory(root)
+            event_id = inventory.archives[0].event_id
+
+            class InspectingClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def send(inner_self, _payload):
+                    durable = store.load()
+                    self.assertIn(event_id, durable.seen_report_event_ids)
+                    self.assertIn(event_id, durable.deliveries)
+                    self.assertEqual(
+                        durable.deliveries[event_id].attempt_count, 1
+                    )
+                    inner_self.calls += 1
+
+            client = InspectingClient()
+            code, _payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda job_id: histories[job_id],
+                lambda: inventory,
+                self.NOW + timedelta(minutes=1),
+            )
+            rerun_code, rerun_payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda job_id: histories[job_id],
+                lambda: inventory,
+                self.NOW + timedelta(minutes=2),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(rerun_code, 0)
+        self.assertEqual(rerun_payload["discovered"], 0)
+        self.assertEqual(rerun_payload["delivered"], 0)
+        self.assertEqual(client.calls, 1)
+
+    def test_disappeared_pending_report_fails_without_sending_fabricated_card(self):
+        histories = execution_histories(self.NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = NotificationStateStore(root / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            report_bytes = b"# Ephemeral\n"
+            persist_report_batch(
+                root,
+                report_batch(date(2026, 8, 17), report_bytes),
+                report_bytes,
+            )
+            inventory = notifier._load_report_inventory(root)
+            event_id = inventory.archives[0].event_id
+
+            class CrashingClient:
+                def send(self, _payload):
+                    raise KeyboardInterrupt()
+
+            first_attempt = self.NOW + timedelta(minutes=1)
+            with self.assertRaises(KeyboardInterrupt):
+                notifier.run_notifier_once(
+                    store,
+                    notifier_config(),
+                    CrashingClient(),
+                    lambda job_id: histories[job_id],
+                    lambda: inventory,
+                    first_attempt,
+                )
+            sends = []
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                type(
+                    "RecordingClient",
+                    (),
+                    {"send": lambda _self, card: sends.append(card)},
+                )(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                first_attempt + timedelta(minutes=5),
+            )
+            state = store.load()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["pending"], 1)
+        self.assertEqual(sends, [])
+        self.assertEqual(state.deliveries[event_id].attempt_count, 2)
+        self.assertEqual(
+            state.deliveries[event_id].last_result, "report_unavailable"
+        )
+
+    def test_run_persists_attempt_before_send_and_marks_success(self):
+        histories = execution_histories(self.NOW)
+        failing_job_id = NOTIFIER_JOBS["review_memory"]
+        failure_id = "f" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            current = dict(histories)
+            current[failing_job_id] = (
+                cron_execution(
+                    failure_id,
+                    "failed",
+                    self.NOW + timedelta(minutes=1),
+                    job_id=failing_job_id,
+                ),
+                *histories[failing_job_id],
+            )
+
+            class InspectingClient:
+                calls = []
+
+                def send(inner_self, payload):
+                    event_id = f"failure:{failing_job_id}:{failure_id}"
+                    durable = store.load().deliveries[event_id]
+                    self.assertIsNone(durable.delivered_at)
+                    self.assertEqual(durable.attempt_count, 1)
+                    inner_self.calls.append(payload)
+
+            client = InspectingClient()
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda job_id: current[job_id],
+                lambda: (),
+                self.NOW + timedelta(minutes=2),
+            )
+
+            delivery = store.load().deliveries[
+                f"failure:{failing_job_id}:{failure_id}"
+            ]
+        self.assertEqual(code, 0)
+        self.assertEqual(payload, {
+            "ok": True,
+            "mode": "run",
+            "discovered": 1,
+            "delivered": 1,
+            "pending": 0,
+        })
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(delivery.attempt_count, 1)
+        self.assertEqual(delivery.delivered_at, self.NOW + timedelta(minutes=2))
+        self.assertEqual(delivery.last_result, "delivered")
+
+    def test_delivery_failure_is_safe_pending_and_does_not_block_next_event(self):
+        histories = execution_histories(self.NOW)
+        failed_jobs = list(NOTIFIER_JOBS.values())[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda job_id: histories[job_id],
+                lambda: (),
+                self.NOW,
+            )
+            current = dict(histories)
+            for index, job_id in enumerate(failed_jobs, start=10):
+                current[job_id] = (
+                    cron_execution(
+                        f"{index:032x}",
+                        "failed",
+                        self.NOW + timedelta(minutes=index),
+                        job_id=job_id,
+                    ),
+                    *histories[job_id],
+                )
+
+            class SelectiveClient:
+                def __init__(inner_self):
+                    inner_self.calls = 0
+
+                def send(inner_self, _payload):
+                    inner_self.calls += 1
+                    if inner_self.calls == 1:
+                        raise FeishuDeliveryError(
+                            "secret-result-must-never-escape"
+                        )
+
+            client = SelectiveClient()
+            attempt_at = self.NOW + timedelta(minutes=20)
+            code, payload = notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda job_id: current[job_id],
+                lambda: (),
+                attempt_at,
+            )
+            state = store.load()
+
+        pending = [
+            record for record in state.deliveries.values()
+            if record.delivered_at is None
+        ]
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["discovered"], 2)
+        self.assertEqual(payload["delivered"], 1)
+        self.assertEqual(payload["pending"], 1)
+        self.assertNotIn("secret-result-must-never-escape", repr(payload))
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(pending[0].attempt_count, 1)
+        self.assertEqual(pending[0].next_attempt_at, attempt_at + timedelta(minutes=5))
+        self.assertEqual(pending[0].last_result, "delivery_error")
+
+    def test_send_test_card_uses_utc_event_id_and_no_state(self):
+        class RecordingClient:
+            def __init__(self):
+                self.cards = []
+
+            def send(self, payload):
+                self.cards.append(payload)
+
+        client = RecordingClient()
+        result = notifier.send_test_card(
+            notifier_config(), client, self.NOW.astimezone(SHANGHAI)
+        )
+
+        self.assertEqual(result, {
+            "ok": True,
+            "mode": "test",
+            "event_id": "test:2026-08-17T04:00:00+00:00",
+        })
+        self.assertEqual(len(client.cards), 1)
+        self.assertEqual(
+            client.cards[0]["card"]["header"],
+            {
+                "template": "orange",
+                "title": {
+                    "tag": "plain_text",
+                    "content": "TradingAgents 飞书通知配置验收",
+                },
+            },
+        )
 
 
 if __name__ == "__main__":
