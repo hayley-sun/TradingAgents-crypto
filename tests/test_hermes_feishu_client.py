@@ -97,6 +97,12 @@ class FakeTransport:
 class LocalFeishuHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _write_response(self, status, body=b"", headers=None):
         self.send_response(status)
         for name, value in (headers or {}).items():
@@ -286,6 +292,37 @@ class FeishuCardRenderingTests(unittest.TestCase):
             "unclosed single quote": (
                 "API_KEY='unclosed-single-fragment",
                 ("unclosed-single-fragment",),
+            ),
+        }
+
+        for case, (value, secret_fragments) in cases.items():
+            payload = render_report_card(
+                report_card_fixture(decision=value), previous=None
+            )
+            rendered = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+            with self.subTest(case=case):
+                for secret_fragment in secret_fragments:
+                    self.assertNotIn(secret_fragment, rendered)
+                self.assertIn("[REDACTED]", rendered)
+
+    def test_report_card_redacts_json_style_quoted_secret_keys(self):
+        cases = {
+            "double quoted object": (
+                'before {"DEEPSEEK_API_KEY": "json-object-fragment"} after',
+                ("json-object-fragment",),
+            ),
+            "single quoted object": (
+                "before {'TOKEN': 'json-single-fragment'} after",
+                ("json-single-fragment",),
+            ),
+            "double quoted key and escaped value": (
+                r'before {"API_KEY": "json-double-a\"json-double-b"} after',
+                ("json-double-a", "json-double-b"),
+            ),
+            "single quoted key and escaped value": (
+                r"before {'PASSWORD': 'json-single-a\'json-single-b'} after",
+                ("json-single-a", "json-single-b"),
             ),
         }
 

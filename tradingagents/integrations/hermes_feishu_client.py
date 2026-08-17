@@ -48,11 +48,14 @@ MAX_RENDERED_CARD_BYTES = MAX_REQUEST_BYTES - SIGNED_ENVELOPE_RESERVE_BYTES
 REPORT_DISCLAIMER = "仅用于研究和模拟交易，不构成交易建议"
 TRUNCATION_NOTICE = "\n\n_其余内容因长度限制已省略_"
 SECRET_ASSIGNMENT_PREFIX = re.compile(
-    r"([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
+    r"(?P<key_quote>[\"'])?"
+    r"(?P<key>[A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
+    r"(?(key_quote)(?P=key_quote))"
     r"\s*[:=]\s*",
     re.IGNORECASE,
 )
 SECRET_TOKEN = re.compile(r"sk-[A-Za-z0-9_-]+", re.IGNORECASE)
+FREE_FIELD_SEPARATOR = re.compile(r"[\s,;]")
 
 
 class FeishuConfigError(RuntimeError):
@@ -271,19 +274,15 @@ def _redact_secret_assignments(value: str) -> str:
     cursor = 0
     while match := SECRET_ASSIGNMENT_PREFIX.search(value, cursor):
         output.append(value[cursor : match.start()])
-        output.append(f"{match.group(1)}=[REDACTED]")
+        output.append(f"{match.group('key')}=[REDACTED]")
         value_start = match.end()
         if value_start >= len(value):
             cursor = value_start
             break
         quote = value[value_start]
         if quote not in ('"', "'"):
-            separator = re.search(r"[\s,;]", value[value_start:])
-            cursor = (
-                len(value)
-                if separator is None
-                else value_start + separator.start()
-            )
+            separator = FREE_FIELD_SEPARATOR.search(value, value_start)
+            cursor = len(value) if separator is None else separator.start()
             continue
 
         cursor = value_start + 1
