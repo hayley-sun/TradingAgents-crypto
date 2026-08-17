@@ -2,6 +2,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import runpy
 import subprocess
 import tempfile
 import unittest
@@ -2931,6 +2932,21 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
         ):
             return self._main(["run"])
 
+    def _run_with_writer(self, result, writer):
+        with (
+            patch.object(notifier, "NotificationStateStore"),
+            patch.object(notifier, "FeishuClient"),
+            patch.object(notifier, "run_notifier_once", return_value=result),
+            patch.object(
+                notifier,
+                "_utc_now",
+                return_value=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            ),
+            patch("sys.stdout", writer),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            return notifier.main(["run"], config=notifier_config())
+
     def test_test_requires_exact_confirmation_without_runtime_dependencies(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -3044,13 +3060,26 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
     def test_initialize_rejects_nonexact_or_invalid_results(self):
         payload = {"ok": True, "mode": "initialize"}
         valid_state = empty_notification_state()
+        subclass_state = type(
+            "NotificationStateSubclass", (notifier.NotificationState,), {}
+        ).model_construct()
+
+        class PayloadSubclass(dict):
+            pass
+
+        class TupleSubclass(tuple):
+            pass
+
         malformed = (
             (valid_state,),
             (valid_state, payload, "secret-marker"),
             [valid_state, payload],
+            TupleSubclass((valid_state, payload)),
             object(),
             (object(), payload),
+            (subclass_state, payload),
             (valid_state, object()),
+            (valid_state, PayloadSubclass(payload)),
         )
         for result in malformed:
             with self.subTest(result_type=type(result).__name__):
@@ -3082,10 +3111,13 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
             (0,),
             (0, payload, "secret-marker"),
             [0, payload],
+            type("TupleSubclass", (tuple,), {})((0, payload)),
             object(),
             (True, payload),
             ("0", payload),
+            (2, payload),
             (0, object()),
+            (0, type("PayloadSubclass", (dict,), {})(payload)),
         )
         for result in malformed:
             with self.subTest(result_type=type(result).__name__):
@@ -3095,6 +3127,28 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
                 self.assertEqual(json.loads(stdout), self._failure_payload("run"))
                 self.assertEqual(stdout.count("\n"), 1)
                 self.assertNotIn("secret-marker", stdout)
+
+    def test_test_mode_rejects_dict_subclass_payload(self):
+        class PayloadSubclass(dict):
+            pass
+
+        with (
+            patch.object(notifier, "FeishuClient"),
+            patch.object(
+                notifier,
+                "send_test_card",
+                return_value=PayloadSubclass({"ok": True, "mode": "test"}),
+            ),
+            patch.object(
+                notifier,
+                "_utc_now",
+                return_value=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            ),
+        ):
+            code, stdout = self._main(["test", "--confirm-external-send"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout), self._failure_payload("test"))
 
     def test_run_rejects_nonfinite_payload_values_before_printing(self):
         for value in (float("nan"), float("inf"), float("-inf")):
@@ -3134,6 +3188,100 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
                 self.assertEqual(json.loads(stdout), self._failure_payload("run"))
                 self.assertEqual(stdout.count("\n"), 1)
 
+    def test_rejects_hostile_argv_without_dispatch_or_marker(self):
+        marker = "argv-marker-must-not-escape"
+
+        class RaisingSequence:
+            def __iter__(self):
+                raise RuntimeError(marker)
+
+        class HostileStr(str):
+            def __eq__(self, _other):
+                raise RuntimeError(marker)
+
+            def __hash__(self):
+                raise RuntimeError(marker)
+
+        for argv in (RaisingSequence(), [HostileStr("run")]):
+            with self.subTest(argv_type=type(argv).__name__):
+                with (
+                    patch.object(notifier, "NotificationStateStore") as store,
+                    patch.object(notifier, "FeishuClient") as client,
+                ):
+                    code, stdout = self._main(argv)
+
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    json.loads(stdout)["error"]["code"],
+                    "INVALID_NOTIFY_REQUEST",
+                )
+                self.assertNotIn(marker, stdout)
+                store.assert_not_called()
+                client.assert_not_called()
+
+    def test_colliding_interrupts_propagate_from_cli_boundaries(self):
+        class CollidingInterrupt(RuntimeError, KeyboardInterrupt):
+            pass
+
+        class InterruptingSequence:
+            def __iter__(self):
+                raise CollidingInterrupt()
+
+        for argv, setup in (
+            (InterruptingSequence(), None),
+            (
+                ["run"],
+                patch.object(
+                    notifier._SafeArgumentParser,
+                    "parse_args",
+                    side_effect=CollidingInterrupt(),
+                ),
+            ),
+            (
+                ["run"],
+                patch.object(notifier, "_utc_now", side_effect=CollidingInterrupt()),
+            ),
+            (
+                ["run"],
+                patch.object(
+                    notifier, "_serialize_payload", side_effect=CollidingInterrupt()
+                ),
+            ),
+        ):
+            with self.subTest(argv_type=type(argv).__name__, setup=setup is not None):
+                context = setup if setup is not None else unittest.mock.patch("sys.stdout")
+                with context:
+                    with self.assertRaises(CollidingInterrupt):
+                        self._main(argv)
+
+    def test_colliding_system_exit_propagates_from_cli_runtime(self):
+        class CollidingSystemExit(RuntimeError, SystemExit):
+            pass
+
+        with patch.object(
+            notifier, "_utc_now", side_effect=CollidingSystemExit()
+        ):
+            with self.assertRaises(CollidingSystemExit):
+                self._main(["run"])
+
+    def test_partial_stdout_failure_never_writes_a_fallback(self):
+        class PartialWriter:
+            def __init__(self):
+                self.calls = 0
+                self.prefix = ""
+
+            def write(self, value):
+                self.calls += 1
+                self.prefix += value[:8]
+                raise RuntimeError("stdout-marker-must-not-escape")
+
+        writer = PartialWriter()
+        code = self._run_with_writer((0, {"ok": True, "mode": "run"}), writer)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(writer.calls, 1)
+        self.assertTrue(writer.prefix)
+
     def test_test_mode_sends_once_only_after_confirmation(self):
         now = datetime(2026, 8, 17, tzinfo=timezone.utc)
         config = notifier_config()
@@ -3162,7 +3310,7 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
 
         def runner_main(argv, *, config):
             received.append((argv, config))
-            return 7
+            return 0
 
         runner = SimpleNamespace(main=runner_main)
         order = []
@@ -3174,7 +3322,7 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
         ):
             code = bootstrap.main(["run"])
 
-        self.assertEqual(code, 7)
+        self.assertEqual(code, 0)
         self.assertEqual(order, ["load", "import"])
         self.assertEqual(received, [(["run"], config)])
 
@@ -3192,7 +3340,7 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
                 ),
             },
         }
-        for result in (True, "1", None):
+        for result in (True, "1", None, 2):
             with self.subTest(result_type=type(result).__name__):
                 stream = io.StringIO()
                 runner = SimpleNamespace(
@@ -3213,6 +3361,109 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(json.loads(stream.getvalue()), expected)
                 self.assertEqual(stream.getvalue().count("\n"), 1)
+
+    def test_startup_boundary_catches_path_home_and_lazy_import_failures(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        marker = "bootstrap-marker-must-not-escape"
+        expected = {
+            "ok": False,
+            "mode": "run",
+            "error": {
+                "code": "FEISHU_NOTIFIER_FAILED",
+                "message": "The Feishu notifier could not complete.",
+                "suggested_action": (
+                    "Inspect the safe notifier Cron result and private configuration."
+                ),
+            },
+        }
+        for failure in ("path_home", "lazy_import"):
+            with self.subTest(failure=failure):
+                stream = io.StringIO()
+                stderr = io.StringIO()
+                if failure == "path_home":
+                    script_path = (
+                        Path(__file__).parents[1]
+                        / "tradingagents"
+                        / "integrations"
+                        / "hermes_feishu_bootstrap.py"
+                    )
+                    with (
+                        patch.object(Path, "home", side_effect=RuntimeError(marker)),
+                        patch("sys.stdout", stream),
+                        patch("sys.stderr", stderr),
+                        self.assertRaises(SystemExit) as exited,
+                    ):
+                        runpy.run_path(str(script_path), run_name="__main__")
+                    self.assertEqual(exited.exception.code, 1)
+                else:
+                    real_import = __import__
+
+                    def fail_client_import(name, *args, **kwargs):
+                        if name == "tradingagents.integrations.hermes_feishu_client":
+                            raise RuntimeError(marker)
+                        return real_import(name, *args, **kwargs)
+
+                    with (
+                        patch("builtins.__import__", side_effect=fail_client_import),
+                        patch("sys.stdout", stream),
+                        patch("sys.stderr", stderr),
+                    ):
+                        code = bootstrap.main(["run"])
+                    self.assertEqual(code, 1)
+
+                self.assertEqual(json.loads(stream.getvalue()), expected)
+                self.assertEqual(stream.getvalue().count("\n"), 1)
+                self.assertNotIn(marker, stream.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_colliding_interrupt_from_bootstrap_config_propagates(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        class CollidingInterrupt(RuntimeError, KeyboardInterrupt):
+            pass
+
+        with patch.object(
+            bootstrap, "load_private_config", side_effect=CollidingInterrupt()
+        ):
+            with self.assertRaises(CollidingInterrupt):
+                bootstrap.main(["run"])
+
+    def test_colliding_system_exit_from_bootstrap_config_propagates(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        class CollidingSystemExit(RuntimeError, SystemExit):
+            pass
+
+        with patch.object(
+            bootstrap, "load_private_config", side_effect=CollidingSystemExit()
+        ):
+            with self.assertRaises(CollidingSystemExit):
+                bootstrap.main(["run"])
+
+    def test_partial_bootstrap_stdout_failure_is_not_retried(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        class PartialWriter:
+            def __init__(self):
+                self.calls = 0
+
+            def write(self, _value):
+                self.calls += 1
+                raise RuntimeError("stdout-marker-must-not-escape")
+
+        writer = PartialWriter()
+        with (
+            patch.object(
+                bootstrap, "load_private_config", side_effect=RuntimeError("failure")
+            ),
+            patch("sys.stdout", writer),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            code = bootstrap.main(["run"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(writer.calls, 1)
 
     def test_startup_failures_are_constant_safe_json_and_do_not_import_after_config_failure(self):
         from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap

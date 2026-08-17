@@ -1411,32 +1411,59 @@ class _SafeArgumentParser(argparse.ArgumentParser):
 
 
 def _safe_mode(argv: object) -> str:
-    if isinstance(argv, Sequence) and not isinstance(argv, (str, bytes)):
-        if argv and isinstance(argv[0], str) and argv[0] in {
-            "initialize",
-            "run",
-            "test",
-        }:
-            return argv[0]
+    if (
+        type(argv) is tuple
+        and argv
+        and type(argv[0]) is str
+        and argv[0] in {"initialize", "run", "test"}
+    ):
+        return argv[0]
     return "unknown"
 
 
-def _print_payload(payload: dict[str, object]) -> None:
-    print(
-        json.dumps(
-            payload, ensure_ascii=True, sort_keys=True, allow_nan=False
-        )
-    )
+def _normalize_argv(argv: object) -> tuple[str, ...] | None:
+    try:
+        tokens = tuple(argv)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+    return tokens if all(type(token) is str for token in tokens) else None
 
 
-def _print_cli_failure(mode: str) -> None:
-    """Print the finite constant fallback without recursing on failures."""
+def _serialize_payload(payload: dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, allow_nan=False)
 
-    print(
-        json.dumps(
-            _cli_failure(mode), ensure_ascii=True, sort_keys=True, allow_nan=False
-        )
-    )
+
+def _write_line(line: str) -> bool:
+    try:
+        sys.stdout.write(line + "\n")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return False
+    return True
+
+
+def _emit_failure(mode: str) -> int:
+    try:
+        line = _serialize_payload(_cli_failure(mode))
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return 1
+    _write_line(line)
+    return 1
+
+
+def _emit_payload(payload: dict[str, object], mode: str, code: int) -> int:
+    try:
+        line = _serialize_payload(payload)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return _emit_failure(mode)
+    return code if _write_line(line) else 1
 
 
 def _initialize_cli_result(
@@ -1445,8 +1472,8 @@ def _initialize_cli_result(
     if (
         type(result) is not tuple
         or len(result) != 2
-        or not isinstance(result[0], NotificationState)
-        or not isinstance(result[1], dict)
+        or type(result[0]) is not NotificationState
+        or type(result[1]) is not dict
     ):
         raise ValueError("invalid notifier result")
     return 0, result[1]
@@ -1457,7 +1484,7 @@ def _run_cli_result(result: object) -> tuple[int, dict[str, object]]:
         type(result) is not tuple
         or len(result) != 2
         or type(result[0]) is not int
-        or not isinstance(result[1], dict)
+        or type(result[1]) is not dict
     ):
         raise ValueError("invalid notifier result")
     return result[0], result[1]
@@ -1477,26 +1504,31 @@ def main(
 ) -> int:
     """Run one explicitly selected Feishu notifier mode."""
 
+    tokens = _normalize_argv(sys.argv[1:] if argv is None else argv)
+    mode = _safe_mode(tokens)
     try:
-        raw_argv = list(sys.argv[1:] if argv is None else argv)
-    except TypeError:
-        raw_argv = []
-    mode = _safe_mode(raw_argv)
-    parser = _SafeArgumentParser(add_help=False)
-    parser.add_argument("mode", choices=("initialize", "run", "test"))
-    parser.add_argument("--confirm-external-send", action="store_true")
-    try:
-        arguments = parser.parse_args(raw_argv)
-        expected_argv = (
-            ["test", "--confirm-external-send"]
+        valid_requests = {
+            ("initialize",),
+            ("run",),
+            ("test", "--confirm-external-send"),
+        }
+        if tokens not in valid_requests:
+            raise ValueError("invalid request")
+        parser = _SafeArgumentParser(add_help=False)
+        parser.add_argument("mode", choices=("initialize", "run", "test"))
+        parser.add_argument("--confirm-external-send", action="store_true")
+        arguments = parser.parse_args(tokens)
+        expected_tokens = (
+            ("test", "--confirm-external-send")
             if arguments.mode == "test"
-            else [arguments.mode]
+            else (arguments.mode,)
         )
-        if raw_argv != expected_argv:
+        if tokens != expected_tokens:
             raise ValueError("invalid confirmation")
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except (TypeError, ValueError):
-        _print_payload(_invalid_request(mode))
-        return 1
+        return _emit_payload(_invalid_request(mode), mode, 1)
 
     try:
         now = _utc_now()
@@ -1518,11 +1550,15 @@ def main(
         else:
             client = FeishuClient(config)
             code, payload = 0, send_test_card(config, client, now)
-        if type(code) is not int or not isinstance(payload, dict):
+        if (
+            type(code) is not int
+            or code not in {0, 1}
+            or type(payload) is not dict
+        ):
             raise ValueError("invalid notifier result")
-        _print_payload(payload)
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception:
-        _print_cli_failure(arguments.mode)
-        return 1
+        return _emit_failure(arguments.mode)
 
-    return code
+    return _emit_payload(payload, arguments.mode, code)
