@@ -29,6 +29,7 @@ from tradingagents.integrations.hermes_feishu_notifier import (
 )
 from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
+    NotificationAlreadyRunning,
     NotificationEvent,
     NotificationStateError,
     NotificationStateStore,
@@ -2015,6 +2016,66 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
         self.assertEqual(list(retried.deliveries), [event_id])
         self.assertEqual(retried.deliveries[event_id].attempt_count, 2)
         self.assertEqual(retried.deliveries[event_id].delivered_at, retry_at)
+
+    def test_client_notification_already_running_crash_propagates(self):
+        self.assert_client_state_exception_propagates(
+            NotificationAlreadyRunning("client crash")
+        )
+
+    def test_client_notification_state_error_crash_propagates(self):
+        self.assert_client_state_exception_propagates(
+            NotificationStateError("client crash")
+        )
+
+    def assert_client_state_exception_propagates(self, crash):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        failure_id = "8" * 32
+        current = dict(histories)
+        current[job_id] = (
+            cron_execution(
+                failure_id,
+                "failed",
+                self.NOW + timedelta(minutes=1),
+                job_id=job_id,
+            ),
+            *histories[job_id],
+        )
+        event_id = f"failure:{job_id}:{failure_id}"
+        attempt_at = self.NOW + timedelta(minutes=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+
+            class CrashingClient:
+                def send(self, _payload):
+                    raise crash
+
+            with self.assertRaises(type(crash)) as raised:
+                notifier.run_notifier_once(
+                    store,
+                    notifier_config(),
+                    CrashingClient(),
+                    lambda source_job_id: current[source_job_id],
+                    lambda: (),
+                    attempt_at,
+                )
+            durable = store.load().deliveries[event_id]
+
+        self.assertIs(raised.exception, crash)
+        self.assertEqual(str(raised.exception), "client crash")
+        self.assertEqual(durable.attempt_count, 1)
+        self.assertEqual(
+            durable.next_attempt_at, attempt_at + timedelta(minutes=5)
+        )
+        self.assertIsNone(durable.delivered_at)
 
     def test_report_render_uses_nearest_previous_and_missing_exact_fails(self):
         with tempfile.TemporaryDirectory() as directory:
