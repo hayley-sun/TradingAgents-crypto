@@ -7,9 +7,7 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Mapping
 from pathlib import Path
-from types import MappingProxyType
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
@@ -38,13 +36,37 @@ class FeishuConfigError(RuntimeError):
     """Raised when the private Feishu configuration is unavailable or invalid."""
 
 
+class _ImmutableJobs(dict[str, str]):
+    @classmethod
+    def from_mapping(cls, values: dict[str, str]) -> Self:
+        instance = dict.__new__(cls)
+        dict.__init__(instance, values)
+        return instance
+
+    def copy(self) -> dict[str, str]:
+        return dict(self)
+
+    def _reject_mutation(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("jobs mapping is immutable")
+
+    __init__ = _reject_mutation
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+    __ior__ = _reject_mutation
+
+
 class FeishuNotifierConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal[1] = 1
     webhook_url: str
     signing_secret: str = Field(min_length=1, max_length=512)
-    jobs: Mapping[str, str]
+    jobs: dict[str, str]
 
     @field_validator("version", mode="before")
     @classmethod
@@ -55,11 +77,11 @@ class FeishuNotifierConfig(BaseModel):
 
     @field_validator("jobs")
     @classmethod
-    def freeze_jobs(cls, value: Mapping[str, str]) -> Mapping[str, str]:
-        return MappingProxyType(dict(value))
+    def freeze_jobs(cls, value: dict[str, str]) -> dict[str, str]:
+        return _ImmutableJobs.from_mapping(value)
 
     @field_serializer("jobs")
-    def serialize_jobs(self, value: Mapping[str, str]) -> dict[str, str]:
+    def serialize_jobs(self, value: dict[str, str]) -> dict[str, str]:
         return dict(value)
 
     @model_validator(mode="after")

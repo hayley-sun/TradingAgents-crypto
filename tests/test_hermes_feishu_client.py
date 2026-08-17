@@ -1,3 +1,5 @@
+import json
+import operator
 import os
 import unittest
 from multiprocessing import get_context
@@ -103,17 +105,69 @@ class FeishuNotifierConfigTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             config.version = 2
 
-    def test_valid_config_jobs_are_deeply_immutable_and_serializable(self):
+    def test_valid_config_jobs_preserve_dict_contract(self):
         config = FeishuNotifierConfig.model_validate(config_payload())
-        serialized = config.model_dump(mode="json")
 
+        with self.subTest("annotation"):
+            self.assertEqual(
+                FeishuNotifierConfig.model_fields["jobs"].annotation,
+                dict[str, str],
+            )
+        with self.subTest("runtime type"):
+            self.assertIsInstance(config.jobs, dict)
+        copied = config.jobs.copy()
+        self.assertIs(type(copied), dict)
+        self.assertEqual(copied, VALID_JOBS)
+        copied["daily_submit"] = "copy-can-change"
         self.assertEqual(config.jobs["daily_submit"], VALID_JOBS["daily_submit"])
         self.assertEqual(config.jobs, VALID_JOBS)
-        self.assertEqual(serialized, config_payload())
-        with self.assertRaises(TypeError):
-            config.jobs["daily_submit"] = "not-valid"
+        self.assertEqual(set(config.jobs.values()), set(VALID_JOBS.values()))
+        self.assertEqual(config.model_dump(mode="json"), config_payload())
+        self.assertEqual(json.loads(config.model_dump_json()), config_payload())
+
+    def test_valid_config_jobs_reject_all_normal_dict_mutators(self):
+        operations = {
+            "item assignment": lambda jobs: operator.setitem(
+                jobs, "daily_submit", "not-valid"
+            ),
+            "item deletion": lambda jobs: operator.delitem(
+                jobs, "daily_submit"
+            ),
+            "clear": lambda jobs: jobs.clear(),
+            "pop": lambda jobs: jobs.pop("daily_submit"),
+            "popitem": lambda jobs: jobs.popitem(),
+            "setdefault": lambda jobs: jobs.setdefault("extra", "not-valid"),
+            "update": lambda jobs: jobs.update(
+                {"daily_submit": "not-valid"}
+            ),
+            "in-place union": lambda jobs: operator.ior(
+                jobs, {"daily_submit": "not-valid"}
+            ),
+        }
+
+        for operation_name, operation in operations.items():
+            config = FeishuNotifierConfig.model_validate(config_payload())
+            try:
+                operation(config.jobs)
+            except Exception as error:
+                mutation_error = error
+            else:
+                mutation_error = None
+
+            with self.subTest(operation=operation_name):
+                self.assertIsInstance(mutation_error, TypeError)
+                self.assertEqual(config.jobs, VALID_JOBS)
+
+    def test_input_jobs_mutation_does_not_affect_validated_config(self):
+        source_jobs = dict(VALID_JOBS)
+        config = FeishuNotifierConfig.model_validate(
+            {**config_payload(), "jobs": source_jobs}
+        )
+
+        source_jobs["daily_submit"] = "not-valid"
+        source_jobs.clear()
+
         self.assertEqual(config.jobs, VALID_JOBS)
-        self.assertEqual(config.model_dump(mode="json"), serialized)
 
     def test_config_rejects_non_feishu_urls(self):
         for url in (
