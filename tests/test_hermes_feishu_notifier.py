@@ -2658,6 +2658,58 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
                 self.assertEqual(activity, [])
                 self.assertEqual(before, after)
 
+    def test_raw_non_strict_attempt_counts_fail_before_sources_or_network(self):
+        event = self.failure_event()
+        state = notifier.add_pending_events(
+            empty_notification_state(), (event,), self.NOW
+        )
+        for attempt_count in (True, "1", 1.0):
+            with self.subTest(attempt_count=attempt_count):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = NotificationStateStore(Path(directory) / "state")
+                    store.save(state)
+                    payload = json.loads(store.path.read_text(encoding="ascii"))
+                    payload["deliveries"][event.event_id][
+                        "attempt_count"
+                    ] = attempt_count
+                    store.path.write_text(
+                        json.dumps(payload, ensure_ascii=True),
+                        encoding="ascii",
+                    )
+                    malformed = store.path.read_bytes()
+                    activity = []
+
+                    def load_execution(_job_id):
+                        activity.append("execution")
+                        return ()
+
+                    def load_archives():
+                        activity.append("archive")
+                        return ()
+
+                    code, result = notifier.run_notifier_once(
+                        store,
+                        notifier_config(),
+                        type(
+                            "NoSendClient",
+                            (),
+                            {
+                                "send": lambda _self, _card: activity.append(
+                                    "send"
+                                )
+                            },
+                        )(),
+                        load_execution,
+                        load_archives,
+                        self.NOW,
+                    )
+                    after = store.path.read_bytes()
+
+                self.assertEqual(code, 1)
+                self.assertEqual(result["result"], "state_error")
+                self.assertEqual(activity, [])
+                self.assertEqual(after, malformed)
+
     def test_extreme_aware_times_fail_before_lock_or_sources(self):
         for now in (
             datetime.min.replace(tzinfo=timezone.utc),

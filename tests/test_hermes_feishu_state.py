@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
+    MAX_ATTEMPT_COUNT,
     NotificationAlreadyRunning,
     NotificationEvent,
     NotificationState,
@@ -33,6 +35,107 @@ def report_event(event_id="report:2026-08-18:" + "a" * 64):
 
 
 class FeishuNotificationStateTests(unittest.TestCase):
+    def test_delivery_attempt_count_has_strict_inclusive_bound(self):
+        now = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        bounded = DeliveryRecord(
+            event=report_event(),
+            attempt_count=MAX_ATTEMPT_COUNT,
+            next_attempt_at=now,
+        )
+
+        self.assertEqual(bounded.attempt_count, MAX_ATTEMPT_COUNT)
+        for attempt_count in (
+            True,
+            "1",
+            1.0,
+            -1,
+            MAX_ATTEMPT_COUNT + 1,
+        ):
+            with self.subTest(attempt_count=attempt_count), self.assertRaises(
+                ValidationError
+            ):
+                DeliveryRecord(
+                    event=report_event(),
+                    attempt_count=attempt_count,
+                    next_attempt_at=now,
+                )
+
+    def test_store_rejects_non_strict_or_out_of_range_attempt_counts(self):
+        now = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        event = report_event()
+        delivery = DeliveryRecord(event=event, next_attempt_at=now)
+        state = initialized_state(now, {}, [event.event_id]).model_copy(
+            update={"deliveries": {event.event_id: delivery}}
+        )
+        invalid_values = (True, "1", 1.0, -1, MAX_ATTEMPT_COUNT + 1)
+
+        for attempt_count in invalid_values:
+            with self.subTest(attempt_count=attempt_count):
+                with TemporaryDirectory() as directory:
+                    store = NotificationStateStore(
+                        Path(directory) / "feishu_notifications"
+                    )
+                    store.save(state)
+                    payload = json.loads(store.path.read_text(encoding="ascii"))
+                    payload["deliveries"][event.event_id][
+                        "attempt_count"
+                    ] = attempt_count
+                    store.path.write_text(
+                        json.dumps(payload, ensure_ascii=True),
+                        encoding="ascii",
+                    )
+                    malformed = store.path.read_bytes()
+
+                    for load in (store.load, store.load_optional):
+                        with self.subTest(load=load.__name__):
+                            with self.assertRaises(
+                                NotificationStateError
+                            ) as raised:
+                                load()
+                            self.assertEqual(
+                                str(raised.exception),
+                                "notification state unavailable",
+                            )
+                            self.assertEqual(
+                                store.path.read_bytes(), malformed
+                            )
+
+    def test_store_save_rejects_manually_invalid_attempt_counts(self):
+        now = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        event = report_event()
+        delivery = DeliveryRecord(event=event, next_attempt_at=now)
+        state = initialized_state(now, {}, [event.event_id]).model_copy(
+            update={"deliveries": {event.event_id: delivery}}
+        )
+
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(
+                Path(directory) / "feishu_notifications"
+            )
+            store.save(state)
+            valid_bytes = store.path.read_bytes()
+            for attempt_count in (
+                True,
+                "1",
+                1.0,
+                -1,
+                MAX_ATTEMPT_COUNT + 1,
+            ):
+                with self.subTest(attempt_count=attempt_count):
+                    invalid_delivery = delivery.model_copy(
+                        update={"attempt_count": attempt_count}
+                    )
+                    invalid_state = state.model_copy(
+                        update={
+                            "deliveries": {
+                                event.event_id: invalid_delivery
+                            }
+                        }
+                    )
+                    with self.assertRaises(NotificationStateError):
+                        store.save(invalid_state)
+                    self.assertEqual(store.path.read_bytes(), valid_bytes)
+
     def test_models_reject_naive_runtime_datetimes(self):
         aware = datetime(2026, 8, 18, tzinfo=timezone.utc)
         naive = aware.replace(tzinfo=None)

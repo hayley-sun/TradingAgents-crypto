@@ -26,6 +26,7 @@ from tradingagents.integrations.hermes_feishu_client import (
 )
 from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
+    MAX_ATTEMPT_COUNT,
     NotificationAlreadyRunning,
     NotificationEvent,
     NotificationState,
@@ -672,7 +673,6 @@ SAFE_DELIVERY_RESULTS = frozenset(
         "feishu_error",
     }
 )
-MAX_ATTEMPT_COUNT = 1_000_000
 
 
 class _CardClient(Protocol):

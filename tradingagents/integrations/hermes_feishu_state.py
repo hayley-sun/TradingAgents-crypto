@@ -13,6 +13,7 @@ from typing import Literal, Self
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     ValidationError,
     field_validator,
     model_validator,
@@ -33,6 +34,7 @@ REQUIRED_FIELDS = {
     },
 }
 RETRY_MINUTES = (5, 10, 20, 40, 60)
+MAX_ATTEMPT_COUNT = 1_000_000
 STATE_ERROR_MESSAGE = "notification state unavailable"
 ALREADY_RUNNING_MESSAGE = "notification notifier already running"
 
@@ -101,7 +103,12 @@ class NotificationEvent(_FrozenModel):
 
 class DeliveryRecord(_FrozenModel):
     event: NotificationEvent
-    attempt_count: int = 0
+    attempt_count: int = Field(
+        default=0,
+        strict=True,
+        ge=0,
+        le=MAX_ATTEMPT_COUNT,
+    )
     next_attempt_at: datetime
     delivered_at: datetime | None = None
     last_result: str | None = None
@@ -205,8 +212,14 @@ class NotificationStateStore:
         temporary_path: Path | None = None
         try:
             self._prepare_root()
+            if any(
+                type(record.attempt_count) is not int
+                or not 0 <= record.attempt_count <= MAX_ATTEMPT_COUNT
+                for record in state.deliveries.values()
+            ):
+                raise ValueError("invalid delivery state")
             payload = NotificationState.model_validate(
-                state.model_dump(mode="json")
+                state.model_dump(mode="json", warnings=False)
             ).model_dump(mode="json")
             with NamedTemporaryFile(
                 mode="w",
