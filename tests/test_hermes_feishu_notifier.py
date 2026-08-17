@@ -1130,6 +1130,36 @@ class HermesFeishuNotifierTests(unittest.TestCase):
             load_verified_archives(UnsafePath())
 
         self.assert_safe_report_error(raised.exception, marker)
+
+    def test_public_report_discovery_rejects_keyerror_pathlike_safely(self):
+        marker = "key-marker-must-never-escape"
+
+        class UnsafePath:
+            def __fspath__(self):
+                raise KeyError(marker)
+
+        execution = cron_execution(
+            "8" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        for discover in (
+            lambda: load_verified_archives(UnsafePath()),
+            lambda: discover_missing_archive_events(
+                UnsafePath(),
+                (execution,),
+                (),
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            ),
+        ):
+            with self.subTest(discover=discover), self.assertRaises(
+                ReportDiscoveryError
+            ) as raised:
+                discover()
+            self.assert_safe_report_error(raised.exception, marker)
         execution = cron_execution(
             "7" * 32,
             "completed",

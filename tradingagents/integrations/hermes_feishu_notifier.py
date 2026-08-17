@@ -382,6 +382,14 @@ def _snapshot_archives(
     return tuple(snapshots)
 
 
+def _coerce_results_root(results_root: object) -> Path:
+    try:
+        return Path(results_root)
+    except Exception:
+        pass
+    raise ReportDiscoveryError()
+
+
 def _load_report_inventory(results_root: object) -> _ReportInventory:
     """Build one fully verified, descriptor-anchored report inventory."""
 
@@ -390,7 +398,7 @@ def _load_report_inventory(results_root: object) -> _ReportInventory:
     batches_descriptor: int | None = None
     reports_descriptor: int | None = None
     try:
-        root = Path(results_root)
+        root = _coerce_results_root(results_root)
         root_descriptor = _open_directory(root, missing=True)
         if root_descriptor is None:
             return _ReportInventory((), frozenset())
