@@ -789,3 +789,279 @@ PY
 ## 回滚
 
 如需禁用 Hermes 访问，仅从 `/home/ubuntu/.hermes/config.yaml` 删除 `tradingagents_crypto` 条目，保持该文件权限为 `600`，然后在 Hermes 中执行 `/reload-mcp`。这不会改变 Web UI、打开或关闭网络端口、修改 nginx、删除 `.venv-hermes-mcp`，也不会删除已持久化的会话、复盘、学习索引或 worker 日志。
+
+## 飞书群机器人通知
+
+此任务是第五个确定性的、无 agent、仅本地投递的 Cron。它只观察下列四个既有 job
+及其已持久化报告，不修改原有 schedule、delivery 或结果；不运行 agent、LLM、市场
+访问或订单，也不监控 notifier 自身。所有时间均按 `Asia/Shanghai` 解释。不得读取、输出或修改 `MEMORY.md`。
+不得在 Git、shell history、Cron 参数、日志或输出中保存秘密；绝不把
+webhook URL 或签名 secret 写入本手册、示例或版本控制文件。
+
+### 固定观察对象
+
+只通过 ID 确认生产任务，绝不按名称猜测。先运行
+`/home/ubuntu/.local/bin/hermes cron list --all`，确认以下四项仍存在且与本次部署前
+记录一致：
+
+| 配置键 | 生产 job ID |
+| --- | --- |
+| `daily_submit` | `2d445dfc1a8a` |
+| `daily_archive` | `5b7f7906306a` |
+| `review_processor` | `d6c0e087e5a8` |
+| `review_memory` | `e93cfab5f78e` |
+
+### 部署前证据
+
+以 `ubuntu` 登录后执行。`reviewed_notifier_commit` 必须是已评审、已推送的精确提交；
+工作树不干净或不是该提交时停止。清单只记录文件名和摘要，不读取报告正文，也不接触
+任何 memory 路径。
+
+```bash
+set -euo pipefail
+export PATH="/home/ubuntu/.local/bin:$PATH"
+PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
+cd "$PROJECT_DIR"
+reviewed_notifier_commit='<reviewed-commit-sha>'
+test -z "$(git status --short)"
+test "$(git rev-parse HEAD)" = "$reviewed_notifier_commit"
+hermes gateway status
+hermes cron status
+/home/ubuntu/.local/bin/hermes cron list --all
+
+test -x deploy/hermes/scripts/tradingagents-feishu-notifier.sh
+install -d -m 700 /home/ubuntu/.hermes/scripts
+install -m 700 deploy/hermes/scripts/tradingagents-feishu-notifier.sh \
+  /home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh
+cmp --silent deploy/hermes/scripts/tradingagents-feishu-notifier.sh \
+  /home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh
+stat -c '%U %a %n' /home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh
+
+manifest_before="$(mktemp /tmp/tradingagents-feishu-artifacts-before.XXXXXX)"
+find results/hermes -type f ! -path '*/feishu_notifications/*' -print0 \
+  | LC_ALL=C sort -z | xargs -0 sha256sum > "$manifest_before"
+```
+
+最后一条 metadata 输出必须为 `ubuntu 700` 且目标是
+`/home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh`。保存
+`$manifest_before` 以供暂停验收、恢复前和首次端到端报告后作只读比较。
+
+### Owner-only 私有配置
+
+只有 `ubuntu` 在受控终端运行下段代码。`getpass` 直接从终端读取两个值，不接受 argv、
+环境变量或 `echo` 输入，也不打印它们。生成的 YAML 只有 `version`、`webhook_url`、
+`signing_secret` 和 `jobs` 四个 schema 键；四个 job ID 只能使用上表的精确值。
+
+```bash
+install -d -m 700 /home/ubuntu/.hermes/secrets
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" - \
+  /home/ubuntu/.hermes/secrets/feishu-notifier.yaml <<'PY'
+import getpass
+import os
+import tempfile
+from pathlib import Path
+
+import yaml
+
+config_path = Path(__import__('sys').argv[1])
+webhook_url = getpass.getpass('Feishu webhook URL: ')
+signing_secret = getpass.getpass('Feishu signing secret: ')
+payload = {
+    'version': 1,
+    'webhook_url': webhook_url,
+    'signing_secret': signing_secret,
+    'jobs': {
+        'daily_submit': '2d445dfc1a8a',
+        'daily_archive': '5b7f7906306a',
+        'review_processor': 'd6c0e087e5a8',
+        'review_memory': 'e93cfab5f78e',
+    },
+}
+assert set(payload) == {'version', 'webhook_url', 'signing_secret', 'jobs'}
+assert set(payload['jobs']) == {
+    'daily_submit', 'daily_archive', 'review_processor', 'review_memory'
+}
+temporary_path = None
+try:
+    with tempfile.NamedTemporaryFile(
+        mode='w', encoding='utf-8', dir=config_path.parent,
+        prefix='.feishu-notifier.', suffix='.tmp', delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+        temporary_path.chmod(0o600)
+        yaml.safe_dump(payload, temporary_file, allow_unicode=False, sort_keys=True)
+        temporary_file.flush()
+        os.fsync(temporary_file.fileno())
+    os.replace(temporary_path, config_path)
+    temporary_path = None
+    config_path.chmod(0o600)
+finally:
+    if temporary_path is not None:
+        temporary_path.unlink(missing_ok=True)
+PY
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" - \
+  /home/ubuntu/.hermes/secrets \
+  /home/ubuntu/.hermes/secrets/feishu-notifier.yaml <<'PY'
+import pwd
+import stat
+import sys
+from pathlib import Path
+
+for raw_path, expected_mode in zip(sys.argv[1:], (0o700, 0o600), strict=True):
+    path = Path(raw_path)
+    metadata = path.stat()
+    assert pwd.getpwuid(metadata.st_uid).pw_name == 'ubuntu'
+    assert stat.S_IMODE(metadata.st_mode) == expected_mode
+    print(f'uid=ubuntu mode={expected_mode:03o} path={path}')
+PY
+```
+
+两行 metadata-only 输出必须精确为 `uid=ubuntu mode=700` 与 `uid=ubuntu mode=600`；
+不要查看、复制、散列或打印配置内容。
+
+### 先初始化，再创建任务
+
+初始化只建立本地基线和 notification state，不使用网络；它必须在创建 Cron 前完成，
+也不得产生飞书卡片。首次完成后只检查安全计数、状态路径及 owner-only 模式，并重复
+初始化确认 state 字节和摘要稳定。
+
+```bash
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m \
+  tradingagents.integrations.hermes_feishu_bootstrap initialize
+state_path="$PROJECT_DIR/results/hermes/feishu_notifications/state.json"
+test -f "$state_path"
+test "$(stat -c '%U %a' "$state_path")" = 'ubuntu 600'
+state_digest_before="$(sha256sum "$state_path" | awk '{print $1}')"
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m \
+  tradingagents.integrations.hermes_feishu_bootstrap initialize
+test "$(sha256sum "$state_path" | awk '{print $1}')" = "$state_digest_before"
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" - "$state_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state = json.loads(Path(sys.argv[1]).read_text(encoding='ascii'))
+print(json.dumps({
+    'schema_version': state['schema_version'],
+    'execution_cursor_count': len(state['execution_cursors']),
+    'seen_report_event_count': len(state['seen_report_event_ids']),
+}, sort_keys=True))
+PY
+```
+
+立即创建并暂停。以下块不得插入任何 Hermes 命令，且不得在 `initialize` 前运行任何
+notifier create：
+
+```bash
+create_output="$(hermes cron create --name tradingagents-feishu-notifier --deliver local --no-agent --script tradingagents-feishu-notifier.sh --workdir "$PROJECT_DIR" '*/5 * * * *')"
+feishu_notifier_job_id="$(printf '%s\n' "$create_output" | sed -n 's/.*Created job: \([0-9a-f]\{12\}\).*/\1/p')"
+test "${#feishu_notifier_job_id}" -eq 12
+hermes cron pause "$feishu_notifier_job_id"
+```
+
+暂停后才执行以下只读确认：notifier 必须是 paused 且没有意外 run；四个固定 job
+仍为 active，定义与部署前一致。
+
+```bash
+hermes cron status
+hermes cron list --all
+hermes cron runs "$feishu_notifier_job_id" --limit 5
+```
+
+### Paused 验收
+
+notifier 保持 paused 时运行 state、client、notifier 单元测试和静态 verifier；可选的
+fake transport 测试仅使用既有测试套件。除下一小节唯一的明确命令外，不得进行真实网络
+请求。随后比较原四个 job 定义和 artifact manifest；`feishu_notifications` 状态目录
+是唯一允许新增的 notifier artifact。
+
+```bash
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m unittest \
+  tests/test_hermes_feishu_state.py \
+  tests/test_hermes_feishu_client.py \
+  tests/test_hermes_feishu_notifier.py \
+  tests/test_hermes_review_verifier.py
+manifest_paused="$(mktemp /tmp/tradingagents-feishu-artifacts-paused.XXXXXX)"
+find results/hermes -type f ! -path '*/feishu_notifications/*' -print0 \
+  | LC_ALL=C sort -z | xargs -0 sha256sum > "$manifest_paused"
+cmp --silent "$manifest_before" "$manifest_paused"
+```
+
+### 一次外部配置卡片
+
+确认以上所有检查通过后，下面是本次验收唯一一次真实外部发送。预期群内仅出现一张橙色
+`TradingAgents 飞书通知配置验收` 卡片；人工确认恰好一张。安全 JSON 和 Cron 输出不得
+包含 URL、secret 或签名。除非明确开始新的验收，不得重复该发送。
+
+```bash
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" -m tradingagents.integrations.hermes_feishu_bootstrap test --confirm-external-send
+```
+
+### 恢复与下一份真实报告
+
+仅在人为确认外部卡片、原 job 定义不变且 immutable manifest 匹配后，恢复 notifier；
+先检查前五条 run，预期完成且没有历史事件。不要恢复、暂停或改变四个原 job。
+
+```bash
+hermes cron resume "$feishu_notifier_job_id"
+hermes cron status
+hermes cron list --all
+hermes cron runs "$feishu_notifier_job_id" --limit 5
+```
+
+等待下一份按 `Asia/Shanghai` 交易日期生成的真实报告。只读取结构化 batch JSON 与报告
+字节，验证日期文件名、SHA-256 和有序 `BTC/ETH/SOL`；只打印安全的日期、状态、symbols
+和摘要，绝不显示报告 narrative 或 memory。
+
+```bash
+NEXT_TRADE_DATE='<next-Asia-Shanghai-YYYY-MM-DD>'
+"$PROJECT_DIR/.venv-hermes-mcp/bin/python" - "$NEXT_TRADE_DATE" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+trade_date = sys.argv[1]
+root = Path('/home/ubuntu/workspace/TradingAgents-crypto/results/hermes')
+batch = json.loads((root / 'report_batches' / f'{trade_date}.json').read_text(encoding='utf-8'))
+archive = batch['archive']
+report_path = root / 'reports' / archive['filename']
+report_bytes = report_path.read_bytes()
+symbols = [item['symbol'] for item in archive['items']]
+assert archive['filename'] == f'{trade_date}.md'
+assert hashlib.sha256(report_bytes).hexdigest() == archive['sha256']
+assert symbols == ['BTC', 'ETH', 'SOL']
+print(json.dumps({
+    'trade_date': trade_date,
+    'state': archive['state'],
+    'symbols': symbols,
+    'sha256': archive['sha256'],
+}, sort_keys=True))
+PY
+hermes cron runs "$feishu_notifier_job_id" --limit 5
+```
+
+人工确认群内恰好一张绿色卡片，且其日期、状态、币种及摘要与上述安全输出一致。原有
+job 和 artifact 除预期报告与 notifier state 外必须保持不变。
+
+### 重试与回滚
+
+仅依据安全 event ID 和结果类别诊断 notifier run，不检查原始 secret。pending/retry
+按 5、10、20、40、60 分钟，之后每小时；HTTP 429 依照安全结果记录。不得手工编辑
+state。
+
+### 回滚
+
+以下命令仅在决定回滚时执行：先暂停 notifier、查看 runs、再移除 notifier。默认保留
+state 与私有配置；仅在获批准后才可最后移除 wrapper。私下记录已解析的 notifier job ID。
+
+```bash
+hermes cron pause "$feishu_notifier_job_id"
+hermes cron runs "$feishu_notifier_job_id" --limit 5
+hermes cron remove "$feishu_notifier_job_id"
+# Approved only after the notifier job is removed:
+# rm /home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh
+```
+
+不得删除已有 session、report、review、index、journal 或 memory；不得删除既有
+schedules、报告或 notification state；不得暂停四个原 job。

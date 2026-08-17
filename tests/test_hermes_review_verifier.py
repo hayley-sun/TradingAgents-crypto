@@ -65,6 +65,13 @@ SCHEDULED_REVIEW_SKILL_PATH = (
     / "tradingagents-scheduled-paper-reviews"
     / "SKILL.md"
 )
+FEISHU_NOTIFIER_SCRIPT = (
+    PROJECT_ROOT
+    / "deploy"
+    / "hermes"
+    / "scripts"
+    / "tradingagents-feishu-notifier.sh"
+)
 
 
 def scheduled_acceptance_guard_script() -> str:
@@ -324,6 +331,93 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn(".venv-hermes-mcp/bin/python", submit)
         self.assertNotIn("hermes ", submit)
         self.assertNotIn("API_KEY", submit + archive)
+
+    def test_feishu_notifier_wrapper_and_runbook_preserve_security_boundary(self):
+        script = FEISHU_NOTIFIER_SCRIPT.read_text(encoding="ascii")
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("hermes_feishu_bootstrap run", script)
+        self.assertIn(".venv-hermes-mcp/bin/python", script)
+        self.assertNotIn("webhook", script.lower())
+        self.assertNotIn("secret", script.lower())
+        self.assertNotIn("MEMORY.md", script)
+        self.assertIn("/home/ubuntu/.hermes/secrets/feishu-notifier.yaml", runbook)
+        self.assertIn("install -d -m 700", runbook)
+        self.assertIn("*/5 * * * *", runbook)
+        self.assertIn("--no-agent --script tradingagents-feishu-notifier.sh", runbook)
+        self.assertIn('hermes cron pause "$feishu_notifier_job_id"', runbook)
+        self.assertIn("test --confirm-external-send", runbook)
+        self.assertIn("不得读取、输出或修改 `MEMORY.md`", runbook)
+
+    def test_feishu_runbook_initializes_before_test_and_resume(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        section = text[text.index("## 飞书群机器人通知") :]
+        initialize = section.index("hermes_feishu_bootstrap initialize")
+        create = section.index("hermes cron create --name tradingagents-feishu-notifier")
+        pause = section.index('hermes cron pause "$feishu_notifier_job_id"')
+        test_send = section.index("test --confirm-external-send")
+        resume = section.index('hermes cron resume "$feishu_notifier_job_id"')
+        self.assertLess(initialize, create)
+        self.assertLess(create, pause)
+        self.assertLess(pause, test_send)
+        self.assertLess(test_send, resume)
+
+    def test_feishu_runbook_static_deployment_guards(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        section = text[text.index("## 飞书群机器人通知") :]
+
+        for job_id in (
+            "2d445dfc1a8a",
+            "5b7f7906306a",
+            "d6c0e087e5a8",
+            "e93cfab5f78e",
+        ):
+            self.assertIn(job_id, section)
+        self.assertIn("/home/ubuntu/.local/bin/hermes cron list --all", section)
+        self.assertIn(
+            "install -m 700 deploy/hermes/scripts/tradingagents-feishu-notifier.sh",
+            section,
+        )
+        self.assertIn("stat -c '%U %a %n'", section)
+        self.assertIn("getpass.getpass", section)
+        self.assertIn("NamedTemporaryFile", section)
+        self.assertIn("os.fsync", section)
+        self.assertIn("os.replace", section)
+        self.assertIn("chmod(0o600)", section)
+        self.assertIn("set(payload) == {'version', 'webhook_url', 'signing_secret', 'jobs'}", section)
+        self.assertIn("set(payload['jobs']) == {", section)
+        self.assertIn("'daily_submit', 'daily_archive', 'review_processor', 'review_memory'", section)
+        self.assertIn("uid=ubuntu mode=700", section)
+        self.assertIn("uid=ubuntu mode=600", section)
+
+        create_pause = '''create_output="$(hermes cron create --name tradingagents-feishu-notifier --deliver local --no-agent --script tradingagents-feishu-notifier.sh --workdir "$PROJECT_DIR" '*/5 * * * *')"
+feishu_notifier_job_id="$(printf '%s\\n' "$create_output" | sed -n 's/.*Created job: \\([0-9a-f]\\{12\\}\\).*/\\1/p')"
+test "${#feishu_notifier_job_id}" -eq 12
+hermes cron pause "$feishu_notifier_job_id"'''
+        self.assertIn(create_pause, section)
+        self.assertNotIn(
+            "hermes cron create --name tradingagents-feishu-notifier",
+            section[: section.index("hermes_feishu_bootstrap initialize")],
+        )
+        self.assertIn("tests/test_hermes_feishu_state.py", section)
+        self.assertIn("tests/test_hermes_feishu_client.py", section)
+        self.assertIn("tests/test_hermes_feishu_notifier.py", section)
+        self.assertEqual(section.count("test --confirm-external-send"), 1)
+        self.assertIn("hermes cron status", section)
+        self.assertIn('hermes cron runs "$feishu_notifier_job_id" --limit 5', section)
+        self.assertIn("BTC/ETH/SOL", section)
+        self.assertIn("SHA-256", section)
+        rollback = section[section.index("### 回滚") :]
+        self.assertLess(
+            rollback.index('hermes cron pause "$feishu_notifier_job_id"'),
+            rollback.index('hermes cron runs "$feishu_notifier_job_id" --limit 5'),
+        )
+        self.assertLess(
+            rollback.index('hermes cron runs "$feishu_notifier_job_id" --limit 5'),
+            rollback.index('hermes cron remove "$feishu_notifier_job_id"'),
+        )
+        self.assertIn("不得删除已有 session、report、review、index、journal 或 memory", section)
+        self.assertIn("不得在 Git、shell history、Cron 参数、日志或输出中保存秘密", section)
 
     def test_daily_report_runbook_uses_paused_no_agent_local_jobs(self):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
