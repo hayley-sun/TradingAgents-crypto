@@ -30,7 +30,6 @@ RUN_LINE = re.compile(
     r"job=(?P<job_id>[0-9a-f]{12})  "
     r"source=(?P<source>[^\s]+)  (?P<claimed_at>[^\s]+)$"
 )
-RUN_HEADER_SHAPE = re.compile(r"(?:^|\s)job=\S+\s+source=\S+(?:\s|$)")
 EXECUTION_ID = re.compile(r"^[0-9a-f]{32}$")
 JOB_ID = re.compile(r"^[0-9a-f]{12}$")
 
@@ -140,7 +139,7 @@ def parse_cron_runs(output: str, job_id: str) -> tuple[CronExecution, ...]:
     for line in lines[first_nonempty:]:
         match = RUN_LINE.fullmatch(line)
         if match is None:
-            if RUN_HEADER_SHAPE.search(line) is not None:
+            if line and not line[0].isspace():
                 raise ExecutionDiscoveryError()
             continue
 

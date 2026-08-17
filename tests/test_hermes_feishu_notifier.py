@@ -66,6 +66,18 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assertEqual([item.status for item in records], ["completed", "failed"])
         self.assertNotIn("must-never-escape", repr(records))
 
+    def test_parse_discards_indented_detail_with_header_metadata_words(self):
+        marker = "opaque-detail-must-never-escape"
+        output = (
+            f"{run_header(1)}\n"
+            f"    {marker} job={JOB_ID} source=schedule\n"
+        )
+
+        records = parse_cron_runs(output, JOB_ID)
+
+        self.assertEqual(len(records), 1)
+        self.assertNotIn(marker, repr(records))
+
     def test_parse_rejects_unknown_preface_or_wrong_job(self):
         with self.assertRaises(ExecutionDiscoveryError):
             parse_cron_runs("unexpected preface\n", "e93cfab5f78e")
@@ -147,6 +159,14 @@ class HermesFeishuNotifierTests(unittest.TestCase):
             "malformed job ID": (
                 f"{'b' * 32}  failed     job=not-a-job-id  "
                 "source=schedule  2026-08-14T17:00:00+08:00"
+            ),
+            "missing source": (
+                f"{'b' * 32}  failed     job={JOB_ID}  "
+                "2026-08-14T17:00:00+08:00"
+            ),
+            "reordered metadata": (
+                f"{'b' * 32}  failed     source=schedule  "
+                f"job={JOB_ID}  2026-08-14T17:00:00+08:00"
             ),
         }
 
