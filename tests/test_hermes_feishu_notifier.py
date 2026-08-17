@@ -2905,6 +2905,32 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
             result = notifier.main(argv, config=config or notifier_config())
         return result, stream.getvalue()
 
+    def _failure_payload(self, mode):
+        return {
+            "ok": False,
+            "mode": mode,
+            "error": {
+                "code": "FEISHU_NOTIFIER_FAILED",
+                "message": "The Feishu notifier could not complete.",
+                "suggested_action": (
+                    "Inspect the safe notifier Cron result and private configuration."
+                ),
+            },
+        }
+
+    def _run_with_result(self, result):
+        with (
+            patch.object(notifier, "NotificationStateStore"),
+            patch.object(notifier, "FeishuClient"),
+            patch.object(notifier, "run_notifier_once", return_value=result),
+            patch.object(
+                notifier,
+                "_utc_now",
+                return_value=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            ),
+        ):
+            return self._main(["run"])
+
     def test_test_requires_exact_confirmation_without_runtime_dependencies(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -2966,7 +2992,9 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
             patch.object(notifier, "NotificationStateStore", return_value=store) as state_store,
             patch.object(notifier, "FeishuClient") as client,
             patch.object(
-                notifier, "initialize_notifier", return_value=(object(), expected)
+                notifier,
+                "initialize_notifier",
+                return_value=(empty_notification_state(), expected),
             ) as initialize,
             patch.object(notifier, "load_cron_runs", return_value=()) as runs,
             patch.object(notifier, "_load_report_inventory", return_value=object()) as inventory,
@@ -3013,6 +3041,99 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
         runs.assert_called_once_with(JOB_ID, hermes_cli=notifier.HERMES_CLI)
         inventory.assert_called_once_with(notifier.RESULTS_ROOT)
 
+    def test_initialize_rejects_nonexact_or_invalid_results(self):
+        payload = {"ok": True, "mode": "initialize"}
+        valid_state = empty_notification_state()
+        malformed = (
+            (valid_state,),
+            (valid_state, payload, "secret-marker"),
+            [valid_state, payload],
+            object(),
+            (object(), payload),
+            (valid_state, object()),
+        )
+        for result in malformed:
+            with self.subTest(result_type=type(result).__name__):
+                with (
+                    patch.object(notifier, "NotificationStateStore"),
+                    patch.object(notifier, "FeishuClient") as client,
+                    patch.object(
+                        notifier, "initialize_notifier", return_value=result
+                    ),
+                    patch.object(
+                        notifier,
+                        "_utc_now",
+                        return_value=datetime(2026, 8, 17, tzinfo=timezone.utc),
+                    ),
+                ):
+                    code, stdout = self._main(["initialize"])
+
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    json.loads(stdout), self._failure_payload("initialize")
+                )
+                self.assertEqual(stdout.count("\n"), 1)
+                self.assertNotIn("secret-marker", stdout)
+                client.assert_not_called()
+
+    def test_run_rejects_nonexact_or_invalid_results(self):
+        payload = {"ok": True, "mode": "run"}
+        malformed = (
+            (0,),
+            (0, payload, "secret-marker"),
+            [0, payload],
+            object(),
+            (True, payload),
+            ("0", payload),
+            (0, object()),
+        )
+        for result in malformed:
+            with self.subTest(result_type=type(result).__name__):
+                code, stdout = self._run_with_result(result)
+
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(stdout), self._failure_payload("run"))
+                self.assertEqual(stdout.count("\n"), 1)
+                self.assertNotIn("secret-marker", stdout)
+
+    def test_run_rejects_nonfinite_payload_values_before_printing(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            for payload in (
+                {"ok": True, "metric": value},
+                {"ok": True, "nested": {"metric": value}},
+            ):
+                with self.subTest(payload=repr(payload)):
+                    code, stdout = self._run_with_result((0, payload))
+
+                    self.assertEqual(code, 1)
+                    self.assertEqual(
+                        json.loads(stdout), self._failure_payload("run")
+                    )
+                    self.assertEqual(stdout.count("\n"), 1)
+                    self.assertNotIn("NaN", stdout)
+                    self.assertNotIn("Infinity", stdout)
+
+    def test_run_redacts_payload_serialization_failures(self):
+        deep_value = []
+        nested = deep_value
+        for _ in range(10_000):
+            child = []
+            nested.append(child)
+            nested = child
+        malformed_payloads = (
+            {"ok": True, "unsafe": object()},
+            {"ok": True, "circular": {}},
+            {"ok": True, "deep": deep_value},
+        )
+        malformed_payloads[1]["circular"]["self"] = malformed_payloads[1]
+        for payload in malformed_payloads:
+            with self.subTest(keys=tuple(payload)):
+                code, stdout = self._run_with_result((0, payload))
+
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(stdout), self._failure_payload("run"))
+                self.assertEqual(stdout.count("\n"), 1)
+
     def test_test_mode_sends_once_only_after_confirmation(self):
         now = datetime(2026, 8, 17, tzinfo=timezone.utc)
         config = notifier_config()
@@ -3057,6 +3178,42 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
         self.assertEqual(order, ["load", "import"])
         self.assertEqual(received, [(["run"], config)])
 
+    def test_rejects_boolean_or_noninteger_runner_return(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        expected = {
+            "ok": False,
+            "mode": "run",
+            "error": {
+                "code": "FEISHU_NOTIFIER_FAILED",
+                "message": "The Feishu notifier could not complete.",
+                "suggested_action": (
+                    "Inspect the safe notifier Cron result and private configuration."
+                ),
+            },
+        }
+        for result in (True, "1", None):
+            with self.subTest(result_type=type(result).__name__):
+                stream = io.StringIO()
+                runner = SimpleNamespace(
+                    main=lambda argv, *, config, result=result: result
+                )
+                with (
+                    patch.object(
+                        bootstrap,
+                        "load_private_config",
+                        return_value=notifier_config(),
+                    ),
+                    patch.object(bootstrap, "import_module", return_value=runner),
+                    patch("sys.stdout", stream),
+                    patch("sys.stderr", io.StringIO()),
+                ):
+                    code = bootstrap.main(["run"])
+
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(stream.getvalue()), expected)
+                self.assertEqual(stream.getvalue().count("\n"), 1)
+
     def test_startup_failures_are_constant_safe_json_and_do_not_import_after_config_failure(self):
         from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
 
@@ -3064,6 +3221,7 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
         for failure in ("config", "import", "runner"):
             with self.subTest(failure=failure):
                 stream = io.StringIO()
+                stderr = io.StringIO()
                 runner = SimpleNamespace(main=lambda argv, *, config: (_ for _ in ()).throw(RuntimeError(marker)))
                 with (
                     patch.object(
@@ -3077,13 +3235,18 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
                         side_effect=RuntimeError(marker) if failure == "import" else lambda name: runner,
                     ) as importer,
                     patch("sys.stdout", stream),
-                    patch("sys.stderr", io.StringIO()),
+                    patch("sys.stderr", stderr),
                 ):
                     code = bootstrap.main(["run"])
 
                 self.assertEqual(code, 1)
                 self.assertEqual(
-                    json.loads(stream.getvalue()),
+                    json.loads(
+                        stream.getvalue(),
+                        parse_constant=lambda value: self.fail(
+                            f"non-finite JSON value: {value}"
+                        ),
+                    ),
                     {
                         "ok": False,
                         "mode": "run",
@@ -3097,6 +3260,9 @@ class HermesFeishuBootstrapTests(unittest.TestCase):
                     },
                 )
                 self.assertNotIn(marker, stream.getvalue())
+                self.assertNotIn("NaN", stream.getvalue())
+                self.assertNotIn("Infinity", stream.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
                 if failure == "config":
                     importer.assert_not_called()
 

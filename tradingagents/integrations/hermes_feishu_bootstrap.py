@@ -40,7 +40,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("invalid notifier result")
         return result
     except Exception:
-        print(json.dumps(_failure(), ensure_ascii=True, sort_keys=True))
+        print(
+            json.dumps(
+                _failure(), ensure_ascii=True, sort_keys=True, allow_nan=False
+            )
+        )
         return 1
 
 

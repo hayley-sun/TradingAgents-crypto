@@ -1422,7 +1422,45 @@ def _safe_mode(argv: object) -> str:
 
 
 def _print_payload(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+    print(
+        json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, allow_nan=False
+        )
+    )
+
+
+def _print_cli_failure(mode: str) -> None:
+    """Print the finite constant fallback without recursing on failures."""
+
+    print(
+        json.dumps(
+            _cli_failure(mode), ensure_ascii=True, sort_keys=True, allow_nan=False
+        )
+    )
+
+
+def _initialize_cli_result(
+    result: object,
+) -> tuple[int, dict[str, object]]:
+    if (
+        type(result) is not tuple
+        or len(result) != 2
+        or not isinstance(result[0], NotificationState)
+        or not isinstance(result[1], dict)
+    ):
+        raise ValueError("invalid notifier result")
+    return 0, result[1]
+
+
+def _run_cli_result(result: object) -> tuple[int, dict[str, object]]:
+    if (
+        type(result) is not tuple
+        or len(result) != 2
+        or type(result[0]) is not int
+        or not isinstance(result[1], dict)
+    ):
+        raise ValueError("invalid notifier result")
+    return result[0], result[1]
 
 
 def _runtime_loaders() -> tuple[
@@ -1468,7 +1506,7 @@ def main(
             result = initialize_notifier(
                 store, config, execution_loader, archive_loader, now
             )
-            code, payload = 0, result[1]
+            code, payload = _initialize_cli_result(result)
         elif arguments.mode == "run":
             store = NotificationStateStore(STATE_ROOT)
             client = FeishuClient(config)
@@ -1476,7 +1514,7 @@ def main(
             result = run_notifier_once(
                 store, config, client, execution_loader, archive_loader, now
             )
-            code, payload = result[0], result[1]
+            code, payload = _run_cli_result(result)
         else:
             client = FeishuClient(config)
             code, payload = 0, send_test_card(config, client, now)
@@ -1484,7 +1522,7 @@ def main(
             raise ValueError("invalid notifier result")
         _print_payload(payload)
     except Exception:
-        _print_payload(_cli_failure(arguments.mode))
+        _print_cli_failure(arguments.mode)
         return 1
 
     return code
