@@ -53,6 +53,7 @@ class FeishuNotifierConfig(BaseModel):
 
         invalid = (
             parts.scheme != "https"
+            or parts.netloc not in ("open.feishu.cn", "open.feishu.cn:443")
             or parts.hostname != "open.feishu.cn"
             or port not in (None, 443)
             or parts.username is not None

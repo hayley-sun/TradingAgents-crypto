@@ -92,6 +92,16 @@ class FeishuNotifierConfigTests(unittest.TestCase):
                     }
                 )
 
+    def test_config_rejects_explicit_empty_port(self):
+        url = config_payload()["webhook_url"].replace(
+            "open.feishu.cn", "open.feishu.cn:"
+        )
+
+        with self.assertRaises(ValidationError):
+            FeishuNotifierConfig.model_validate(
+                {**config_payload(), "webhook_url": url}
+            )
+
     def test_config_rejects_query_fragment_and_non_default_port(self):
         base_url = config_payload()["webhook_url"]
         for url in (
