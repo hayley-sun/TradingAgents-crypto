@@ -79,6 +79,19 @@ class FeishuNotifierConfigTests(unittest.TestCase):
                     {**config_payload(), "webhook_url": url}
                 )
 
+    def test_config_rejects_userinfo_on_otherwise_valid_urls(self):
+        path = "/open-apis/bot/v2/hook/0000000000000000"
+        for userinfo in ("user@", "user:pass@"):
+            with self.subTest(userinfo=userinfo), self.assertRaises(
+                ValidationError
+            ):
+                FeishuNotifierConfig.model_validate(
+                    {
+                        **config_payload(),
+                        "webhook_url": f"https://{userinfo}open.feishu.cn{path}",
+                    }
+                )
+
     def test_config_rejects_query_fragment_and_non_default_port(self):
         base_url = config_payload()["webhook_url"]
         for url in (
@@ -87,6 +100,30 @@ class FeishuNotifierConfigTests(unittest.TestCase):
             base_url.replace("open.feishu.cn", "open.feishu.cn:8443"),
         ):
             with self.subTest(url=url), self.assertRaises(ValidationError):
+                FeishuNotifierConfig.model_validate(
+                    {**config_payload(), "webhook_url": url}
+                )
+
+    def test_config_rejects_empty_query_or_fragment_delimiters(self):
+        base_url = config_payload()["webhook_url"]
+        for suffix in ("?", "#", "?#"):
+            with self.subTest(suffix=suffix), self.assertRaises(ValidationError):
+                FeishuNotifierConfig.model_validate(
+                    {**config_payload(), "webhook_url": f"{base_url}{suffix}"}
+                )
+
+    def test_config_rejects_raw_url_spaces_and_ascii_controls(self):
+        base_url = config_payload()["webhook_url"]
+        invalid_urls = {
+            "leading space": f" {base_url}",
+            "leading NUL": f"\x00{base_url}",
+            "leading tab": f"\t{base_url}",
+            "embedded newline": base_url.replace("open-apis", "open-\napis"),
+            "embedded tab": base_url.replace("/hook/", "/hook/\t"),
+        }
+
+        for case, url in invalid_urls.items():
+            with self.subTest(case=case), self.assertRaises(ValidationError):
                 FeishuNotifierConfig.model_validate(
                     {**config_payload(), "webhook_url": url}
                 )

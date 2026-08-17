@@ -39,6 +39,12 @@ class FeishuNotifierConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_boundary(self) -> Self:
+        if (
+            re.search(r"[\x00-\x20\x7f]", self.webhook_url) is not None
+            or "?" in self.webhook_url
+            or "#" in self.webhook_url
+        ):
+            raise ValueError("invalid Feishu notifier configuration")
         try:
             parts = urlsplit(self.webhook_url)
             port = parts.port
