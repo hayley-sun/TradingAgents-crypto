@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import io
 import json
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -2894,6 +2896,227 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
                 },
             },
         )
+
+
+class HermesFeishuNotifierCliTests(unittest.TestCase):
+    def _main(self, argv, config=None):
+        stream = io.StringIO()
+        with patch("sys.stdout", stream), patch("sys.stderr", io.StringIO()):
+            result = notifier.main(argv, config=config or notifier_config())
+        return result, stream.getvalue()
+
+    def test_test_requires_exact_confirmation_without_runtime_dependencies(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(notifier, "NotificationStateStore") as store,
+            patch.object(notifier, "FeishuClient") as client,
+            patch.object(notifier, "load_cron_runs") as runs,
+            patch.object(notifier, "_load_report_inventory") as inventory,
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
+        ):
+            code = notifier.main(["test"], config=notifier_config())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "ok": False,
+                "mode": "test",
+                "error": {
+                    "code": "INVALID_NOTIFY_REQUEST",
+                    "message": "The Feishu notifier request is invalid.",
+                    "suggested_action": (
+                        "Use initialize, run, or explicitly confirmed test mode."
+                    ),
+                },
+            },
+        )
+        self.assertTrue(stdout.getvalue().isascii())
+        self.assertEqual(stderr.getvalue(), "")
+        store.assert_not_called()
+        client.assert_not_called()
+        runs.assert_not_called()
+        inventory.assert_not_called()
+
+    def test_rejects_every_form_except_the_three_exact_commands(self):
+        rejected = (
+            [],
+            ["unknown"],
+            ["initialize", "extra"],
+            ["run", "--confirm-external-send"],
+            ["test", "--confirm-external-send", "--confirm-external-send"],
+            ["test", "--confirm-external-sends"],
+            ["test", "--confirm-external-send", "extra"],
+        )
+        for argv in rejected:
+            with self.subTest(argv=argv):
+                code, stdout = self._main(list(argv))
+                payload = json.loads(stdout)
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["error"]["code"], "INVALID_NOTIFY_REQUEST")
+                self.assertEqual(stdout.count("\n"), 1)
+
+    def test_initialize_uses_no_client_and_fixed_runtime_dependencies(self):
+        now = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        store = SimpleNamespace()
+        expected = {"ok": True, "mode": "initialize"}
+        with (
+            patch.object(notifier, "NotificationStateStore", return_value=store) as state_store,
+            patch.object(notifier, "FeishuClient") as client,
+            patch.object(
+                notifier, "initialize_notifier", return_value=(object(), expected)
+            ) as initialize,
+            patch.object(notifier, "load_cron_runs", return_value=()) as runs,
+            patch.object(notifier, "_load_report_inventory", return_value=object()) as inventory,
+            patch.object(notifier, "_utc_now", return_value=now),
+        ):
+            code, stdout = self._main(["initialize"])
+            execution_loader = initialize.call_args.args[2]
+            archive_loader = initialize.call_args.args[3]
+            execution_loader(JOB_ID)
+            archive_loader()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), expected)
+        state_store.assert_called_once_with(notifier.STATE_ROOT)
+        client.assert_not_called()
+        initialize.assert_called_once()
+        self.assertEqual(initialize.call_args.args[4], now)
+        runs.assert_called_once_with(JOB_ID, hermes_cli=notifier.HERMES_CLI)
+        inventory.assert_called_once_with(notifier.RESULTS_ROOT)
+
+    def test_run_constructs_configured_client_and_uses_fixed_defaults(self):
+        now = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        store = SimpleNamespace()
+        expected = {"ok": True, "mode": "run", "discovered": 0, "delivered": 0, "pending": 0}
+        config = notifier_config()
+        with (
+            patch.object(notifier, "NotificationStateStore", return_value=store),
+            patch.object(notifier, "FeishuClient") as client,
+            patch.object(notifier, "run_notifier_once", return_value=(0, expected)) as run_once,
+            patch.object(notifier, "load_cron_runs", return_value=()) as runs,
+            patch.object(notifier, "_load_report_inventory", return_value=object()) as inventory,
+            patch.object(notifier, "_utc_now", return_value=now),
+        ):
+            code, stdout = self._main(["run"], config)
+            args = run_once.call_args.args
+            args[3](JOB_ID)
+            args[4]()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), expected)
+        client.assert_called_once_with(config)
+        self.assertEqual(args[:3], (store, config, client.return_value))
+        self.assertEqual(args[5], now)
+        runs.assert_called_once_with(JOB_ID, hermes_cli=notifier.HERMES_CLI)
+        inventory.assert_called_once_with(notifier.RESULTS_ROOT)
+
+    def test_test_mode_sends_once_only_after_confirmation(self):
+        now = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        config = notifier_config()
+        expected = {"ok": True, "mode": "test", "event_id": "test:ok"}
+        with (
+            patch.object(notifier, "NotificationStateStore") as store,
+            patch.object(notifier, "FeishuClient") as client,
+            patch.object(notifier, "send_test_card", return_value=expected) as send,
+            patch.object(notifier, "_utc_now", return_value=now),
+        ):
+            code, stdout = self._main(["test", "--confirm-external-send"], config)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), expected)
+        store.assert_not_called()
+        client.assert_called_once_with(config)
+        send.assert_called_once_with(config, client.return_value, now)
+
+
+class HermesFeishuBootstrapTests(unittest.TestCase):
+    def test_loads_config_before_late_runner_import_and_preserves_arguments(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        config = notifier_config()
+        received = []
+
+        def runner_main(argv, *, config):
+            received.append((argv, config))
+            return 7
+
+        runner = SimpleNamespace(main=runner_main)
+        order = []
+        with (
+            patch.object(bootstrap, "load_private_config", side_effect=lambda path: order.append("load") or config),
+            patch.object(bootstrap, "import_module", side_effect=lambda name: order.append("import") or runner),
+            patch("sys.stdout", io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            code = bootstrap.main(["run"])
+
+        self.assertEqual(code, 7)
+        self.assertEqual(order, ["load", "import"])
+        self.assertEqual(received, [(["run"], config)])
+
+    def test_startup_failures_are_constant_safe_json_and_do_not_import_after_config_failure(self):
+        from tradingagents.integrations import hermes_feishu_bootstrap as bootstrap
+
+        marker = "https://example.invalid/hook/secret-signature"
+        for failure in ("config", "import", "runner"):
+            with self.subTest(failure=failure):
+                stream = io.StringIO()
+                runner = SimpleNamespace(main=lambda argv, *, config: (_ for _ in ()).throw(RuntimeError(marker)))
+                with (
+                    patch.object(
+                        bootstrap,
+                        "load_private_config",
+                        side_effect=RuntimeError(marker) if failure == "config" else notifier_config(),
+                    ),
+                    patch.object(
+                        bootstrap,
+                        "import_module",
+                        side_effect=RuntimeError(marker) if failure == "import" else lambda name: runner,
+                    ) as importer,
+                    patch("sys.stdout", stream),
+                    patch("sys.stderr", io.StringIO()),
+                ):
+                    code = bootstrap.main(["run"])
+
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    json.loads(stream.getvalue()),
+                    {
+                        "ok": False,
+                        "mode": "run",
+                        "error": {
+                            "code": "FEISHU_NOTIFIER_FAILED",
+                            "message": "The Feishu notifier could not complete.",
+                            "suggested_action": (
+                                "Inspect the safe notifier Cron result and private configuration."
+                            ),
+                        },
+                    },
+                )
+                self.assertNotIn(marker, stream.getvalue())
+                if failure == "config":
+                    importer.assert_not_called()
+
+    def test_wrapper_is_exact_executable_no_agent_command(self):
+        wrapper = (
+            Path(__file__).parents[1]
+            / "deploy"
+            / "hermes"
+            / "scripts"
+            / "tradingagents-feishu-notifier.sh"
+        )
+        self.assertEqual(
+            wrapper.read_text(encoding="ascii"),
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n\n"
+            "PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto\n"
+            "exec \"$PROJECT_DIR/.venv-hermes-mcp/bin/python\" -m "
+            "tradingagents.integrations.hermes_feishu_bootstrap run \"$@\"\n",
+        )
+        self.assertNotEqual(wrapper.stat().st_mode & 0o111, 0)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
 """Fail-closed discovery of Hermes Cron execution events."""
 
+import argparse
 import hashlib
+import json
 import os
 import re
 import stat
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -17,6 +20,8 @@ from pydantic import ValidationError
 from tradingagents.integrations.hermes_feishu_client import (
     EXPECTED_JOB_NAMES,
     FeishuDeliveryError,
+    FeishuClient,
+    FeishuNotifierConfig,
     ReportCardData,
     ReportCardItem,
     render_failure_card,
@@ -31,6 +36,7 @@ from tradingagents.integrations.hermes_feishu_state import (
     NotificationEvent,
     NotificationState,
     NotificationStateError,
+    NotificationStateStore,
     initialized_state,
     retry_delay,
 )
@@ -47,6 +53,9 @@ NONTERMINAL_EXECUTION_STATUSES = frozenset({"claimed", "running"})
 EXECUTION_ERROR_MESSAGE = "Hermes execution history unavailable"
 NO_EXECUTIONS_LINE = "No cron execution attempts recorded."
 DEFAULT_HERMES_CLI = Path("/home/ubuntu/.local/bin/hermes")
+RESULTS_ROOT = Path.cwd() / "results"
+STATE_ROOT = RESULTS_ROOT / "hermes" / "feishu_notifications"
+HERMES_CLI = Path.home() / ".local" / "bin" / "hermes"
 MAX_EXECUTION_ROWS = 500
 MAX_BATCH_BYTES = 1_048_576
 MAX_REPORT_BYTES = 20 * 1_048_576
@@ -1362,3 +1371,120 @@ def send_test_card(
     event_id = f"test:{utc_now.isoformat()}"
     client.send(render_test_card(event_id, checked_now))
     return {"ok": True, "mode": "test", "event_id": event_id}
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _invalid_request(mode: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "mode": mode,
+        "error": {
+            "code": "INVALID_NOTIFY_REQUEST",
+            "message": "The Feishu notifier request is invalid.",
+            "suggested_action": (
+                "Use initialize, run, or explicitly confirmed test mode."
+            ),
+        },
+    }
+
+
+def _cli_failure(mode: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "mode": mode,
+        "error": {
+            "code": "FEISHU_NOTIFIER_FAILED",
+            "message": "The Feishu notifier could not complete.",
+            "suggested_action": (
+                "Inspect the safe notifier Cron result and private configuration."
+            ),
+        },
+    }
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ValueError(message)
+
+
+def _safe_mode(argv: object) -> str:
+    if isinstance(argv, Sequence) and not isinstance(argv, (str, bytes)):
+        if argv and isinstance(argv[0], str) and argv[0] in {
+            "initialize",
+            "run",
+            "test",
+        }:
+            return argv[0]
+    return "unknown"
+
+
+def _print_payload(payload: dict[str, object]) -> None:
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+
+
+def _runtime_loaders() -> tuple[
+    Callable[[str], Sequence[CronExecution]], Callable[[], object]
+]:
+    return (
+        lambda job_id: load_cron_runs(job_id, hermes_cli=HERMES_CLI),
+        lambda: _load_report_inventory(RESULTS_ROOT),
+    )
+
+
+def main(
+    argv: Sequence[str] | None = None, *, config: FeishuNotifierConfig
+) -> int:
+    """Run one explicitly selected Feishu notifier mode."""
+
+    try:
+        raw_argv = list(sys.argv[1:] if argv is None else argv)
+    except TypeError:
+        raw_argv = []
+    mode = _safe_mode(raw_argv)
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("mode", choices=("initialize", "run", "test"))
+    parser.add_argument("--confirm-external-send", action="store_true")
+    try:
+        arguments = parser.parse_args(raw_argv)
+        expected_argv = (
+            ["test", "--confirm-external-send"]
+            if arguments.mode == "test"
+            else [arguments.mode]
+        )
+        if raw_argv != expected_argv:
+            raise ValueError("invalid confirmation")
+    except (TypeError, ValueError):
+        _print_payload(_invalid_request(mode))
+        return 1
+
+    try:
+        now = _utc_now()
+        if arguments.mode == "initialize":
+            store = NotificationStateStore(STATE_ROOT)
+            execution_loader, archive_loader = _runtime_loaders()
+            result = initialize_notifier(
+                store, config, execution_loader, archive_loader, now
+            )
+            code, payload = 0, result[1]
+        elif arguments.mode == "run":
+            store = NotificationStateStore(STATE_ROOT)
+            client = FeishuClient(config)
+            execution_loader, archive_loader = _runtime_loaders()
+            result = run_notifier_once(
+                store, config, client, execution_loader, archive_loader, now
+            )
+            code, payload = result[0], result[1]
+        else:
+            client = FeishuClient(config)
+            code, payload = 0, send_test_card(config, client, now)
+        if type(code) is not int or not isinstance(payload, dict):
+            raise ValueError("invalid notifier result")
+        _print_payload(payload)
+    except Exception:
+        _print_payload(_cli_failure(arguments.mode))
+        return 1
+
+    return code
