@@ -12,7 +12,10 @@ from tradingagents.integrations.hermes_feishu_notifier import (
     load_cron_runs,
     parse_cron_runs,
 )
-from tradingagents.integrations.hermes_feishu_state import initialized_state
+from tradingagents.integrations.hermes_feishu_state import (
+    DeliveryRecord,
+    initialized_state,
+)
 
 
 JOB_ID = "e93cfab5f78e"
@@ -366,6 +369,65 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assert_safe_discovery_error(raised.exception)
         self.assertFalse(called)
 
+    def test_loader_rejects_malformed_cli_path_without_running_command(self):
+        marker = "path-marker-must-never-escape"
+        called = False
+
+        class InvalidPath:
+            def __fspath__(self):
+                raise TypeError(marker)
+
+        def run(command, **kwargs):
+            nonlocal called
+            called = True
+
+        for hermes_cli, forbidden_markers in (
+            (None, ()),
+            (InvalidPath(), (marker,)),
+        ):
+            with self.subTest(hermes_cli=hermes_cli):
+                with self.assertRaises(ExecutionDiscoveryError) as raised:
+                    load_cron_runs(
+                        JOB_ID, run_command=run, hermes_cli=hermes_cli
+                    )
+                self.assert_safe_discovery_error(
+                    raised.exception, *forbidden_markers
+                )
+                self.assertFalse(called)
+
+    def test_loader_rejects_malformed_process_results_safely(self):
+        malformed_results = {
+            "wrong result type": object(),
+            "boolean return code": CompletedProcess(
+                [], False, RUNS_OUTPUT, ""
+            ),
+            "float return code": CompletedProcess([], 0.0, RUNS_OUTPUT, ""),
+            "non-string stdout": CompletedProcess(
+                [], 0, b"stdout-marker-must-never-escape", ""
+            ),
+        }
+
+        for case, result in malformed_results.items():
+            with self.subTest(case=case):
+                with self.assertRaises(ExecutionDiscoveryError) as raised:
+                    load_cron_runs(
+                        JOB_ID, run_command=lambda command, **kwargs: result
+                    )
+                self.assert_safe_discovery_error(
+                    raised.exception, "stdout-marker-must-never-escape"
+                )
+
+    def test_loader_rejects_runner_type_error_without_exposing_context(self):
+        marker = "runner-marker-must-never-escape"
+
+        def run(command, **kwargs):
+            raise TypeError(marker)
+
+        with self.assertRaises(ExecutionDiscoveryError) as raised:
+            load_cron_runs(JOB_ID, run_command=run)
+
+        self.assert_safe_discovery_error(raised.exception, marker)
+
     def test_discovery_rejects_cursor_missing_from_nonempty_window(self):
         start = datetime(2026, 8, 14, tzinfo=timezone.utc)
         rows = tuple(
@@ -421,6 +483,154 @@ class HermesFeishuNotifierTests(unittest.TestCase):
             [newest_id, first_new_id, cursor_id, older_id],
         )
         self.assertEqual(completed, ())
+
+    def test_running_transition_to_failed_emits_once(self):
+        claimed_at = datetime(2026, 8, 14, 12, tzinfo=timezone.utc)
+        execution_id = "a" * 32
+        running = cron_execution(execution_id, "running", claimed_at)
+
+        running_state, events, completed = discover_execution_events(
+            state_with_cursor(JOB_ID, None),
+            "review_memory",
+            JOB_ID,
+            (running,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+
+        self.assertEqual(events, ())
+        self.assertEqual(completed, ())
+        self.assertIsNone(running_state.execution_cursors[JOB_ID])
+        self.assertEqual(
+            running_state.seen_execution_ids[JOB_ID], [execution_id]
+        )
+
+        failed = cron_execution(execution_id, "failed", claimed_at)
+        failed_state, events, completed = discover_execution_events(
+            running_state,
+            "review_memory",
+            JOB_ID,
+            (failed,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+
+        self.assertEqual(
+            [event.event_id for event in events],
+            [f"failure:{JOB_ID}:{execution_id}"],
+        )
+        self.assertEqual(completed, ())
+        self.assertEqual(failed_state.execution_cursors[JOB_ID], execution_id)
+
+        stable_state, events, completed = discover_execution_events(
+            failed_state,
+            "review_memory",
+            JOB_ID,
+            (failed,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+        self.assertEqual(events, ())
+        self.assertEqual(completed, ())
+        self.assertEqual(stable_state, failed_state)
+
+    def test_running_archive_transition_to_completed_is_returned_once(self):
+        claimed_at = datetime(2026, 8, 14, 12, tzinfo=timezone.utc)
+        execution_id = "a" * 32
+        running = cron_execution(
+            execution_id,
+            "running",
+            claimed_at,
+            job_id=ARCHIVE_JOB_ID,
+        )
+
+        running_state, events, completed = discover_execution_events(
+            state_with_cursor(ARCHIVE_JOB_ID, None),
+            "daily_archive",
+            ARCHIVE_JOB_ID,
+            (running,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+
+        self.assertEqual(events, ())
+        self.assertEqual(completed, ())
+        self.assertIsNone(running_state.execution_cursors[ARCHIVE_JOB_ID])
+
+        complete = cron_execution(
+            execution_id,
+            "completed",
+            claimed_at,
+            job_id=ARCHIVE_JOB_ID,
+        )
+        complete_state, events, completed = discover_execution_events(
+            running_state,
+            "daily_archive",
+            ARCHIVE_JOB_ID,
+            (complete,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+
+        self.assertEqual(events, ())
+        self.assertEqual(completed, (complete,))
+        self.assertEqual(
+            complete_state.execution_cursors[ARCHIVE_JOB_ID], execution_id
+        )
+
+        stable_state, events, completed = discover_execution_events(
+            complete_state,
+            "daily_archive",
+            ARCHIVE_JOB_ID,
+            (complete,),
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+        self.assertEqual(events, ())
+        self.assertEqual(completed, ())
+        self.assertEqual(stable_state, complete_state)
+
+    def test_newer_failure_is_not_delayed_by_older_running_execution(self):
+        base = datetime(2026, 8, 14, tzinfo=timezone.utc)
+        cursor_id = "a" * 32
+        running_id = "b" * 32
+        failed_id = "c" * 32
+        rows = (
+            cron_execution(failed_id, "failed", base + timedelta(hours=2)),
+            cron_execution(running_id, "running", base + timedelta(hours=1)),
+            cron_execution(cursor_id, "completed", base),
+        )
+
+        updated, events, completed = discover_execution_events(
+            state_with_cursor(JOB_ID, cursor_id),
+            "review_memory",
+            JOB_ID,
+            rows,
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+
+        self.assertEqual(
+            [event.execution_id for event in events], [failed_id]
+        )
+        self.assertEqual(completed, ())
+        self.assertEqual(updated.execution_cursors[JOB_ID], cursor_id)
+        self.assertEqual(
+            updated.seen_execution_ids[JOB_ID],
+            [failed_id, running_id, cursor_id],
+        )
+
+        event = events[0]
+        persisted = updated.model_copy(
+            update={
+                "deliveries": {
+                    event.event_id: DeliveryRecord(
+                        event=event, next_attempt_at=event.created_at
+                    )
+                }
+            }
+        )
+        _, repeated_events, _ = discover_execution_events(
+            persisted,
+            "review_memory",
+            JOB_ID,
+            rows,
+            daily_archive_job_id=ARCHIVE_JOB_ID,
+        )
+        self.assertEqual(repeated_events, ())
 
     def test_unknown_is_seen_without_creating_an_alert(self):
         claimed_at = datetime(2026, 8, 14, 12, tzinfo=timezone.utc)

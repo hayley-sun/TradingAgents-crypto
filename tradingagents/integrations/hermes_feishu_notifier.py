@@ -20,6 +20,7 @@ ExecutionStatus = Literal[
 EXECUTION_STATUSES = frozenset(
     {"claimed", "running", "completed", "failed", "unknown"}
 )
+NONTERMINAL_EXECUTION_STATUSES = frozenset({"claimed", "running"})
 EXECUTION_ERROR_MESSAGE = "Hermes execution history unavailable"
 NO_EXECUTIONS_LINE = "No cron execution attempts recorded."
 DEFAULT_HERMES_CLI = Path("/home/ubuntu/.local/bin/hermes")
@@ -169,6 +170,31 @@ def parse_cron_runs(output: str, job_id: str) -> tuple[CronExecution, ...]:
     return _normalize_rows(records)
 
 
+def _absolute_cli_path(value: object) -> Path | None:
+    try:
+        path = Path(value)
+        absolute = path.is_absolute()
+    except Exception:
+        return None
+    return path if absolute else None
+
+
+def _successful_stdout(result: object) -> str | None:
+    if not isinstance(result, subprocess.CompletedProcess):
+        return None
+    try:
+        returncode = result.returncode
+    except Exception:
+        return None
+    if type(returncode) is not int or returncode != 0:
+        return None
+    try:
+        stdout = result.stdout
+    except Exception:
+        return None
+    return stdout if isinstance(stdout, str) else None
+
+
 def load_cron_runs(
     job_id: str,
     *,
@@ -179,8 +205,8 @@ def load_cron_runs(
 
     if not _is_job_id(job_id):
         raise ExecutionDiscoveryError()
-    cli_path = Path(hermes_cli)
-    if not cli_path.is_absolute():
+    cli_path = _absolute_cli_path(hermes_cli)
+    if cli_path is None:
         raise ExecutionDiscoveryError()
 
     command = [
@@ -192,7 +218,7 @@ def load_cron_runs(
         str(MAX_EXECUTION_ROWS),
     ]
     process_failed = False
-    result: subprocess.CompletedProcess[str] | None = None
+    result: object = None
     try:
         result = run_command(
             command,
@@ -201,12 +227,15 @@ def load_cron_runs(
             timeout=20,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+    except Exception:
         process_failed = True
 
-    if process_failed or result is None or result.returncode != 0:
+    if process_failed:
         raise ExecutionDiscoveryError()
-    return parse_cron_runs(result.stdout, job_id)
+    stdout = _successful_stdout(result)
+    if stdout is None:
+        raise ExecutionDiscoveryError()
+    return parse_cron_runs(stdout, job_id)
 
 
 def discover_execution_events(
@@ -248,18 +277,27 @@ def discover_execution_events(
 
     failure_events: list[NotificationEvent] = []
     completed_archive_rows: list[CronExecution] = []
+    advanced_cursor = cursor
+    cursor_blocked = False
     for row in new_rows_oldest_first:
+        if not cursor_blocked:
+            if row.status in NONTERMINAL_EXECUTION_STATUSES:
+                cursor_blocked = True
+            else:
+                advanced_cursor = row.execution_id
         if row.status == "failed":
-            failure_events.append(
-                NotificationEvent(
-                    event_id=f"failure:{job_id}:{row.execution_id}",
-                    kind="execution_failure",
-                    created_at=row.claimed_at,
-                    job_name=job_name,
-                    job_id=job_id,
-                    execution_id=row.execution_id,
+            event_id = f"failure:{job_id}:{row.execution_id}"
+            if event_id not in state.deliveries:
+                failure_events.append(
+                    NotificationEvent(
+                        event_id=event_id,
+                        kind="execution_failure",
+                        created_at=row.claimed_at,
+                        job_name=job_name,
+                        job_id=job_id,
+                        execution_id=row.execution_id,
+                    )
                 )
-            )
         elif row.status == "completed" and job_id == daily_archive_job_id:
             completed_archive_rows.append(row)
 
@@ -268,10 +306,7 @@ def discover_execution_events(
         existing_job_id: list(execution_ids)
         for existing_job_id, execution_ids in state.seen_execution_ids.items()
     }
-    if newest_first:
-        execution_cursors[job_id] = newest_first[0].execution_id
-    elif job_id not in execution_cursors:
-        execution_cursors[job_id] = None
+    execution_cursors[job_id] = advanced_cursor
     seen_execution_ids[job_id] = observed_ids
     updated_state = state.model_copy(
         update={
