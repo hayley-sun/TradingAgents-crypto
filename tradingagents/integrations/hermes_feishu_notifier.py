@@ -1,17 +1,28 @@
 """Fail-closed discovery of Hermes Cron execution events."""
 
+import hashlib
+import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal, TypeGuard
+from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
+from tradingagents.integrations.hermes_feishu_client import (
+    ReportCardData,
+    ReportCardItem,
+)
 from tradingagents.integrations.hermes_feishu_state import (
     NotificationEvent,
     NotificationState,
 )
+from tradingagents.integrations.schemas import DailyReportBatch
 
 
 ExecutionStatus = Literal[
@@ -25,6 +36,10 @@ EXECUTION_ERROR_MESSAGE = "Hermes execution history unavailable"
 NO_EXECUTIONS_LINE = "No cron execution attempts recorded."
 DEFAULT_HERMES_CLI = Path("/home/ubuntu/.local/bin/hermes")
 MAX_EXECUTION_ROWS = 500
+MAX_BATCH_BYTES = 1_048_576
+MAX_REPORT_BYTES = 20 * 1_048_576
+REPORT_DISCOVERY_ERROR_MESSAGE = "daily report archive unavailable"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 RUN_LINE = re.compile(
     r"^(?P<id>[0-9a-f]{32})  "
     r"(?P<status>claimed|running|completed|failed|unknown)\s+"
@@ -40,6 +55,42 @@ class ExecutionDiscoveryError(RuntimeError):
 
     def __init__(self, *_ignored: object) -> None:
         super().__init__(EXECUTION_ERROR_MESSAGE)
+
+
+class ReportDiscoveryError(RuntimeError):
+    """Raised without preserving untrusted report archive details."""
+
+    def __init__(self, *_ignored: object) -> None:
+        super().__init__(REPORT_DISCOVERY_ERROR_MESSAGE)
+
+
+@dataclass(frozen=True)
+class VerifiedArchive:
+    """A hash-verified archive with structured data for notification cards."""
+
+    trade_date: date
+    batch_id: str
+    report_sha256: str
+    state: str
+    items: tuple[ReportCardItem, ...]
+    report_path: Path
+    archived_at: datetime
+    previous: "VerifiedArchive | None" = None
+
+    @property
+    def event_id(self) -> str:
+        return (
+            f"report:{self.trade_date.isoformat()}:{self.report_sha256}"
+        )
+
+    def to_card_data(self, event_id: str) -> ReportCardData:
+        return ReportCardData(
+            event_id=event_id,
+            trade_date=self.trade_date,
+            state=self.state,
+            items=self.items,
+            report_path=self.report_path,
+        )
 
 
 def _is_job_id(value: object) -> TypeGuard[str]:
@@ -236,6 +287,255 @@ def load_cron_runs(
     if stdout is None:
         raise ExecutionDiscoveryError()
     return parse_cron_runs(stdout, job_id)
+
+
+def _read_regular_bytes(path: Path, maximum_size: int) -> bytes:
+    """Read a bounded regular file without following a leaf symlink."""
+
+    descriptor: int | None = None
+    try:
+        initial_metadata = os.lstat(path)
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise OSError("symlinked source")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum_size:
+            raise OSError("invalid source")
+        chunks: list[bytes] = []
+        remaining = maximum_size
+        while True:
+            chunk = os.read(descriptor, min(65_536, remaining + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining < 0:
+                raise OSError("oversized source")
+        return b"".join(chunks)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _report_paths(results_root: Path) -> tuple[Path, Path]:
+    root = Path(results_root)
+    hermes_root = root / "hermes"
+    if hermes_root.is_symlink():
+        raise OSError("invalid Hermes directory")
+    return (
+        hermes_root / "report_batches",
+        hermes_root / "reports",
+    )
+
+
+def _is_aware(value: object) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    try:
+        return value.utcoffset() is not None
+    except (OverflowError, ValueError):
+        return False
+
+
+def _load_report_batches(results_root: Path) -> tuple[DailyReportBatch, ...]:
+    """Fully validate every persisted batch JSON before exposing any batch."""
+
+    try:
+        batches_root, _ = _report_paths(results_root)
+        if batches_root.is_symlink():
+            raise OSError("invalid batch directory")
+        if not batches_root.exists():
+            return ()
+        if not batches_root.is_dir():
+            raise OSError("invalid batch directory")
+        paths = sorted(
+            (path for path in batches_root.iterdir() if path.suffix == ".json"),
+            key=lambda path: path.name,
+        )
+        batches: list[DailyReportBatch] = []
+        seen_dates: set[date] = set()
+        for path in paths:
+            raw = _read_regular_bytes(path, MAX_BATCH_BYTES)
+            text = raw.decode("utf-8")
+            batch = DailyReportBatch.model_validate_json(text)
+            expected_name = f"{batch.request.trade_date.isoformat()}.json"
+            if path.name != expected_name or batch.request.trade_date in seen_dates:
+                raise ValueError("invalid canonical batch")
+            if not _is_aware(batch.created_at):
+                raise ValueError("naive batch timestamp")
+            seen_dates.add(batch.request.trade_date)
+            batches.append(batch)
+        return tuple(sorted(batches, key=lambda batch: batch.request.trade_date))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        TypeError,
+    ):
+        pass
+    raise ReportDiscoveryError()
+
+
+def load_verified_archives(results_root: Path) -> tuple[VerifiedArchive, ...]:
+    """Load only complete, hash-verified daily report archive snapshots."""
+
+    try:
+        batches = _load_report_batches(results_root)
+        _, reports_root = _report_paths(results_root)
+        verified: list[VerifiedArchive] = []
+        for batch in batches:
+            archive = batch.archive
+            if archive is None:
+                continue
+            expected_filename = f"{batch.request.trade_date.isoformat()}.md"
+            if archive.filename != expected_filename or not _is_aware(
+                archive.archived_at
+            ):
+                raise ValueError("invalid archive metadata")
+            if reports_root.is_symlink() or not reports_root.is_dir():
+                raise OSError("invalid reports directory")
+            report_path = reports_root / expected_filename
+            report_bytes = _read_regular_bytes(report_path, MAX_REPORT_BYTES)
+            digest = hashlib.sha256(report_bytes).hexdigest()
+            if digest != archive.sha256:
+                raise ValueError("report digest mismatch")
+            items = tuple(
+                ReportCardItem(
+                    symbol=item.symbol,
+                    status=item.status,
+                    processed_signal=item.processed_signal,
+                    final_trade_decision=item.final_trade_decision,
+                    error_code=item.error_code,
+                )
+                for item in archive.items
+            )
+            verified.append(
+                VerifiedArchive(
+                    trade_date=batch.request.trade_date,
+                    batch_id=batch.batch_id,
+                    report_sha256=archive.sha256,
+                    state=archive.state,
+                    items=items,
+                    report_path=report_path,
+                    archived_at=archive.archived_at,
+                )
+            )
+        ordered = sorted(verified, key=lambda archive: archive.trade_date)
+        snapshots: list[VerifiedArchive] = []
+        previous: VerifiedArchive | None = None
+        for archive in ordered:
+            snapshot = VerifiedArchive(
+                trade_date=archive.trade_date,
+                batch_id=archive.batch_id,
+                report_sha256=archive.report_sha256,
+                state=archive.state,
+                items=archive.items,
+                report_path=archive.report_path,
+                archived_at=archive.archived_at,
+                previous=previous,
+            )
+            snapshots.append(snapshot)
+            previous = snapshot
+        return tuple(snapshots)
+    except ReportDiscoveryError as error:
+        error.__context__ = None
+        raise
+    except (OSError, ValueError, TypeError):
+        pass
+    raise ReportDiscoveryError()
+
+
+def discover_report_events(
+    state: NotificationState, archives: Sequence[VerifiedArchive]
+) -> tuple[NotificationEvent, ...]:
+    """Create undelivered report events in immutable archive order."""
+
+    seen = set(state.seen_report_event_ids)
+    deliveries = state.deliveries
+    events: list[NotificationEvent] = []
+    for archive in sorted(archives, key=lambda item: item.trade_date):
+        if archive.event_id in seen or archive.event_id in deliveries:
+            continue
+        events.append(
+            NotificationEvent(
+                event_id=archive.event_id,
+                kind="report",
+                created_at=archive.archived_at,
+                trade_date=archive.trade_date,
+                report_sha256=archive.report_sha256,
+                batch_state=archive.state,
+            )
+        )
+    return tuple(events)
+
+
+def discover_missing_archive_events(
+    results_root: Path,
+    completed_archive_rows: Sequence[CronExecution],
+    verified_archives: Sequence[VerifiedArchive],
+    state: NotificationState,
+    *,
+    job_name: str,
+    daily_archive_job_id: str,
+) -> tuple[NotificationEvent, ...]:
+    """Report completed archive jobs whose exact-date batch is unarchived."""
+
+    if not isinstance(job_name, str) or not job_name or not _is_job_id(
+        daily_archive_job_id
+    ):
+        raise ReportDiscoveryError()
+    rows = tuple(completed_archive_rows)
+    if any(
+        not isinstance(archive, VerifiedArchive)
+        for archive in verified_archives
+    ):
+        raise ReportDiscoveryError()
+    if any(
+        not _valid_execution(row, daily_archive_job_id)
+        or row.status != "completed"
+        for row in rows
+    ):
+        raise ReportDiscoveryError()
+    try:
+        batches = _load_report_batches(results_root)
+        # Reloading verifies the currently persisted report bytes before alerts.
+        current_archives = load_verified_archives(results_root)
+    except ReportDiscoveryError:
+        raise
+
+    unarchived_dates = {
+        batch.request.trade_date for batch in batches if batch.archive is None
+    }
+    archived_dates = {archive.trade_date for archive in current_archives}
+    events: list[NotificationEvent] = []
+    known_event_ids = set(state.deliveries)
+    seen_execution_ids: set[str] = set()
+    for row in sorted(rows, key=lambda item: item.claimed_at):
+        if row.execution_id in seen_execution_ids:
+            continue
+        seen_execution_ids.add(row.execution_id)
+        trade_date = row.claimed_at.astimezone(SHANGHAI).date()
+        event_id = f"missing_archive:{row.job_id}:{row.execution_id}"
+        if (
+            trade_date not in unarchived_dates
+            or trade_date in archived_dates
+            or event_id in known_event_ids
+        ):
+            continue
+        events.append(
+            NotificationEvent(
+                event_id=event_id,
+                kind="missing_archive",
+                created_at=row.claimed_at,
+                trade_date=trade_date,
+                batch_state="unarchived",
+                job_name=job_name,
+                job_id=row.job_id,
+                execution_id=row.execution_id,
+            )
+        )
+    return tuple(events)
 
 
 def discover_execution_events(

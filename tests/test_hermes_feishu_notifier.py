@@ -1,25 +1,48 @@
 import dataclasses
+import hashlib
+import json
 import subprocess
+import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
+from zoneinfo import ZoneInfo
 
+from tradingagents.integrations.hermes_feishu_client import ReportCardData
 from tradingagents.integrations.hermes_feishu_notifier import (
     CronExecution,
     ExecutionDiscoveryError,
+    ReportDiscoveryError,
     discover_execution_events,
+    discover_missing_archive_events,
+    discover_report_events,
     load_cron_runs,
+    load_verified_archives,
     parse_cron_runs,
 )
 from tradingagents.integrations.hermes_feishu_state import (
     DeliveryRecord,
     initialized_state,
 )
+from tradingagents.integrations.schemas import (
+    DailyReportArchive,
+    DailyReportArchiveItem,
+    DailyReportBatch,
+    DailyReportBatchItem,
+    DailyReportRequest,
+)
 
 
 JOB_ID = "e93cfab5f78e"
 ARCHIVE_JOB_ID = "5b7f7906306a"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+NOTIFIER_JOBS = {
+    "daily_submit": "2d445dfc1a8a",
+    "daily_archive": ARCHIVE_JOB_ID,
+    "review_processor": "d6c0e087e5a8",
+    "review_memory": "e93cfab5f78e",
+}
 RUNS_OUTPUT = """\
 d5f80f1f5694484f8282bc746277a277  completed  job=e93cfab5f78e  source=direct  2026-08-14T17:30:57.290949+08:00
 f9691db864e34293b6a68ea082967e45  failed     job=e93cfab5f78e  source=schedule  2026-08-14T17:14:56.700588+08:00
@@ -50,6 +73,80 @@ def state_with_cursor(job_id, execution_id):
         {job_id: [execution_id] if execution_id is not None else []},
         [],
     )
+
+
+def empty_notification_state():
+    return initialized_state(
+        datetime(2026, 8, 14, tzinfo=timezone.utc),
+        {job_id: [] for job_id in NOTIFIER_JOBS.values()},
+        [],
+    )
+
+
+def report_batch(
+    trade_date,
+    report_bytes,
+    *,
+    state="ready",
+    archive=True,
+    items=None,
+):
+    request = DailyReportRequest(
+        trade_date=trade_date,
+        symbols=["BTC", "ETH", "SOL"],
+        analysts=["market", "news", "fundamentals"],
+        research_depth=1,
+        llm_provider="deepseek",
+        quick_model="deepseek-v4-flash",
+        deep_model="deepseek-v4-pro",
+    )
+    archive_items = items or [
+        DailyReportArchiveItem(
+            symbol=symbol,
+            status="completed",
+            processed_signal=f"{symbol} signal",
+            final_trade_decision=f"{symbol} decision",
+            error_code=None,
+        )
+        for symbol in request.symbols
+    ]
+    archived = (
+        DailyReportArchive(
+            filename=f"{trade_date.isoformat()}.md",
+            sha256=hashlib.sha256(report_bytes).hexdigest(),
+            state=state,
+            archived_at=datetime.combine(trade_date, datetime.min.time(), SHANGHAI),
+            items=archive_items,
+            scheduled_review_version=2,
+        )
+        if archive
+        else None
+    )
+    return DailyReportBatch(
+        batch_id="report_" + "a" * 16,
+        request=request,
+        created_at=datetime.combine(trade_date, datetime.min.time(), SHANGHAI),
+        items=[
+            DailyReportBatchItem(
+                symbol=symbol,
+                session_id="hermes_" + character * 16,
+            )
+            for symbol, character in zip(request.symbols, "bcd")
+        ],
+        archive=archived,
+    )
+
+
+def persist_report_batch(root, batch, report_bytes=b"# Daily report\n"):
+    batches = root / "hermes" / "report_batches"
+    reports = root / "hermes" / "reports"
+    batches.mkdir(parents=True, exist_ok=True)
+    reports.mkdir(parents=True, exist_ok=True)
+    batch_path = batches / f"{batch.request.trade_date.isoformat()}.json"
+    batch_path.write_text(batch.model_dump_json(), encoding="ascii")
+    if batch.archive is not None:
+        (reports / batch.archive.filename).write_bytes(report_bytes)
+    return batch_path
 
 
 def run_header(index, *, claimed_at=None):
@@ -804,6 +901,288 @@ class HermesFeishuNotifierTests(unittest.TestCase):
                 self.assert_safe_discovery_error(raised.exception)
                 self.assertEqual(state, state_with_cursor(JOB_ID, None))
 
+    def test_load_verified_archives_builds_ordered_snapshots_and_cards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_date = date(2026, 8, 14)
+            middle_date = date(2026, 8, 15)
+            last_date = date(2026, 8, 16)
+            first_bytes = b"# First\n"
+            middle_bytes = b"# Middle\n"
+            last_bytes = b"# Last\n"
+            persist_report_batch(
+                root, report_batch(last_date, last_bytes, state="degraded"), last_bytes
+            )
+            persist_report_batch(
+                root, report_batch(first_date, first_bytes), first_bytes
+            )
+            persist_report_batch(
+                root,
+                report_batch(
+                    middle_date,
+                    middle_bytes,
+                    items=[
+                        DailyReportArchiveItem(
+                            symbol="BTC",
+                            status="unreadable",
+                            processed_signal=None,
+                            final_trade_decision=None,
+                            error_code="SOURCE_UNREADABLE",
+                        ),
+                        DailyReportArchiveItem(
+                            symbol="ETH",
+                            status="completed",
+                            processed_signal="hold",
+                            final_trade_decision="hold",
+                            error_code=None,
+                        ),
+                        DailyReportArchiveItem(
+                            symbol="SOL",
+                            status="failed",
+                            processed_signal=None,
+                            final_trade_decision=None,
+                            error_code="ANALYSIS_FAILED",
+                        ),
+                    ],
+                ),
+                middle_bytes,
+            )
+
+            archives = load_verified_archives(root)
+
+        self.assertEqual(
+            [archive.trade_date for archive in archives],
+            [first_date, middle_date, last_date],
+        )
+        self.assertIsNone(archives[0].previous)
+        self.assertEqual(archives[1].previous.trade_date, first_date)
+        self.assertEqual(archives[2].previous.trade_date, middle_date)
+        self.assertEqual(archives[2].state, "degraded")
+        self.assertEqual(
+            [item.status for item in archives[1].items],
+            ["unreadable", "completed", "failed"],
+        )
+        self.assertEqual(
+            archives[0].event_id,
+            f"report:2026-08-14:{hashlib.sha256(first_bytes).hexdigest()}",
+        )
+        card = archives[1].to_card_data(archives[1].event_id)
+        self.assertIsInstance(card, ReportCardData)
+        self.assertEqual([item.symbol for item in card.items], ["BTC", "ETH", "SOL"])
+        self.assertEqual(card.report_path, root / "hermes" / "reports" / "2026-08-15.md")
+
+    def test_load_verified_archives_rejects_tampered_report_with_safe_error(self):
+        marker = "report-content-must-never-escape"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_bytes = marker.encode("ascii")
+            batch = report_batch(date(2026, 8, 14), report_bytes)
+            persist_report_batch(root, batch, b"tampered")
+
+            with self.assertRaises(ReportDiscoveryError) as raised:
+                load_verified_archives(root)
+
+        self.assert_safe_report_error(raised.exception, marker)
+
+    def test_load_verified_archives_rejects_invalid_canonical_sources_fail_closed(self):
+        cases = (
+            "batch date mismatch",
+            "archive date mismatch",
+            "malformed JSON",
+            "schema invalid",
+            "missing report",
+            "nonregular batch",
+            "symlink batch",
+            "nonregular report",
+            "symlink report",
+            "non-UTF batch",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                report_bytes = b"# Valid\n"
+                batch = report_batch(date(2026, 8, 14), report_bytes)
+                batch_path = persist_report_batch(root, batch, report_bytes)
+                report_path = root / "hermes" / "reports" / "2026-08-14.md"
+                if case == "batch date mismatch":
+                    batch_path.rename(batch_path.with_name("2026-08-15.json"))
+                elif case == "archive date mismatch":
+                    payload = batch.model_dump(mode="json")
+                    payload["archive"]["filename"] = "2026-08-15.md"
+                    batch_path.write_text(json.dumps(payload), encoding="ascii")
+                elif case == "malformed JSON":
+                    batch_path.write_text("{unsafe-json", encoding="ascii")
+                elif case == "schema invalid":
+                    batch_path.write_text("{}", encoding="ascii")
+                elif case == "missing report":
+                    report_path.unlink()
+                elif case == "nonregular batch":
+                    batch_path.unlink()
+                    batch_path.mkdir()
+                elif case == "symlink batch":
+                    batch_path.unlink()
+                    batch_path.symlink_to(root / "elsewhere.json")
+                elif case == "nonregular report":
+                    report_path.unlink()
+                    report_path.mkdir()
+                elif case == "symlink report":
+                    report_path.unlink()
+                    report_path.symlink_to(root / "elsewhere.md")
+                elif case == "non-UTF batch":
+                    batch_path.write_bytes(b"\xff")
+
+                with self.assertRaises(ReportDiscoveryError) as raised:
+                    load_verified_archives(root)
+                self.assert_safe_report_error(raised.exception, "unsafe-json")
+
+    def test_load_verified_archives_validates_every_json_before_returning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_bytes = b"# Valid\n"
+            persist_report_batch(
+                root, report_batch(date(2026, 8, 14), report_bytes), report_bytes
+            )
+            invalid_path = root / "hermes" / "report_batches" / "unrelated.json"
+            invalid_path.write_text("not JSON", encoding="ascii")
+            (root / "hermes" / "report_batches" / "README.txt").write_text(
+                "ignored", encoding="ascii"
+            )
+
+            with self.assertRaises(ReportDiscoveryError):
+                load_verified_archives(root)
+
+    def test_discover_report_events_is_oldest_first_and_suppresses_seen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            early_bytes = b"# Early\n"
+            later_bytes = b"# Later\n"
+            persist_report_batch(
+                root, report_batch(date(2026, 8, 14), early_bytes), early_bytes
+            )
+            persist_report_batch(
+                root, report_batch(date(2026, 8, 15), later_bytes), later_bytes
+            )
+            archives = load_verified_archives(root)
+
+        events = discover_report_events(empty_notification_state(), archives)
+
+        self.assertEqual([event.event_id for event in events], [
+            archive.event_id for archive in archives
+        ])
+        self.assertEqual(events[0].trade_date, date(2026, 8, 14))
+        self.assertEqual(events[0].report_sha256, archives[0].report_sha256)
+        self.assertEqual(events[0].batch_state, "ready")
+        self.assertEqual(events[0].created_at, archives[0].archived_at)
+        seen = empty_notification_state().model_copy(
+            update={"seen_report_event_ids": [archives[0].event_id]}
+        )
+        self.assertEqual(discover_report_events(seen, archives), (events[1],))
+        delivered = empty_notification_state().model_copy(
+            update={
+                "deliveries": {
+                    events[1].event_id: DeliveryRecord(
+                        event=events[1], next_attempt_at=events[1].created_at
+                    )
+                }
+            }
+        )
+        self.assertEqual(discover_report_events(delivered, archives), (events[0],))
+
+    def test_completed_unarchived_batch_creates_one_missing_archive_event(self):
+        trade_date = date(2026, 8, 14)
+        execution = cron_execution(
+            "e" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(root, report_batch(trade_date, b"", archive=False))
+            archives = load_verified_archives(root)
+            events = discover_missing_archive_events(
+                root,
+                (execution,),
+                archives,
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.event_id, f"missing_archive:{ARCHIVE_JOB_ID}:{'e' * 32}")
+        self.assertEqual(event.kind, "missing_archive")
+        self.assertEqual(event.trade_date, trade_date)
+        self.assertEqual(event.batch_state, "unarchived")
+        self.assertEqual(event.job_name, "daily_archive")
+        self.assertEqual(event.job_id, ARCHIVE_JOB_ID)
+        self.assertEqual(event.execution_id, "e" * 32)
+
+    def test_missing_archive_discovery_is_exact_date_deduplicated_and_fail_closed(self):
+        trade_date = date(2026, 8, 14)
+        matching = cron_execution(
+            "e" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        missing = cron_execution(
+            "f" * 32,
+            "completed",
+            datetime(2026, 8, 15, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persist_report_batch(root, report_batch(trade_date, b"", archive=False))
+            archives = load_verified_archives(root)
+            state = empty_notification_state()
+            events = discover_missing_archive_events(
+                root,
+                (matching, missing, matching),
+                archives,
+                state,
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+            self.assertEqual([event.execution_id for event in events], ["e" * 32])
+            delivered_state = state.model_copy(
+                update={
+                    "deliveries": {
+                        events[0].event_id: DeliveryRecord(
+                            event=events[0], next_attempt_at=events[0].created_at
+                        )
+                    }
+                }
+            )
+            self.assertEqual(
+                discover_missing_archive_events(
+                    root,
+                    (matching,),
+                    archives,
+                    delivered_state,
+                    job_name="daily_archive",
+                    daily_archive_job_id=ARCHIVE_JOB_ID,
+                ),
+                (),
+            )
+            (root / "hermes" / "report_batches" / "broken.json").write_text(
+                "source-marker-must-never-escape", encoding="ascii"
+            )
+            with self.assertRaises(ReportDiscoveryError) as raised:
+                discover_missing_archive_events(
+                    root,
+                    (matching,),
+                    archives,
+                    state,
+                    job_name="daily_archive",
+                    daily_archive_job_id=ARCHIVE_JOB_ID,
+                )
+        self.assert_safe_report_error(
+            raised.exception, "source-marker-must-never-escape"
+        )
+
     def assert_safe_discovery_error(self, error, *forbidden_markers):
         self.assertEqual(str(error), "Hermes execution history unavailable")
         self.assertEqual(error.args, ("Hermes execution history unavailable",))
@@ -813,6 +1192,15 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assertNotIn("must-never-escape", rendered)
         self.assertNotIn("stdout", rendered)
         self.assertNotIn("stderr", rendered)
+        for marker in forbidden_markers:
+            self.assertNotIn(marker, rendered)
+
+    def assert_safe_report_error(self, error, *forbidden_markers):
+        self.assertEqual(str(error), "daily report archive unavailable")
+        self.assertEqual(error.args, ("daily report archive unavailable",))
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        rendered = repr(error)
         for marker in forbidden_markers:
             self.assertNotIn(marker, rendered)
 
