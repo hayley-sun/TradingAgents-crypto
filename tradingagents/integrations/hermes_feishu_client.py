@@ -42,8 +42,10 @@ MAX_FREE_FIELD_CHARACTERS = 500
 MAX_REQUEST_BYTES = 20_000
 MAX_RESPONSE_BYTES = 65_536
 MAX_RETRY_AFTER_SECONDS = 86_400
-MAX_CARD_BODY_BYTES = 18_000
+SIGNED_ENVELOPE_RESERVE_BYTES = 256
+MAX_RENDERED_CARD_BYTES = MAX_REQUEST_BYTES - SIGNED_ENVELOPE_RESERVE_BYTES
 REPORT_DISCLAIMER = "仅用于研究和模拟交易，不构成交易建议"
+TRUNCATION_NOTICE = "\n\n_其余内容因长度限制已省略_"
 SECRET_ASSIGNMENT = re.compile(
     r"\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
     r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
@@ -201,6 +203,12 @@ def _bounded_retry_after_seconds(value: object) -> int | None:
     return value
 
 
+def _strict_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
 class RequestsTransport:
     def __init__(self, connect_timeout: float = 3.05, read_timeout: float = 10):
         self.session = requests.Session()
@@ -210,7 +218,7 @@ class RequestsTransport:
     def post(self, url: str, payload: dict[str, Any]) -> TransportResponse:
         response = self.session.post(
             url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=_strict_json_bytes(payload),
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=self.timeout,
             allow_redirects=False,
@@ -238,21 +246,7 @@ def _safe_free_field(value: object | None) -> str:
     return redacted[:MAX_FREE_FIELD_CHARACTERS]
 
 
-def _truncate_utf8(value: str, byte_limit: int) -> str:
-    encoded = value.encode("utf-8")
-    if len(encoded) <= byte_limit:
-        return value
-    suffix = "\n\n_其余内容因长度限制已省略_"
-    prefix = encoded[: byte_limit - len(suffix.encode("utf-8"))]
-    while True:
-        try:
-            return prefix.decode("utf-8") + suffix
-        except UnicodeDecodeError:
-            prefix = prefix[:-1]
-
-
-def _interactive_card(title: str, color: str, lines: list[str]) -> dict[str, Any]:
-    body = _truncate_utf8("\n".join(lines), MAX_CARD_BODY_BYTES)
+def _card_payload(title: str, color: str, body: str) -> dict[str, Any]:
     return {
         "msg_type": "interactive",
         "card": {
@@ -268,6 +262,30 @@ def _interactive_card(title: str, color: str, lines: list[str]) -> dict[str, Any
             ],
         },
     }
+
+
+def _serialized_json_size(payload: dict[str, Any]) -> int:
+    return len(_strict_json_bytes(payload))
+
+
+def _interactive_card(title: str, color: str, lines: list[str]) -> dict[str, Any]:
+    body = "\n".join(lines)
+    payload = _card_payload(title, color, body)
+    if _serialized_json_size(payload) <= MAX_RENDERED_CARD_BYTES:
+        return payload
+
+    lower = 0
+    upper = len(body)
+    while lower < upper:
+        midpoint = (lower + upper + 1) // 2
+        candidate = _card_payload(
+            title, color, body[:midpoint] + TRUNCATION_NOTICE
+        )
+        if _serialized_json_size(candidate) <= MAX_RENDERED_CARD_BYTES:
+            lower = midpoint
+        else:
+            upper = midpoint - 1
+    return _card_payload(title, color, body[:lower] + TRUNCATION_NOTICE)
 
 
 def _report_item_line(item: ReportCardItem) -> str:
@@ -351,15 +369,19 @@ def render_test_card(event_id: str, now: datetime) -> dict[str, Any]:
         "飞书通知配置已通过发送验收。",
     ]
     return _interactive_card(
-        "TradingAgents 飞书通知配置验收", "green", lines
+        "TradingAgents 飞书通知配置验收", "orange", lines
     )
 
 
 def _serialize_payload(payload: dict[str, Any]) -> bytes | None:
     try:
-        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return _strict_json_bytes(payload)
     except (TypeError, ValueError):
         return None
+
+
+def _reject_nonstandard_json_constant(_value: str) -> object:
+    raise ValueError("nonstandard JSON constant")
 
 
 class FeishuClient:
@@ -417,8 +439,10 @@ class FeishuClient:
         if not 200 <= response.status_code < 300:
             raise FeishuDeliveryError("http_error")
         try:
-            decoded = json.loads(response.body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            decoded = json.loads(
+                response.body, parse_constant=_reject_nonstandard_json_constant
+            )
+        except (ValueError, UnicodeDecodeError):
             decoded = None
         if not isinstance(decoded, dict) or "code" not in decoded:
             raise FeishuDeliveryError("invalid_response")

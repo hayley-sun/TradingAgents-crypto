@@ -306,6 +306,43 @@ class FeishuCardRenderingTests(unittest.TestCase):
         self.assertIn(report.event_id, card_body(payload))
         self.assertIn("仅用于研究和模拟交易，不构成交易建议", card_body(payload))
 
+    def test_report_card_bounds_json_escaping_and_signed_envelope(self):
+        escape_heavy = '\"\\' * 300
+        items = tuple(
+            ReportCardItem(
+                symbol=escape_heavy,
+                status=escape_heavy,
+                processed_signal=escape_heavy,
+                final_trade_decision=escape_heavy,
+                error_code=escape_heavy,
+            )
+            for _index in range(20)
+        )
+        report = replace(report_card_fixture(), items=items)
+
+        payload = render_report_card(report, previous=None)
+        rendered = json.dumps(
+            payload, ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+
+        self.assertLessEqual(len(rendered), 20_000)
+        body = card_body(payload)
+        self.assertIn(report.event_id, body)
+        self.assertIn("仅用于研究和模拟交易，不构成交易建议", body)
+        self.assertIn("_其余内容因长度限制已省略_", body)
+        self.assertEqual(payload, render_report_card(report, previous=None))
+
+        transport = FakeTransport(TransportResponse(200, b'{"code":0}', None))
+        FeishuClient(
+            config_fixture(), transport=transport, clock=lambda: 1599360473
+        ).send(payload)
+        signed = json.dumps(
+            transport.calls[0].payload,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertLessEqual(len(signed), 20_000)
+
     def test_failure_card_is_red_and_contains_only_safe_failure_metadata(self):
         event = NotificationEvent(
             event_id="execution_failure:daily_submit:execution-1",
@@ -363,7 +400,7 @@ class FeishuCardRenderingTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, body)
 
-    def test_test_card_has_exact_title_green_header_and_stable_event_id(self):
+    def test_test_card_has_exact_title_orange_header_and_stable_event_id(self):
         event_id = "test:2026-08-18T12:00:00+08:00"
         now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
 
@@ -371,7 +408,7 @@ class FeishuCardRenderingTests(unittest.TestCase):
 
         body = self.assert_card(
             payload,
-            "green",
+            "orange",
             "TradingAgents 飞书通知配置验收",
             event_id,
         )
@@ -492,6 +529,38 @@ class FeishuClientTests(unittest.TestCase):
         )
         self.assertEqual(transport.calls, [])
 
+    def test_client_rejects_nonfinite_payload_before_transport(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            transport = FakeTransport(
+                TransportResponse(200, b'{"code":0}', None)
+            )
+            client = FeishuClient(config_fixture(), transport=transport)
+
+            with self.subTest(value=value):
+                with self.assertRaises(FeishuDeliveryError) as caught:
+                    client.send({"msg_type": "interactive", "value": value})
+
+                self.assertEqual(caught.exception.result, "http_error")
+                self.assertEqual(transport.calls, [])
+                self.assertNotIn(str(value), str(caught.exception).lower())
+
+    def test_client_rejects_nonstandard_json_constants_in_response(self):
+        for constant in (b"NaN", b"Infinity", b"-Infinity"):
+            response = b'{"code":0,"value":' + constant + b"}"
+            client = FeishuClient(
+                config_fixture(),
+                transport=FakeTransport(TransportResponse(200, response, None)),
+            )
+
+            with self.subTest(constant=constant):
+                with self.assertRaises(FeishuDeliveryError) as caught:
+                    client.send({"msg_type": "interactive", "card": {}})
+
+                self.assertEqual(caught.exception.result, "invalid_response")
+                self.assertNotIn(
+                    constant.decode("ascii"), str(caught.exception)
+                )
+
 
 class RequestsTransportTests(unittest.TestCase):
     def test_retry_after_parser_accepts_only_bounded_integer_seconds(self):
@@ -535,6 +604,16 @@ class RequestsTransportTests(unittest.TestCase):
         self.assertEqual(
             request.content_type, "application/json; charset=utf-8"
         )
+
+    def test_transport_rejects_nonfinite_json_before_request(self):
+        transport = RequestsTransport()
+
+        with local_feishu_server() as (base_url, server):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    transport.post(base_url + "/ok", {"value": value})
+
+        self.assertEqual(server.requests, [])
 
     def test_transport_returns_status_without_following_redirects(self):
         transport = RequestsTransport()
