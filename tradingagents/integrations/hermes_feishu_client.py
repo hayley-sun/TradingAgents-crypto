@@ -48,9 +48,9 @@ MAX_RENDERED_CARD_BYTES = MAX_REQUEST_BYTES - SIGNED_ENVELOPE_RESERVE_BYTES
 REPORT_DISCLAIMER = "仅用于研究和模拟交易，不构成交易建议"
 TRUNCATION_NOTICE = "\n\n_其余内容因长度限制已省略_"
 SECRET_ASSIGNMENT_PREFIX = re.compile(
-    r"(?P<key_quote>[\"'])?"
+    r"[\"']?"
     r"(?P<key>[A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
-    r"(?(key_quote)(?P=key_quote))"
+    r"[\"']?"
     r"\s*[:=]\s*",
     re.IGNORECASE,
 )

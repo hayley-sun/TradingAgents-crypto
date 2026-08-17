@@ -337,6 +337,50 @@ class FeishuCardRenderingTests(unittest.TestCase):
                     self.assertNotIn(secret_fragment, rendered)
                 self.assertIn("[REDACTED]", rendered)
 
+    def test_report_card_redacts_malformed_secret_key_quotes(self):
+        cases = {
+            "double to single mismatched": (
+                'before {"API_KEY\': "mismatch-double-fragment"} after',
+                "mismatch-double-fragment",
+                "API_KEY",
+            ),
+            "single to double mismatched": (
+                "before {'TOKEN\": 'mismatch-single-fragment'} after",
+                "mismatch-single-fragment",
+                "TOKEN",
+            ),
+            "double opening only": (
+                'before {"SECRET: "opening-double-fragment"} after',
+                "opening-double-fragment",
+                "SECRET",
+            ),
+            "single opening only": (
+                "before {'PASSWORD: 'opening-single-fragment'} after",
+                "opening-single-fragment",
+                "PASSWORD",
+            ),
+            "double closing only": (
+                'before {DEEPSEEK_API_KEY\": "closing-double-fragment"} after',
+                "closing-double-fragment",
+                "DEEPSEEK_API_KEY",
+            ),
+            "single closing only": (
+                "before {TOKEN': 'closing-single-fragment'} after",
+                "closing-single-fragment",
+                "TOKEN",
+            ),
+        }
+
+        for case, (value, secret_fragment, expected_key) in cases.items():
+            payload = render_report_card(
+                report_card_fixture(decision=value), previous=None
+            )
+            rendered = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+            with self.subTest(case=case):
+                self.assertNotIn(secret_fragment, rendered)
+                self.assertIn(f"{{{expected_key}=[REDACTED]}}", rendered)
+
     def test_report_card_contains_current_items_path_and_prior_comparison(self):
         report = report_card_fixture()
         previous = replace(
