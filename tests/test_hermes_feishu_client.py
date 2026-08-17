@@ -1,21 +1,42 @@
 import json
 import operator
 import os
+import time
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import date, datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import get_context
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
 import yaml
 from pydantic import ValidationError
 
 from tradingagents.integrations.hermes_feishu_client import (
+    FeishuClient,
     FeishuConfigError,
+    FeishuDeliveryError,
     FeishuNotifierConfig,
+    ReportCardData,
+    ReportCardItem,
+    RequestsTransport,
+    TransportResponse,
     feishu_signature,
     load_private_config,
+    parse_bounded_retry_after,
+    render_failure_card,
+    render_missing_archive_card,
+    render_report_card,
+    render_test_card,
+)
+from tradingagents.integrations.hermes_feishu_state import (
+    NotificationEvent,
 )
 
 
@@ -37,6 +58,522 @@ def config_payload():
         "signing_secret": "unit-test-signing-secret",
         "jobs": VALID_JOBS,
     }
+
+
+def config_fixture():
+    return FeishuNotifierConfig.model_validate(config_payload())
+
+
+def report_card_fixture(signal="BUY", decision="Hold risk limit"):
+    return ReportCardData(
+        event_id="report:2026-08-18:" + "a" * 64,
+        trade_date=date(2026, 8, 18),
+        state="ready",
+        items=(
+            ReportCardItem(
+                symbol="BTC",
+                status="completed",
+                processed_signal=signal,
+                final_trade_decision=decision,
+                error_code=None,
+            ),
+        ),
+        report_path=Path("results/hermes/reports/2026-08-18.md"),
+    )
+
+
+class FakeTransport:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def post(self, url, payload):
+        self.calls.append(SimpleNamespace(url=url, payload=payload))
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+class LocalFeishuHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _write_response(self, status, body=b"", headers=None):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        request_body = self.rfile.read(content_length)
+        self.server.requests.append(
+            SimpleNamespace(
+                path=self.path,
+                body=request_body,
+                content_type=self.headers.get("Content-Type"),
+            )
+        )
+
+        if self.path == "/ok":
+            self._write_response(200, b'{"code":0}')
+        elif self.path == "/redirect":
+            self._write_response(302, headers={"Location": "/redirect-target"})
+        elif self.path == "/redirect-target":
+            self.server.redirect_target_requests += 1
+            self._write_response(200, b'{"code":0}')
+        elif self.path == "/rate-limited":
+            self._write_response(
+                429,
+                b"rate limited",
+                headers={"Retry-After": "17"},
+            )
+        elif self.path == "/server-error":
+            self._write_response(500, b"internal details")
+        elif self.path == "/timeout":
+            time.sleep(0.15)
+            self._write_response(200, b'{"code":0}')
+        elif self.path == "/invalid-json":
+            self._write_response(200, b"not json")
+        elif self.path == "/too-large":
+            self._write_response(200, b"x" * 65_537)
+        else:
+            self._write_response(404, b"not found")
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+@contextmanager
+def local_feishu_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), LocalFeishuHandler)
+    server.requests = []
+    server.redirect_target_requests = 0
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}", server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+def card_body(payload):
+    bodies = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get("tag") == "lark_md":
+                bodies.append(value.get("content"))
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(payload)
+    if len(bodies) != 1:
+        raise AssertionError(f"expected one lark_md body, found {len(bodies)}")
+    return bodies[0]
+
+
+class FeishuCardRenderingTests(unittest.TestCase):
+    def assert_card(self, payload, color, title, event_id):
+        self.assertEqual(payload["msg_type"], "interactive")
+        self.assertEqual(payload["card"]["header"]["template"], color)
+        self.assertEqual(
+            payload["card"]["header"]["title"],
+            {"tag": "plain_text", "content": title},
+        )
+        body = card_body(payload)
+        self.assertIn(event_id, body)
+        return body
+
+    def test_report_card_is_bounded_redacted_and_contains_disclaimer(self):
+        report = report_card_fixture(
+            signal="DEEPSEEK_API_KEY=visible-secret " + "x" * 1000,
+            decision="token sk-1234567890abcdefgh",
+        )
+
+        payload = render_report_card(report, previous=None)
+
+        text = json.dumps(payload, ensure_ascii=False)
+        self.assertLessEqual(len(text.encode("utf-8")), 20_000)
+        self.assertNotIn("visible-secret", text)
+        self.assertNotIn("sk-1234567890abcdefgh", text)
+        self.assertIn("不构成交易建议", text)
+
+    def test_report_card_redacts_short_sk_tokens(self):
+        report = report_card_fixture(decision="credential sk-abc")
+
+        text = json.dumps(render_report_card(report, previous=None))
+
+        self.assertNotIn("sk-abc", text)
+
+    def test_report_card_contains_current_items_path_and_prior_comparison(self):
+        report = report_card_fixture()
+        previous = replace(
+            report_card_fixture(signal="SELL", decision=None),
+            event_id="report:2026-08-17:" + "b" * 64,
+            trade_date=date(2026, 8, 17),
+            state="degraded",
+            report_path=Path("results/hermes/reports/2026-08-17.md"),
+        )
+
+        payload = render_report_card(report, previous=previous)
+
+        body = self.assert_card(
+            payload,
+            "green",
+            "TradingAgents 日报 | 2026-08-18",
+            report.event_id,
+        )
+        for expected in (
+            "ready",
+            "BTC",
+            "completed",
+            "BUY",
+            "Hold risk limit",
+            "results/hermes/reports/2026-08-18.md",
+            "2026-08-17",
+            "SELL",
+            "不可用",
+            "仅用于研究和模拟交易，不构成交易建议",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, body)
+
+    def test_report_card_normalizes_and_caps_each_free_item_field(self):
+        fields = {
+            "state": "state-" + "a" * 600,
+            "symbol": "symbol-" + "b" * 600,
+            "status": "status-" + "c" * 600,
+            "signal": "signal-" + "d" * 600,
+            "decision": "decision-" + "e" * 600,
+            "error": "error-" + "f" * 600,
+            "path": "path-" + "g" * 600,
+        }
+        report = ReportCardData(
+            event_id="report:bounded-fields",
+            trade_date=date(2026, 8, 18),
+            state=fields["state"],
+            items=(
+                ReportCardItem(
+                    symbol="symbol-" + "b" * 300 + "\r\n" + "b" * 300,
+                    status=fields["status"],
+                    processed_signal=fields["signal"],
+                    final_trade_decision=fields["decision"],
+                    error_code=fields["error"],
+                ),
+            ),
+            report_path=Path(fields["path"]),
+        )
+
+        body = card_body(render_report_card(report, previous=None))
+
+        self.assertNotIn("\r", body)
+        self.assertIn("b" * 300 + " " + "b" * 190, body)
+        for name, value in fields.items():
+            if name == "symbol":
+                continue
+            with self.subTest(field=name):
+                self.assertNotIn(value, body)
+                self.assertIn(value[:500], body)
+
+    def test_report_card_stays_bounded_with_many_items(self):
+        items = tuple(
+            ReportCardItem(
+                symbol=f"SYMBOL-{index}-" + "界" * 600,
+                status="completed-" + "界" * 600,
+                processed_signal="BUY-" + "界" * 600,
+                final_trade_decision="decision-" + "界" * 600,
+                error_code="error-" + "界" * 600,
+            )
+            for index in range(100)
+        )
+        report = replace(report_card_fixture(), items=items)
+
+        payload = render_report_card(report, previous=None)
+
+        rendered = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.assertLessEqual(len(rendered), 20_000)
+        self.assertIn(report.event_id, card_body(payload))
+        self.assertIn("仅用于研究和模拟交易，不构成交易建议", card_body(payload))
+
+    def test_failure_card_is_red_and_contains_only_safe_failure_metadata(self):
+        event = NotificationEvent(
+            event_id="execution_failure:daily_submit:execution-1",
+            kind="execution_failure",
+            created_at=datetime(2026, 8, 18, 0, 5, tzinfo=timezone.utc),
+            job_name="daily\r\nsubmit DEEPSEEK_API_KEY=secret-marker",
+            job_id="2d445dfc1a8a",
+            execution_id="execution-sk-1234567890abcdefgh",
+        )
+
+        payload = render_failure_card(event)
+
+        body = self.assert_card(
+            payload,
+            "red",
+            "TradingAgents 定时任务失败",
+            event.event_id,
+        )
+        self.assertIn("CRON_EXECUTION_FAILED", body)
+        self.assertIn("daily submit", body)
+        self.assertIn("2d445dfc1a8a", body)
+        self.assertIn("2026-08-18T00:05:00+00:00", body)
+        self.assertIn("服务器", body)
+        self.assertNotIn("secret-marker", body)
+        self.assertNotIn("sk-1234567890abcdefgh", body)
+
+    def test_missing_archive_card_is_orange_and_contains_safe_state(self):
+        event = NotificationEvent(
+            event_id="missing_archive:2026-08-18:execution-2",
+            kind="missing_archive",
+            created_at=datetime(2026, 8, 18, 4, 5, tzinfo=timezone.utc),
+            trade_date=date(2026, 8, 18),
+            batch_state="active",
+            job_name="daily_archive",
+            job_id="5b7f7906306a",
+            execution_id="execution-2",
+        )
+
+        payload = render_missing_archive_card(event)
+
+        body = self.assert_card(
+            payload,
+            "orange",
+            "TradingAgents 日报待归档",
+            event.event_id,
+        )
+        for expected in (
+            "2026-08-18",
+            "active",
+            "daily_archive",
+            "5b7f7906306a",
+            "execution-2",
+            "sessions",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, body)
+
+    def test_test_card_has_exact_title_green_header_and_stable_event_id(self):
+        event_id = "test:2026-08-18T12:00:00+08:00"
+        now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+
+        payload = render_test_card(event_id, now)
+
+        body = self.assert_card(
+            payload,
+            "green",
+            "TradingAgents 飞书通知配置验收",
+            event_id,
+        )
+        self.assertIn("2026-08-18T12:00:00+00:00", body)
+
+
+class FeishuClientTests(unittest.TestCase):
+    def test_client_accepts_only_http_2xx_with_feishu_code_zero(self):
+        transport = FakeTransport(TransportResponse(200, b'{"code":0}', None))
+        client = FeishuClient(
+            config_fixture(), transport=transport, clock=lambda: 1599360473
+        )
+
+        client.send({"msg_type": "interactive", "card": {}})
+
+        call = transport.calls[0]
+        self.assertEqual(call.url, config_payload()["webhook_url"])
+        self.assertEqual(call.payload["timestamp"], "1599360473")
+        self.assertEqual(
+            call.payload["sign"],
+            feishu_signature(1599360473, "unit-test-signing-secret"),
+        )
+
+    def test_client_keeps_429_retry_after_safe(self):
+        client = FeishuClient(
+            config_fixture(),
+            transport=FakeTransport(TransportResponse(429, b"rate limited", 17)),
+        )
+
+        with self.assertRaises(FeishuDeliveryError) as caught:
+            client.send({"msg_type": "interactive", "card": {}})
+
+        self.assertEqual(caught.exception.result, "rate_limited")
+        self.assertEqual(caught.exception.retry_after_seconds, 17)
+        self.assertNotIn("rate limited", str(caught.exception))
+
+    def test_client_discards_unsafe_429_retry_after_values(self):
+        for retry_after in (-1, 86_401, True):
+            client = FeishuClient(
+                config_fixture(),
+                transport=FakeTransport(
+                    TransportResponse(429, b"rate limited", retry_after)
+                ),
+            )
+
+            with self.subTest(retry_after=retry_after), self.assertRaises(
+                FeishuDeliveryError
+            ) as caught:
+                client.send({"msg_type": "interactive", "card": {}})
+
+            self.assertEqual(caught.exception.result, "rate_limited")
+            self.assertIsNone(caught.exception.retry_after_seconds)
+
+    def test_client_maps_transport_failures_without_raw_exception_leakage(self):
+        cases = {
+            "timeout": requests.exceptions.Timeout("timeout-secret-marker"),
+            "connection_error": requests.exceptions.ConnectionError(
+                "connection-secret-marker"
+            ),
+            "response_too_large": FeishuDeliveryError("response_too_large"),
+        }
+
+        for expected, transport_error in cases.items():
+            client = FeishuClient(
+                config_fixture(), transport=FakeTransport(transport_error)
+            )
+            with self.subTest(expected=expected), self.assertRaises(
+                FeishuDeliveryError
+            ) as caught:
+                client.send({"msg_type": "interactive", "card": {}})
+            self.assertEqual(caught.exception.result, expected)
+            self.assertNotIn("secret-marker", str(caught.exception))
+            self.assertIsNone(caught.exception.__context__)
+
+    def test_client_rejects_redirect_http_invalid_and_feishu_errors(self):
+        cases = (
+            (TransportResponse(302, b"redirect details", None), "redirect_rejected"),
+            (TransportResponse(500, b"server details", None), "http_error"),
+            (TransportResponse(200, b"not json", None), "invalid_response"),
+            (TransportResponse(200, b"[]", None), "invalid_response"),
+            (TransportResponse(200, b'{"code":false}', None), "feishu_error"),
+            (TransportResponse(200, b'{"code":19021}', None), "feishu_error"),
+        )
+
+        for response, expected in cases:
+            client = FeishuClient(config_fixture(), transport=FakeTransport(response))
+            with self.subTest(expected=expected), self.assertRaises(
+                FeishuDeliveryError
+            ) as caught:
+                client.send({"msg_type": "interactive", "card": {}})
+            self.assertEqual(caught.exception.result, expected)
+            self.assertNotIn(response.body.decode("utf-8"), str(caught.exception))
+
+    def test_client_rejects_oversized_payload_before_transport(self):
+        transport = FakeTransport(TransportResponse(200, b'{"code":0}', None))
+        client = FeishuClient(config_fixture(), transport=transport)
+
+        with self.assertRaises(FeishuDeliveryError) as caught:
+            client.send(
+                {
+                    "msg_type": "interactive",
+                    "card": {"content": "界" * 20_000},
+                }
+            )
+
+        self.assertIn(
+            caught.exception.result,
+            {
+                "timeout",
+                "connection_error",
+                "redirect_rejected",
+                "rate_limited",
+                "http_error",
+                "response_too_large",
+                "invalid_response",
+                "feishu_error",
+            },
+        )
+        self.assertEqual(transport.calls, [])
+
+
+class RequestsTransportTests(unittest.TestCase):
+    def test_retry_after_parser_accepts_only_bounded_integer_seconds(self):
+        expected = {
+            None: None,
+            "": None,
+            "0": 0,
+            "17": 17,
+            "000017": 17,
+            "86400": 86_400,
+            "86401": None,
+            "-1": None,
+            "+1": None,
+            " 17 ": None,
+            "1.5": None,
+            "Wed, 21 Oct 2026 07:28:00 GMT": None,
+            "9" * 100: None,
+            "0" * 11: None,
+        }
+
+        for raw_value, parsed in expected.items():
+            with self.subTest(raw_value=raw_value):
+                self.assertEqual(parse_bounded_retry_after(raw_value), parsed)
+
+    def test_transport_disables_environment_proxy_and_posts_utf8_json(self):
+        transport = RequestsTransport()
+        self.assertIs(transport.session.trust_env, False)
+
+        with local_feishu_server() as (base_url, server):
+            response = transport.post(
+                base_url + "/ok", {"message": "飞书", "value": 1}
+            )
+
+        self.assertEqual(response, TransportResponse(200, b'{"code":0}', None))
+        request = server.requests[0]
+        self.assertEqual(request.path, "/ok")
+        self.assertEqual(
+            json.loads(request.body.decode("utf-8")),
+            {"message": "飞书", "value": 1},
+        )
+        self.assertEqual(
+            request.content_type, "application/json; charset=utf-8"
+        )
+
+    def test_transport_returns_status_without_following_redirects(self):
+        transport = RequestsTransport()
+
+        with local_feishu_server() as (base_url, server):
+            redirect = transport.post(base_url + "/redirect", {})
+            rate_limited = transport.post(base_url + "/rate-limited", {})
+            server_error = transport.post(base_url + "/server-error", {})
+
+        self.assertEqual(redirect.status_code, 302)
+        self.assertEqual(server.redirect_target_requests, 0)
+        self.assertEqual(rate_limited.retry_after_seconds, 17)
+        self.assertEqual(server_error.status_code, 500)
+
+    def test_transport_leaves_invalid_json_for_client_validation(self):
+        transport = RequestsTransport()
+
+        with local_feishu_server() as (base_url, _server):
+            response = transport.post(base_url + "/invalid-json", {})
+
+        self.assertEqual(response.body, b"not json")
+
+    def test_transport_enforces_read_timeout(self):
+        transport = RequestsTransport(connect_timeout=0.1, read_timeout=0.02)
+
+        with local_feishu_server() as (base_url, _server), self.assertRaises(
+            requests.exceptions.Timeout
+        ):
+            transport.post(base_url + "/timeout", {})
+
+    def test_transport_rejects_response_over_65536_bytes(self):
+        transport = RequestsTransport()
+
+        with local_feishu_server() as (base_url, _server), self.assertRaises(
+            FeishuDeliveryError
+        ) as caught:
+            transport.post(base_url + "/too-large", {})
+
+        self.assertEqual(caught.exception.result, "response_too_large")
 
 
 def write_private_config(directory, payload=None):
