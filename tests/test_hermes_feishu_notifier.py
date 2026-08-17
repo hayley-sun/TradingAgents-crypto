@@ -7,8 +7,10 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import tradingagents.integrations.hermes_feishu_notifier as notifier
 from tradingagents.integrations.hermes_feishu_client import ReportCardData
 from tradingagents.integrations.hermes_feishu_notifier import (
     CronExecution,
@@ -1056,6 +1058,96 @@ class HermesFeishuNotifierTests(unittest.TestCase):
             with self.assertRaises(ReportDiscoveryError):
                 load_verified_archives(root)
 
+    def test_load_verified_archives_rejects_invalid_source_directories(self):
+        marker = "directory-boundary-marker-must-never-escape"
+        cases = (
+            "results root symlink",
+            "results root regular file",
+            "hermes regular file",
+            "hermes symlink",
+            "batches regular file",
+            "batches symlink",
+            "reports regular file",
+            "reports symlink",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "configured"
+                external = Path(directory) / marker
+                report_bytes = b"# Valid\n"
+                if case == "results root symlink":
+                    persist_report_batch(
+                        external,
+                        report_batch(date(2026, 8, 14), report_bytes),
+                        report_bytes,
+                    )
+                    root.symlink_to(external, target_is_directory=True)
+                elif case == "results root regular file":
+                    root.write_text("not a directory", encoding="ascii")
+                elif case == "hermes regular file":
+                    root.mkdir()
+                    (root / "hermes").write_text("not a directory", encoding="ascii")
+                elif case == "hermes symlink":
+                    root.mkdir()
+                    target = root / "hermes-target"
+                    target.mkdir()
+                    (root / "hermes").symlink_to(
+                        target, target_is_directory=True
+                    )
+                else:
+                    persist_report_batch(
+                        root,
+                        report_batch(date(2026, 8, 14), report_bytes),
+                        report_bytes,
+                    )
+                    boundary = root / "hermes" / (
+                        "report_batches"
+                        if case.startswith("batches")
+                        else "reports"
+                    )
+                    if case.endswith("regular file"):
+                        for child in boundary.iterdir():
+                            child.unlink()
+                        boundary.rmdir()
+                        boundary.write_text("not a directory", encoding="ascii")
+                    else:
+                        target = root / f"{boundary.name}-target"
+                        boundary.rename(target)
+                        boundary.symlink_to(target, target_is_directory=True)
+
+                with self.assertRaises(ReportDiscoveryError) as raised:
+                    load_verified_archives(root)
+                self.assert_safe_report_error(raised.exception, marker)
+
+    def test_load_verified_archives_rejects_unsafe_pathlike(self):
+        marker = "unsafe-path-marker"
+
+        class UnsafePath:
+            def __fspath__(self):
+                raise RuntimeError(marker)
+
+        with self.assertRaises(ReportDiscoveryError) as raised:
+            load_verified_archives(UnsafePath())
+
+        self.assert_safe_report_error(raised.exception, marker)
+        execution = cron_execution(
+            "7" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with self.assertRaises(ReportDiscoveryError) as raised:
+            discover_missing_archive_events(
+                UnsafePath(),
+                (execution,),
+                (),
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assert_safe_report_error(raised.exception, marker)
+
     def test_discover_report_events_is_oldest_first_and_suppresses_seen(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1226,6 +1318,71 @@ class HermesFeishuNotifierTests(unittest.TestCase):
                 )
 
         self.assert_safe_report_error(raised.exception, marker)
+
+    def test_missing_archive_discovery_uses_one_immutable_inventory_snapshot(self):
+        trade_date = date(2026, 8, 14)
+        execution = cron_execution(
+            "5" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch_path = persist_report_batch(
+                root, report_batch(trade_date, b"", archive=False)
+            )
+            original_loader = notifier._load_report_inventory
+
+            def load_then_remove(source_root):
+                inventory = original_loader(source_root)
+                batch_path.unlink()
+                return inventory
+
+            with patch.object(
+                notifier,
+                "_load_report_inventory",
+                side_effect=load_then_remove,
+            ) as loader:
+                events = discover_missing_archive_events(
+                    root,
+                    (execution,),
+                    (),
+                    empty_notification_state(),
+                    job_name="daily_archive",
+                    daily_archive_job_id=ARCHIVE_JOB_ID,
+                )
+
+        self.assertEqual(loader.call_count, 1)
+        self.assertEqual([event.trade_date for event in events], [trade_date])
+
+    def test_missing_archive_discovery_does_not_trust_stale_archives(self):
+        trade_date = date(2026, 8, 14)
+        execution = cron_execution(
+            "6" * 32,
+            "completed",
+            datetime(2026, 8, 14, 5, tzinfo=timezone.utc),
+            job_id=ARCHIVE_JOB_ID,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "empty"
+            root.mkdir()
+            external = Path(directory) / "external"
+            report_bytes = b"# Archived\n"
+            persist_report_batch(
+                external, report_batch(trade_date, report_bytes), report_bytes
+            )
+            stale_archives = load_verified_archives(external)
+            events = discover_missing_archive_events(
+                root,
+                (execution,),
+                stale_archives,
+                empty_notification_state(),
+                job_name="daily_archive",
+                daily_archive_job_id=ARCHIVE_JOB_ID,
+            )
+
+        self.assertEqual(events, ())
 
     def test_missing_archive_discovery_is_exact_date_deduplicated_and_fail_closed(self):
         trade_date = date(2026, 8, 14)

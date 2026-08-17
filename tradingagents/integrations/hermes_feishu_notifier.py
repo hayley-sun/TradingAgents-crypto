@@ -289,15 +289,50 @@ def load_cron_runs(
     return parse_cron_runs(stdout, job_id)
 
 
-def _read_regular_bytes(path: Path, maximum_size: int) -> bytes:
-    """Read a bounded regular file without following a leaf symlink."""
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
+
+@dataclass(frozen=True)
+class _ReportInventory:
+    archives: tuple[VerifiedArchive, ...]
+    unarchived_dates: frozenset[date]
+
+
+def _open_directory(
+    path: str | Path, *, parent_descriptor: int | None = None, missing: bool = False
+) -> int | None:
+    try:
+        descriptor = os.open(
+            path, DIRECTORY_FLAGS, dir_fd=parent_descriptor
+        )
+    except FileNotFoundError:
+        if missing:
+            return None
+        raise
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("invalid directory")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_regular_bytes_at(
+    directory_descriptor: int, name: str, maximum_size: int
+) -> bytes:
+    """Read a bounded regular leaf without reopening through a symlink."""
+
+    metadata = os.stat(
+        name, dir_fd=directory_descriptor, follow_symlinks=False
+    )
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum_size:
+        raise OSError("invalid source")
     descriptor: int | None = None
     try:
-        initial_metadata = os.lstat(path)
-        if not stat.S_ISREG(initial_metadata.st_mode):
-            raise OSError("symlinked source")
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+        )
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum_size:
             raise OSError("invalid source")
@@ -317,17 +352,6 @@ def _read_regular_bytes(path: Path, maximum_size: int) -> bytes:
             os.close(descriptor)
 
 
-def _report_paths(results_root: Path) -> tuple[Path, Path]:
-    root = Path(results_root)
-    hermes_root = root / "hermes"
-    if hermes_root.is_symlink():
-        raise OSError("invalid Hermes directory")
-    return (
-        hermes_root / "report_batches",
-        hermes_root / "reports",
-    )
-
-
 def _is_aware(value: object) -> bool:
     if not isinstance(value, datetime):
         return False
@@ -337,111 +361,139 @@ def _is_aware(value: object) -> bool:
         return False
 
 
-def _load_report_batches(results_root: Path) -> tuple[DailyReportBatch, ...]:
-    """Fully validate every persisted batch JSON before exposing any batch."""
-
-    try:
-        batches_root, _ = _report_paths(results_root)
-        if batches_root.is_symlink():
-            raise OSError("invalid batch directory")
-        if not batches_root.exists():
-            return ()
-        if not batches_root.is_dir():
-            raise OSError("invalid batch directory")
-        paths = sorted(
-            (path for path in batches_root.iterdir() if path.suffix == ".json"),
-            key=lambda path: path.name,
+def _snapshot_archives(
+    archives: Sequence[VerifiedArchive],
+) -> tuple[VerifiedArchive, ...]:
+    snapshots: list[VerifiedArchive] = []
+    previous: VerifiedArchive | None = None
+    for archive in sorted(archives, key=lambda item: item.trade_date):
+        snapshot = VerifiedArchive(
+            trade_date=archive.trade_date,
+            batch_id=archive.batch_id,
+            report_sha256=archive.report_sha256,
+            state=archive.state,
+            items=archive.items,
+            report_path=archive.report_path,
+            archived_at=archive.archived_at,
+            previous=previous,
         )
+        snapshots.append(snapshot)
+        previous = snapshot
+    return tuple(snapshots)
+
+
+def _load_report_inventory(results_root: object) -> _ReportInventory:
+    """Build one fully verified, descriptor-anchored report inventory."""
+
+    root_descriptor: int | None = None
+    hermes_descriptor: int | None = None
+    batches_descriptor: int | None = None
+    reports_descriptor: int | None = None
+    try:
+        root = Path(results_root)
+        root_descriptor = _open_directory(root, missing=True)
+        if root_descriptor is None:
+            return _ReportInventory((), frozenset())
+        hermes_descriptor = _open_directory(
+            "hermes", parent_descriptor=root_descriptor, missing=True
+        )
+        if hermes_descriptor is None:
+            return _ReportInventory((), frozenset())
+        batches_descriptor = _open_directory(
+            "report_batches", parent_descriptor=hermes_descriptor, missing=True
+        )
+        if batches_descriptor is None:
+            return _ReportInventory((), frozenset())
+
         batches: list[DailyReportBatch] = []
         seen_dates: set[date] = set()
-        for path in paths:
-            raw = _read_regular_bytes(path, MAX_BATCH_BYTES)
-            text = raw.decode("utf-8")
-            batch = DailyReportBatch.model_validate_json(text)
+        for name in sorted(os.listdir(batches_descriptor)):
+            if not name.endswith(".json"):
+                continue
+            raw = _read_regular_bytes_at(
+                batches_descriptor, name, MAX_BATCH_BYTES
+            )
+            batch = DailyReportBatch.model_validate_json(raw.decode("utf-8"))
             expected_name = f"{batch.request.trade_date.isoformat()}.json"
-            if path.name != expected_name or batch.request.trade_date in seen_dates:
+            if name != expected_name or batch.request.trade_date in seen_dates:
                 raise ValueError("invalid canonical batch")
             seen_dates.add(batch.request.trade_date)
             batches.append(batch)
-        return tuple(sorted(batches, key=lambda batch: batch.request.trade_date))
-    except (
-        OSError,
-        UnicodeDecodeError,
-        ValidationError,
-        ValueError,
-        TypeError,
-    ):
-        pass
-    raise ReportDiscoveryError()
 
-
-def load_verified_archives(results_root: Path) -> tuple[VerifiedArchive, ...]:
-    """Load only complete, hash-verified daily report archive snapshots."""
-
-    try:
-        batches = _load_report_batches(results_root)
-        _, reports_root = _report_paths(results_root)
-        verified: list[VerifiedArchive] = []
-        for batch in batches:
+        unarchived_dates: set[date] = set()
+        archives: list[VerifiedArchive] = []
+        for batch in sorted(batches, key=lambda item: item.request.trade_date):
             archive = batch.archive
             if archive is None:
+                unarchived_dates.add(batch.request.trade_date)
                 continue
             expected_filename = f"{batch.request.trade_date.isoformat()}.md"
             if archive.filename != expected_filename or not _is_aware(
                 archive.archived_at
             ):
                 raise ValueError("invalid archive metadata")
-            if reports_root.is_symlink() or not reports_root.is_dir():
-                raise OSError("invalid reports directory")
-            report_path = reports_root / expected_filename
-            report_bytes = _read_regular_bytes(report_path, MAX_REPORT_BYTES)
-            digest = hashlib.sha256(report_bytes).hexdigest()
-            if digest != archive.sha256:
-                raise ValueError("report digest mismatch")
-            items = tuple(
-                ReportCardItem(
-                    symbol=item.symbol,
-                    status=item.status,
-                    processed_signal=item.processed_signal,
-                    final_trade_decision=item.final_trade_decision,
-                    error_code=item.error_code,
+            if reports_descriptor is None:
+                reports_descriptor = _open_directory(
+                    "reports", parent_descriptor=hermes_descriptor
                 )
-                for item in archive.items
+            report_bytes = _read_regular_bytes_at(
+                reports_descriptor, expected_filename, MAX_REPORT_BYTES
             )
-            verified.append(
+            if hashlib.sha256(report_bytes).hexdigest() != archive.sha256:
+                raise ValueError("report digest mismatch")
+            archives.append(
                 VerifiedArchive(
                     trade_date=batch.request.trade_date,
                     batch_id=batch.batch_id,
                     report_sha256=archive.sha256,
                     state=archive.state,
-                    items=items,
-                    report_path=report_path,
+                    items=tuple(
+                        ReportCardItem(
+                            symbol=item.symbol,
+                            status=item.status,
+                            processed_signal=item.processed_signal,
+                            final_trade_decision=item.final_trade_decision,
+                            error_code=item.error_code,
+                        )
+                        for item in archive.items
+                    ),
+                    report_path=(
+                        root / "hermes" / "reports" / expected_filename
+                    ),
                     archived_at=archive.archived_at,
                 )
             )
-        ordered = sorted(verified, key=lambda archive: archive.trade_date)
-        snapshots: list[VerifiedArchive] = []
-        previous: VerifiedArchive | None = None
-        for archive in ordered:
-            snapshot = VerifiedArchive(
-                trade_date=archive.trade_date,
-                batch_id=archive.batch_id,
-                report_sha256=archive.report_sha256,
-                state=archive.state,
-                items=archive.items,
-                report_path=archive.report_path,
-                archived_at=archive.archived_at,
-                previous=previous,
-            )
-            snapshots.append(snapshot)
-            previous = snapshot
-        return tuple(snapshots)
-    except ReportDiscoveryError as error:
-        error.__context__ = None
-        raise
-    except (OSError, ValueError, TypeError):
+        return _ReportInventory(
+            _snapshot_archives(archives), frozenset(unarchived_dates)
+        )
+    except (
+        OSError,
+        RuntimeError,
+        UnicodeDecodeError,
+        ValidationError,
+        ValueError,
+        TypeError,
+    ):
         pass
+    finally:
+        for descriptor in (
+            reports_descriptor,
+            batches_descriptor,
+            hermes_descriptor,
+            root_descriptor,
+        ):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
     raise ReportDiscoveryError()
+
+
+def load_verified_archives(results_root: object) -> tuple[VerifiedArchive, ...]:
+    """Load only complete, hash-verified daily report archive snapshots."""
+
+    return _load_report_inventory(results_root).archives
 
 
 def discover_report_events(
@@ -495,17 +547,8 @@ def discover_missing_archive_events(
         for row in rows
     ):
         raise ReportDiscoveryError()
-    try:
-        batches = _load_report_batches(results_root)
-        # Reloading verifies the currently persisted report bytes before alerts.
-        current_archives = load_verified_archives(results_root)
-    except ReportDiscoveryError:
-        raise
-
-    unarchived_dates = {
-        batch.request.trade_date for batch in batches if batch.archive is None
-    }
-    archived_dates = {archive.trade_date for archive in current_archives}
+    inventory = _load_report_inventory(results_root)
+    archived_dates = {archive.trade_date for archive in inventory.archives}
     events: list[NotificationEvent] = []
     known_event_ids = set(state.deliveries)
     seen_execution_ids: set[str] = set()
@@ -516,7 +559,7 @@ def discover_missing_archive_events(
         trade_date = row.claimed_at.astimezone(SHANGHAI).date()
         event_id = f"missing_archive:{row.job_id}:{row.execution_id}"
         if (
-            trade_date not in unarchived_dates
+            trade_date not in inventory.unarchived_dates
             or trade_date in archived_dates
             or event_id in known_event_ids
         ):
