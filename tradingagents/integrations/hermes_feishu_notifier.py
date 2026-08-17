@@ -1421,9 +1421,10 @@ def _safe_mode(argv: object) -> str:
     return "unknown"
 
 
-def _normalize_argv(argv: object) -> tuple[str, ...] | None:
+def _normalize_argv(argv: Sequence[str] | None) -> tuple[str, ...] | None:
     try:
-        tokens = tuple(argv)
+        source = sys.argv[1:] if argv is None else argv
+        tokens = tuple(source)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
@@ -1504,7 +1505,7 @@ def main(
 ) -> int:
     """Run one explicitly selected Feishu notifier mode."""
 
-    tokens = _normalize_argv(sys.argv[1:] if argv is None else argv)
+    tokens = _normalize_argv(argv)
     mode = _safe_mode(tokens)
     try:
         valid_requests = {

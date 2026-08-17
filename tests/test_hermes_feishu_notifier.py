@@ -3219,6 +3219,25 @@ class HermesFeishuNotifierCliTests(unittest.TestCase):
                 store.assert_not_called()
                 client.assert_not_called()
 
+        class RaisingArgv(list):
+            def __getitem__(self, _index):
+                raise RuntimeError(marker)
+
+        stdout = io.StringIO()
+        with (
+            patch.object(notifier.sys, "argv", RaisingArgv(["notifier"])),
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            code = notifier.main(None, config=notifier_config())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["error"]["code"],
+            "INVALID_NOTIFY_REQUEST",
+        )
+        self.assertNotIn(marker, stdout.getvalue())
+
     def test_colliding_interrupts_propagate_from_cli_boundaries(self):
         class CollidingInterrupt(RuntimeError, KeyboardInterrupt):
             pass
