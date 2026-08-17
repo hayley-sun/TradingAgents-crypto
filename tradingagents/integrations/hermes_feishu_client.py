@@ -7,12 +7,21 @@ import os
 import re
 import stat
 import unicodedata
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 EXPECTED_JOB_NAMES = frozenset(
@@ -30,12 +39,28 @@ class FeishuConfigError(RuntimeError):
 
 
 class FeishuNotifierConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal[1] = 1
     webhook_url: str
     signing_secret: str = Field(min_length=1, max_length=512)
-    jobs: dict[str, str]
+    jobs: Mapping[str, str]
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def require_integer_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("version must be an integer")
+        return value
+
+    @field_validator("jobs")
+    @classmethod
+    def freeze_jobs(cls, value: Mapping[str, str]) -> Mapping[str, str]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("jobs")
+    def serialize_jobs(self, value: Mapping[str, str]) -> dict[str, str]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_boundary(self) -> Self:
@@ -83,7 +108,7 @@ def feishu_signature(timestamp: int, secret: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
-def load_private_config(path: str | os.PathLike[str]) -> FeishuNotifierConfig:
+def _load_private_config(path: str | os.PathLike[str]) -> FeishuNotifierConfig:
     descriptor: int | None = None
     try:
         config_path = Path(path)
@@ -96,7 +121,9 @@ def load_private_config(path: str | os.PathLike[str]) -> FeishuNotifierConfig:
         ):
             raise ValueError("invalid private configuration directory")
 
-        descriptor = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(
+            config_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
         file_metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(file_metadata.st_mode)
@@ -112,11 +139,17 @@ def load_private_config(path: str | os.PathLike[str]) -> FeishuNotifierConfig:
         if not isinstance(payload, dict) or set(payload) != EXPECTED_CONFIG_FIELDS:
             raise ValueError("invalid private configuration fields")
         return FeishuNotifierConfig.model_validate(payload)
-    except Exception:
-        raise FeishuConfigError(CONFIG_ERROR_MESSAGE) from None
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def load_private_config(path: str | os.PathLike[str]) -> FeishuNotifierConfig:
+    try:
+        return _load_private_config(path)
+    except Exception:
+        pass
+    raise FeishuConfigError(CONFIG_ERROR_MESSAGE)

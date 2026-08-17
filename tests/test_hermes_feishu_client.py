@@ -1,5 +1,6 @@
 import os
 import unittest
+from multiprocessing import get_context
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -52,6 +53,42 @@ def other_owner(metadata):
     return SimpleNamespace(st_mode=metadata.st_mode, st_uid=metadata.st_uid + 1)
 
 
+def exception_chain(error):
+    chain = []
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        pending.extend(
+            related
+            for related in (current.__cause__, current.__context__)
+            if related is not None
+        )
+    return chain
+
+
+def load_private_config_in_subprocess(path, sender):
+    try:
+        load_private_config(path)
+    except Exception as error:
+        sender.send(
+            (
+                type(error).__name__,
+                str(error),
+                error.__cause__ is None,
+                error.__context__ is None,
+            )
+        )
+    else:
+        sender.send(("accepted",))
+    finally:
+        sender.close()
+
+
 class FeishuNotifierConfigTests(unittest.TestCase):
     def test_signature_matches_fixed_vector(self):
         self.assertEqual(
@@ -65,6 +102,18 @@ class FeishuNotifierConfigTests(unittest.TestCase):
         self.assertEqual(config.jobs, VALID_JOBS)
         with self.assertRaises(ValidationError):
             config.version = 2
+
+    def test_valid_config_jobs_are_deeply_immutable_and_serializable(self):
+        config = FeishuNotifierConfig.model_validate(config_payload())
+        serialized = config.model_dump(mode="json")
+
+        self.assertEqual(config.jobs["daily_submit"], VALID_JOBS["daily_submit"])
+        self.assertEqual(config.jobs, VALID_JOBS)
+        self.assertEqual(serialized, config_payload())
+        with self.assertRaises(TypeError):
+            config.jobs["daily_submit"] = "not-valid"
+        self.assertEqual(config.jobs, VALID_JOBS)
+        self.assertEqual(config.model_dump(mode="json"), serialized)
 
     def test_config_rejects_non_feishu_urls(self):
         for url in (
@@ -160,6 +209,52 @@ class FeishuNotifierConfigTests(unittest.TestCase):
                     {**config_payload(), "signing_secret": secret}
                 )
 
+    def test_config_rejects_boolean_version(self):
+        with self.assertRaises(ValidationError):
+            FeishuNotifierConfig.model_validate(
+                {**config_payload(), "version": True}
+            )
+
+    def test_config_rejects_non_string_values_without_coercion(self):
+        payload = config_payload()
+        bytes_key_jobs = {
+            (key.encode("ascii") if key == "daily_submit" else key): value
+            for key, value in VALID_JOBS.items()
+        }
+        integer_key_jobs = {
+            (1 if key == "daily_submit" else key): value
+            for key, value in VALID_JOBS.items()
+        }
+        invalid_payloads = {
+            "bytes webhook URL": {
+                **payload,
+                "webhook_url": payload["webhook_url"].encode("ascii"),
+            },
+            "bytes signing secret": {
+                **payload,
+                "signing_secret": b"unit-test-signing-secret",
+            },
+            "bytes job name": {**payload, "jobs": bytes_key_jobs},
+            "bytes job ID": {
+                **payload,
+                "jobs": {
+                    **VALID_JOBS,
+                    "daily_submit": b"2d445dfc1a8a",
+                },
+            },
+            "integer webhook URL": {**payload, "webhook_url": 1},
+            "integer signing secret": {**payload, "signing_secret": 1},
+            "integer job name": {**payload, "jobs": integer_key_jobs},
+            "integer job ID": {
+                **payload,
+                "jobs": {**VALID_JOBS, "daily_submit": 1},
+            },
+        }
+
+        for case, invalid_payload in invalid_payloads.items():
+            with self.subTest(case=case), self.assertRaises(ValidationError):
+                FeishuNotifierConfig.model_validate(invalid_payload)
+
     def test_config_rejects_unknown_fields(self):
         with self.assertRaises(ValidationError):
             FeishuNotifierConfig.model_validate(
@@ -189,6 +284,7 @@ class PrivateFeishuConfigTests(unittest.TestCase):
             "Feishu notifier configuration unavailable",
         )
         self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_private_config_requires_regular_owner_only_file(self):
         with TemporaryDirectory() as directory:
@@ -201,6 +297,75 @@ class PrivateFeishuConfigTests(unittest.TestCase):
             link.symlink_to(path)
             self.assert_config_unavailable(lambda: load_private_config(link))
 
+    def test_private_config_error_does_not_expose_secret_context(self):
+        marker = "LEAKMARK1739"
+        payload = {
+            **config_payload(),
+            "signing_secret": marker + "x" * 513,
+        }
+        with TemporaryDirectory() as directory:
+            _, path = write_private_config(directory, payload)
+
+            with self.assertRaises(FeishuConfigError) as raised:
+                load_private_config(path)
+
+        error = raised.exception
+        self.assertEqual(
+            str(error), "Feishu notifier configuration unavailable"
+        )
+        self.assertIsNone(error.__cause__)
+        with self.subTest("context"):
+            self.assertIsNone(error.__context__)
+        with self.subTest("public representation"):
+            self.assertNotIn(marker, repr(error))
+        with self.subTest("recursive exception chain"):
+            self.assertNotIn(
+                marker,
+                "\n".join(repr(item) for item in exception_chain(error)),
+            )
+
+    def test_private_config_rejects_boolean_version(self):
+        with TemporaryDirectory() as directory:
+            _, path = write_private_config(
+                directory, {**config_payload(), "version": True}
+            )
+
+            self.assert_config_unavailable(lambda: load_private_config(path))
+
+    def test_private_config_rejects_yaml_binary_string_values(self):
+        payload = config_payload()
+        binary_key_jobs = {
+            (key.encode("ascii") if key == "daily_submit" else key): value
+            for key, value in VALID_JOBS.items()
+        }
+        invalid_payloads = {
+            "binary webhook URL": {
+                **payload,
+                "webhook_url": payload["webhook_url"].encode("ascii"),
+            },
+            "binary signing secret": {
+                **payload,
+                "signing_secret": b"unit-test-signing-secret",
+            },
+            "binary job name": {**payload, "jobs": binary_key_jobs},
+            "binary job ID": {
+                **payload,
+                "jobs": {
+                    **VALID_JOBS,
+                    "daily_submit": b"2d445dfc1a8a",
+                },
+            },
+        }
+
+        for case, invalid_payload in invalid_payloads.items():
+            with self.subTest(case=case), TemporaryDirectory() as directory:
+                self.assertIn("!!binary", yaml.safe_dump(invalid_payload))
+                _, path = write_private_config(directory, invalid_payload)
+
+                self.assert_config_unavailable(
+                    lambda: load_private_config(path)
+                )
+
     def test_private_config_rejects_non_regular_file(self):
         with TemporaryDirectory() as directory:
             secret_root = Path(directory) / "secrets"
@@ -209,6 +374,45 @@ class PrivateFeishuConfigTests(unittest.TestCase):
             path.mkdir(mode=0o600)
 
             self.assert_config_unavailable(lambda: load_private_config(path))
+
+    def test_private_config_rejects_fifo_without_blocking(self):
+        with TemporaryDirectory() as directory:
+            secret_root = Path(directory) / "secrets"
+            secret_root.mkdir(mode=0o700)
+            path = secret_root / "feishu-notifier.yaml"
+            os.mkfifo(path, mode=0o600)
+            context = get_context("fork")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=load_private_config_in_subprocess,
+                args=(path, sender),
+            )
+            process.start()
+            sender.close()
+            process.join(timeout=2)
+            blocked = process.is_alive()
+            if blocked:
+                process.terminate()
+                process.join(timeout=2)
+            try:
+                result = receiver.recv() if receiver.poll() else None
+            except EOFError:
+                result = None
+            has_result = result is not None
+            receiver.close()
+            process.close()
+
+        self.assertFalse(blocked, "FIFO config open blocked without a writer")
+        self.assertTrue(has_result)
+        self.assertEqual(
+            result,
+            (
+                "FeishuConfigError",
+                "Feishu notifier configuration unavailable",
+                True,
+                True,
+            ),
+        )
 
     def test_private_config_requires_exact_parent_mode(self):
         for mode in (0o750, 0o701):
