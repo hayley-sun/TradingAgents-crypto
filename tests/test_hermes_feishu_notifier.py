@@ -1952,6 +1952,101 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(before, after)
 
+    def test_save_failures_preserve_last_successful_delivery_state(self):
+        cases = (
+            ("initial_pending", 1, "success", 0, 0, None),
+            ("begin_attempt", 2, "success", 0, 0, None),
+            ("failure_result", 3, "failure", 1, 1, None),
+            ("success_result", 3, "success", 1, 1, None),
+            ("final_prune", 4, "success", 1, 1, "delivered"),
+        )
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        failure_id = "7" * 32
+        current = dict(histories)
+        current[job_id] = (
+            cron_execution(
+                failure_id,
+                "failed",
+                self.NOW + timedelta(minutes=1),
+                job_id=job_id,
+            ),
+            *histories[job_id],
+        )
+        event_id = f"failure:{job_id}:{failure_id}"
+
+        for (
+            name,
+            failed_save,
+            client_result,
+            expected_client_calls,
+            expected_attempts,
+            expected_result,
+        ) in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                real_store = NotificationStateStore(Path(directory) / "state")
+                notifier.initialize_notifier(
+                    real_store,
+                    notifier_config(),
+                    lambda source_job_id: histories[source_job_id],
+                    lambda: (),
+                    self.NOW,
+                )
+
+                class FailingSaveStore:
+                    def __init__(inner_self):
+                        inner_self.save_calls = 0
+                        inner_self.last_successful = real_store.load()
+
+                    def lock(inner_self):
+                        return real_store.lock()
+
+                    def load_optional(inner_self):
+                        return real_store.load_optional()
+
+                    def save(inner_self, state):
+                        inner_self.save_calls += 1
+                        if inner_self.save_calls == failed_save:
+                            raise NotificationStateError("safe")
+                        real_store.save(state)
+                        inner_self.last_successful = state
+
+                class CaseClient:
+                    def __init__(inner_self):
+                        inner_self.calls = 0
+
+                    def send(inner_self, _card):
+                        inner_self.calls += 1
+                        if client_result == "failure":
+                            raise FeishuDeliveryError("timeout")
+
+                store = FailingSaveStore()
+                client = CaseClient()
+                code, payload = notifier.run_notifier_once(
+                    store,
+                    notifier_config(),
+                    client,
+                    lambda source_job_id: current[source_job_id],
+                    lambda: (),
+                    self.NOW + timedelta(minutes=2),
+                )
+                durable = real_store.load()
+
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["result"], "state_error")
+            self.assertEqual(client.calls, expected_client_calls)
+            self.assertEqual(durable, store.last_successful)
+            if event_id not in durable.deliveries:
+                self.assertEqual(expected_attempts, 0)
+                continue
+            record = durable.deliveries[event_id]
+            self.assertEqual(record.attempt_count, expected_attempts)
+            self.assertEqual(record.last_result, expected_result)
+            self.assertEqual(
+                record.delivered_at is not None,
+                expected_result == "delivered",
+            )
+
     def test_unexpected_client_crash_retries_same_event_id(self):
         histories = execution_histories(self.NOW)
         job_id = NOTIFIER_JOBS["review_memory"]
@@ -2075,6 +2170,128 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
         self.assertEqual(
             durable.next_attempt_at, attempt_at + timedelta(minutes=5)
         )
+        self.assertIsNone(durable.delivered_at)
+
+    def test_lock_release_named_errors_after_normal_body_are_state_errors(self):
+        histories = execution_histories(self.NOW)
+        for release_error in (
+            NotificationAlreadyRunning("release collision"),
+            NotificationStateError("release failure"),
+        ):
+            with self.subTest(error=type(release_error).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    real_store = NotificationStateStore(
+                        Path(directory) / "state"
+                    )
+                    notifier.initialize_notifier(
+                        real_store,
+                        notifier_config(),
+                        lambda job_id: histories[job_id],
+                        lambda: (),
+                        self.NOW,
+                    )
+
+                    class ExitFailure:
+                        def __enter__(inner_self):
+                            return None
+
+                        def __exit__(
+                            inner_self, exception_type, exception, traceback
+                        ):
+                            self.assertIsNone(exception_type)
+                            raise release_error
+
+                    class ReleaseFailingStore:
+                        def lock(inner_self):
+                            return ExitFailure()
+
+                        def load_optional(inner_self):
+                            return real_store.load_optional()
+
+                        def save(inner_self, state):
+                            real_store.save(state)
+
+                    code, payload = notifier.run_notifier_once(
+                        ReleaseFailingStore(),
+                        notifier_config(),
+                        type(
+                            "NoSendClient", (), {"send": lambda *_args: None}
+                        )(),
+                        lambda job_id: histories[job_id],
+                        lambda: (),
+                        self.NOW + timedelta(minutes=1),
+                    )
+                    durable = real_store.load()
+
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["result"], "state_error")
+                self.assertEqual(durable.deliveries, {})
+
+    def test_lock_cleanup_does_not_replace_active_client_crash(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        failure_id = "6" * 32
+        current = dict(histories)
+        current[job_id] = (
+            cron_execution(
+                failure_id,
+                "failed",
+                self.NOW + timedelta(minutes=1),
+                job_id=job_id,
+            ),
+            *histories[job_id],
+        )
+        event_id = f"failure:{job_id}:{failure_id}"
+        client_crash = RuntimeError("client crash")
+
+        with tempfile.TemporaryDirectory() as directory:
+            real_store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                real_store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+
+            class CleanupFailure:
+                def __enter__(inner_self):
+                    return None
+
+                def __exit__(
+                    inner_self, exception_type, exception, traceback
+                ):
+                    self.assertIs(exception, client_crash)
+                    raise NotificationStateError("cleanup failure")
+
+            class CleanupFailingStore:
+                def lock(inner_self):
+                    return CleanupFailure()
+
+                def load_optional(inner_self):
+                    return real_store.load_optional()
+
+                def save(inner_self, state):
+                    real_store.save(state)
+
+            class CrashingClient:
+                def send(inner_self, _card):
+                    raise client_crash
+
+            attempt_at = self.NOW + timedelta(minutes=2)
+            with self.assertRaises(RuntimeError) as raised:
+                notifier.run_notifier_once(
+                    CleanupFailingStore(),
+                    notifier_config(),
+                    CrashingClient(),
+                    lambda source_job_id: current[source_job_id],
+                    lambda: (),
+                    attempt_at,
+                )
+            durable = real_store.load().deliveries[event_id]
+
+        self.assertIs(raised.exception, client_crash)
+        self.assertEqual(durable.attempt_count, 1)
         self.assertIsNone(durable.delivered_at)
 
     def test_report_render_uses_nearest_previous_and_missing_exact_fails(self):
@@ -2214,6 +2431,266 @@ class HermesFeishuOrchestrationTests(unittest.TestCase):
         self.assertEqual(
             state.deliveries[event_id].last_result, "report_unavailable"
         )
+
+    def test_old_failure_above_blocked_cursor_is_retained_until_cursor_advances(self):
+        histories = execution_histories(self.NOW)
+        job_id = NOTIFIER_JOBS["review_memory"]
+        cursor_row = histories[job_id][0]
+        blocker = cron_execution(
+            "b" * 32,
+            "running",
+            self.NOW + timedelta(minutes=1),
+            job_id=job_id,
+        )
+        failure = cron_execution(
+            "c" * 32,
+            "failed",
+            self.NOW + timedelta(minutes=2),
+            job_id=job_id,
+        )
+        blocked = dict(histories)
+        blocked[job_id] = (failure, blocker, cursor_row)
+        event_id = f"failure:{job_id}:{failure.execution_id}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+            sends = []
+            client = type(
+                "RecordingClient",
+                (),
+                {"send": lambda _self, card: sends.append(card)},
+            )()
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: blocked[source_job_id],
+                lambda: (),
+                self.NOW + timedelta(minutes=3),
+            )
+            old_now = self.NOW + timedelta(days=91)
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: blocked[source_job_id],
+                lambda: (),
+                old_now,
+            )
+            retained = store.load()
+
+            advanced = dict(blocked)
+            advanced[job_id] = (
+                failure,
+                dataclasses.replace(blocker, status="unknown"),
+                cursor_row,
+            )
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: advanced[source_job_id],
+                lambda: (),
+                old_now + timedelta(minutes=1),
+            )
+            pruned = store.load()
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: advanced[source_job_id],
+                lambda: (),
+                old_now + timedelta(minutes=2),
+            )
+
+        self.assertIn(event_id, retained.deliveries)
+        self.assertEqual(retained.execution_cursors[job_id], cursor_row.execution_id)
+        self.assertNotIn(event_id, pruned.deliveries)
+        self.assertEqual(pruned.execution_cursors[job_id], failure.execution_id)
+        self.assertEqual(len(sends), 1)
+
+    def test_old_missing_archive_above_blocked_cursor_is_retained_until_advance(self):
+        histories = execution_histories(self.NOW)
+        job_id = ARCHIVE_JOB_ID
+        cursor_row = histories[job_id][0]
+        blocker = cron_execution(
+            "d" * 32,
+            "running",
+            self.NOW + timedelta(minutes=1),
+            job_id=job_id,
+        )
+        completed = cron_execution(
+            "e" * 32,
+            "completed",
+            self.NOW + timedelta(minutes=2),
+            job_id=job_id,
+        )
+        blocked = dict(histories)
+        blocked[job_id] = (completed, blocker, cursor_row)
+        trade_date = completed.claimed_at.astimezone(SHANGHAI).date()
+        inventory = notifier._ReportInventory((), frozenset({trade_date}))
+        event_id = f"missing_archive:{job_id}:{completed.execution_id}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "state")
+            notifier.initialize_notifier(
+                store,
+                notifier_config(),
+                lambda source_job_id: histories[source_job_id],
+                lambda: (),
+                self.NOW,
+            )
+            sends = []
+            client = type(
+                "RecordingClient",
+                (),
+                {"send": lambda _self, card: sends.append(card)},
+            )()
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: blocked[source_job_id],
+                lambda: inventory,
+                self.NOW + timedelta(minutes=3),
+            )
+            old_now = self.NOW + timedelta(days=91)
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: blocked[source_job_id],
+                lambda: inventory,
+                old_now,
+            )
+            retained = store.load()
+
+            advanced = dict(blocked)
+            advanced[job_id] = (
+                completed,
+                dataclasses.replace(blocker, status="unknown"),
+                cursor_row,
+            )
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: advanced[source_job_id],
+                lambda: inventory,
+                old_now + timedelta(minutes=1),
+            )
+            pruned = store.load()
+            notifier.run_notifier_once(
+                store,
+                notifier_config(),
+                client,
+                lambda source_job_id: advanced[source_job_id],
+                lambda: inventory,
+                old_now + timedelta(minutes=2),
+            )
+
+        self.assertIn(event_id, retained.deliveries)
+        self.assertEqual(retained.execution_cursors[job_id], cursor_row.execution_id)
+        self.assertNotIn(event_id, pruned.deliveries)
+        self.assertEqual(pruned.execution_cursors[job_id], completed.execution_id)
+        self.assertEqual(len(sends), 1)
+
+    def test_invalid_loaded_attempt_counts_fail_before_sources_or_mutation(self):
+        event = self.failure_event()
+        pending = notifier.add_pending_events(
+            empty_notification_state(), (event,), self.NOW
+        )
+        for attempt_count in (-1, True, 10**100):
+            with self.subTest(attempt_count=attempt_count):
+                record = pending.deliveries[event.event_id].model_copy(
+                    update={"attempt_count": attempt_count}
+                )
+                malformed = pending.model_copy(
+                    update={"deliveries": {event.event_id: record}}
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    real_store = NotificationStateStore(
+                        Path(directory) / "state"
+                    )
+                    baseline = empty_notification_state()
+                    real_store.save(baseline)
+                    before = real_store.path.read_bytes()
+                    activity = []
+
+                    class MalformedStateStore:
+                        def lock(inner_self):
+                            return real_store.lock()
+
+                        def load_optional(inner_self):
+                            return malformed
+
+                        def save(inner_self, state):
+                            activity.append("save")
+                            real_store.save(state)
+
+                    code, payload = notifier.run_notifier_once(
+                        MalformedStateStore(),
+                        notifier_config(),
+                        type(
+                            "NoSendClient",
+                            (),
+                            {
+                                "send": lambda _self, _card: activity.append(
+                                    "send"
+                                )
+                            },
+                        )(),
+                        lambda _job_id: activity.append("execution"),
+                        lambda: activity.append("archive"),
+                        self.NOW,
+                    )
+                    after = real_store.path.read_bytes()
+
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["result"], "state_error")
+                self.assertEqual(activity, [])
+                self.assertEqual(before, after)
+
+    def test_extreme_aware_times_fail_before_lock_or_sources(self):
+        for now in (
+            datetime.min.replace(tzinfo=timezone.utc),
+            datetime.max.replace(tzinfo=timezone.utc),
+        ):
+            with self.subTest(now=now):
+                activity = []
+
+                class UntouchedStore:
+                    def lock(inner_self):
+                        activity.append("lock")
+                        raise AssertionError("lock must not be acquired")
+
+                code, payload = notifier.run_notifier_once(
+                    UntouchedStore(),
+                    notifier_config(),
+                    type(
+                        "NoSendClient",
+                        (),
+                        {
+                            "send": lambda _self, _card: activity.append(
+                                "send"
+                            )
+                        },
+                    )(),
+                    lambda _job_id: activity.append("execution"),
+                    lambda: activity.append("archive"),
+                    now,
+                )
+
+                self.assertEqual(code, 1)
+                self.assertEqual(payload["result"], "invalid_time")
+                self.assertEqual(activity, [])
 
     def test_run_persists_attempt_before_send_and_marks_success(self):
         histories = execution_histories(self.NOW)

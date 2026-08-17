@@ -31,7 +31,6 @@ from tradingagents.integrations.hermes_feishu_state import (
     NotificationState,
     NotificationStateError,
     initialized_state,
-    prune_delivered,
     retry_delay,
 )
 from tradingagents.integrations.schemas import DailyReportBatch
@@ -673,6 +672,7 @@ SAFE_DELIVERY_RESULTS = frozenset(
         "feishu_error",
     }
 )
+MAX_ATTEMPT_COUNT = 1_000_000
 
 
 class _CardClient(Protocol):
@@ -680,8 +680,17 @@ class _CardClient(Protocol):
 
 
 def _require_aware_now(now: object) -> datetime:
-    if not _is_aware(now):
+    try:
+        aware = _is_aware(now)
+    except Exception:
+        aware = False
+    if not aware:
         raise ValueError("notification time unavailable")
+    try:
+        now - timedelta(days=90)
+        now + timedelta(hours=24)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("notification time unavailable") from None
     return now
 
 
@@ -971,6 +980,11 @@ def begin_attempt(
 ) -> NotificationState:
     checked_now = _require_aware_now(now)
     record = state.deliveries[event_id]
+    if (
+        type(record.attempt_count) is not int
+        or not 0 <= record.attempt_count < MAX_ATTEMPT_COUNT
+    ):
+        raise ValueError("invalid delivery attempt count")
     attempt_count = record.attempt_count + 1
     deliveries = dict(state.deliveries)
     deliveries[event_id] = record.model_copy(
@@ -1093,6 +1107,76 @@ def _pending_count(state: NotificationState) -> int:
     )
 
 
+def _validate_runtime_state(
+    state: object, now: datetime
+) -> NotificationState:
+    if not isinstance(state, NotificationState):
+        raise NotificationStateError("notification state unavailable")
+    cutoff = now - timedelta(days=90)
+    try:
+        for record in state.deliveries.values():
+            if (
+                type(record.attempt_count) is not int
+                or not 0 <= record.attempt_count < MAX_ATTEMPT_COUNT
+                or not _is_aware(record.next_attempt_at)
+                or (
+                    record.delivered_at is not None
+                    and not _is_aware(record.delivered_at)
+                )
+            ):
+                raise ValueError("invalid delivery state")
+            record.next_attempt_at <= now
+            if record.delivered_at is not None:
+                record.delivered_at >= cutoff
+    except Exception:
+        raise NotificationStateError(
+            "notification state unavailable"
+        ) from None
+    return state
+
+
+def _execution_delivery_may_be_rediscovered(
+    state: NotificationState, record: DeliveryRecord
+) -> bool:
+    event = record.event
+    try:
+        if event.job_id is None or event.execution_id is None:
+            return True
+        observed = state.seen_execution_ids[event.job_id]
+        cursor = state.execution_cursors[event.job_id]
+        if (
+            cursor is None
+            or len(observed) != len(set(observed))
+            or observed.count(cursor) != 1
+            or observed.count(event.execution_id) != 1
+        ):
+            return True
+        return observed.index(event.execution_id) < observed.index(cursor)
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def prune_notifier_deliveries(
+    state: NotificationState, now: datetime
+) -> NotificationState:
+    """Prune only delivery metadata proven unable to replay."""
+
+    checked_now = _require_aware_now(now)
+    cutoff = checked_now - timedelta(days=90)
+    deliveries: dict[str, DeliveryRecord] = {}
+    for event_id, record in state.deliveries.items():
+        recent_or_pending = (
+            record.delivered_at is None or record.delivered_at >= cutoff
+        )
+        execution_event_may_recur = (
+            record.event.kind in {"execution_failure", "missing_archive"}
+            and _execution_delivery_may_be_rediscovered(state, record)
+        )
+        if recent_or_pending or execution_event_may_recur:
+            deliveries[event_id] = record
+    return state.model_copy(update={"deliveries": deliveries})
+
+
 def run_notifier_once(
     store: object,
     config: object,
@@ -1117,102 +1201,128 @@ def run_notifier_once(
     discovered_count = 0
     delivered_count = 0
     last_state: NotificationState | None = None
-    exception_source = "lock"
-    try:
-        with store.lock():
-            exception_source = "state"
-            state = store.load_optional()
-            if state is None:
-                return 1, _run_payload(
-                    ok=False,
-                    discovered=0,
-                    delivered=0,
-                    pending=0,
-                    result="uninitialized",
-                )
-            last_state = state
-            exception_source = "discovery"
-            try:
-                discovered_state, events, inventory = discover_all_events(
-                    state,
-                    config,
-                    execution_loader,
-                    archive_loader,
-                )
-            except (ExecutionDiscoveryError, ReportDiscoveryError):
-                exception_source = "state"
-                return 1, _run_payload(
-                    ok=False,
-                    discovered=0,
-                    delivered=0,
-                    pending=_pending_count(state),
-                    result="discovery_error",
-                )
-            discovered_count = len(events)
-            state = add_pending_events(discovered_state, events, checked_now)
-            exception_source = "state"
-            store.save(state)
-            last_state = state
+    exception_source = "state"
+    lock_context: object
 
-            delivery_failed = False
-            for event_id in due_event_ids(state, checked_now):
-                exception_source = "delivery"
-                state = begin_attempt(state, event_id, checked_now)
-                exception_source = "state"
-                store.save(state)
-                last_state = state
-                record = state.deliveries[event_id]
-                exception_source = "render"
-                try:
-                    card = render_persisted_event(record.event, inventory)
-                except ReportDiscoveryError:
-                    exception_source = "delivery"
-                    state = _record_failure_result(
-                        state,
-                        event_id,
-                        checked_now,
-                        "report_unavailable",
-                    )
-                    exception_source = "state"
-                    store.save(state)
-                    last_state = state
-                    delivery_failed = True
-                    continue
-                exception_source = "client"
-                try:
-                    client.send(card)
-                except FeishuDeliveryError as error:
-                    exception_source = "delivery"
-                    state = record_delivery_failure(
-                        state, event_id, checked_now, error
-                    )
-                    exception_source = "state"
-                    store.save(state)
-                    last_state = state
-                    delivery_failed = True
-                    continue
-                exception_source = "delivery"
-                state = record_delivery_success(state, event_id, checked_now)
-                exception_source = "state"
-                store.save(state)
-                last_state = state
-                delivered_count += 1
+    def state_error_result() -> tuple[int, dict[str, object]]:
+        return 1, _run_payload(
+            ok=False,
+            discovered=discovered_count,
+            delivered=delivered_count,
+            pending=_pending_count(last_state) if last_state else 0,
+            result="state_error",
+        )
 
-            exception_source = "delivery"
-            state = prune_delivered(state, checked_now)
-            exception_source = "state"
-            store.save(state)
-            last_state = state
-            code = 1 if delivery_failed else 0
-            return code, _run_payload(
-                ok=not delivery_failed,
-                discovered=discovered_count,
-                delivered=delivered_count,
-                pending=_pending_count(state),
+    def run_locked_body() -> tuple[int, dict[str, object]]:
+        nonlocal discovered_count
+        nonlocal delivered_count
+        nonlocal exception_source
+        nonlocal last_state
+
+        exception_source = "state"
+        state = store.load_optional()
+        if state is None:
+            return 1, _run_payload(
+                ok=False,
+                discovered=0,
+                delivered=0,
+                pending=0,
+                result="uninitialized",
             )
+        state = _validate_runtime_state(state, checked_now)
+        last_state = state
+        exception_source = "discovery"
+        try:
+            discovered_state, events, inventory = discover_all_events(
+                state,
+                config,
+                execution_loader,
+                archive_loader,
+            )
+        except (ExecutionDiscoveryError, ReportDiscoveryError):
+            return 1, _run_payload(
+                ok=False,
+                discovered=0,
+                delivered=0,
+                pending=_pending_count(state),
+                result="discovery_error",
+            )
+        discovered_count = len(events)
+        state = add_pending_events(discovered_state, events, checked_now)
+        exception_source = "state"
+        store.save(state)
+        last_state = state
+
+        delivery_failed = False
+        exception_source = "delivery"
+        for event_id in due_event_ids(state, checked_now):
+            state = begin_attempt(state, event_id, checked_now)
+            exception_source = "state"
+            store.save(state)
+            last_state = state
+            record = state.deliveries[event_id]
+            exception_source = "render"
+            try:
+                card = render_persisted_event(record.event, inventory)
+            except ReportDiscoveryError:
+                exception_source = "delivery"
+                state = _record_failure_result(
+                    state,
+                    event_id,
+                    checked_now,
+                    "report_unavailable",
+                )
+                exception_source = "state"
+                store.save(state)
+                last_state = state
+                delivery_failed = True
+                exception_source = "delivery"
+                continue
+            exception_source = "client"
+            try:
+                client.send(card)
+            except FeishuDeliveryError as error:
+                exception_source = "delivery"
+                state = record_delivery_failure(
+                    state, event_id, checked_now, error
+                )
+                exception_source = "state"
+                store.save(state)
+                last_state = state
+                delivery_failed = True
+                exception_source = "delivery"
+                continue
+            exception_source = "delivery"
+            state = record_delivery_success(state, event_id, checked_now)
+            exception_source = "state"
+            store.save(state)
+            last_state = state
+            delivered_count += 1
+            exception_source = "delivery"
+
+        state = prune_notifier_deliveries(state, checked_now)
+        exception_source = "state"
+        store.save(state)
+        last_state = state
+        code = 1 if delivery_failed else 0
+        return code, _run_payload(
+            ok=not delivery_failed,
+            discovered=discovered_count,
+            delivered=delivered_count,
+            pending=_pending_count(state),
+        )
+
+    def release_preserving(error: BaseException) -> None:
+        try:
+            lock_context.__exit__(type(error), error, error.__traceback__)
+        except BaseException:
+            # The active body exception remains authoritative over cleanup.
+            pass
+
+    try:
+        lock_context = store.lock()
+        lock_context.__enter__()
     except NotificationAlreadyRunning:
-        if exception_source != "lock":
-            raise
         return 0, _run_payload(
             ok=True,
             discovered=0,
@@ -1221,15 +1331,24 @@ def run_notifier_once(
             result="already_running",
         )
     except NotificationStateError:
-        if exception_source not in {"lock", "state"}:
+        return state_error_result()
+
+    try:
+        result = run_locked_body()
+    except NotificationStateError as error:
+        release_preserving(error)
+        if exception_source != "state":
             raise
-        return 1, _run_payload(
-            ok=False,
-            discovered=discovered_count,
-            delivered=delivered_count,
-            pending=_pending_count(last_state) if last_state else 0,
-            result="state_error",
-        )
+        return state_error_result()
+    except BaseException as error:
+        release_preserving(error)
+        raise
+
+    try:
+        lock_context.__exit__(None, None, None)
+    except (NotificationAlreadyRunning, NotificationStateError):
+        return state_error_result()
+    return result
 
 
 def send_test_card(
