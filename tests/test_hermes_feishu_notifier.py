@@ -49,6 +49,17 @@ def state_with_cursor(job_id, execution_id):
     )
 
 
+def run_header(index, *, claimed_at=None):
+    occurred_at = claimed_at or (
+        datetime(2026, 8, 14, tzinfo=timezone.utc)
+        + timedelta(minutes=index)
+    )
+    return (
+        f"{index:032x}  completed  job={JOB_ID}  source=schedule  "
+        f"{occurred_at.isoformat()}"
+    )
+
+
 class HermesFeishuNotifierTests(unittest.TestCase):
     def test_parse_keeps_headers_and_discards_error_detail(self):
         records = parse_cron_runs(RUNS_OUTPUT, "e93cfab5f78e")
@@ -119,6 +130,34 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         with self.assertRaises(ExecutionDiscoveryError):
             parse_cron_runs(output, JOB_ID)
 
+    def test_parse_rejects_malformed_follow_up_execution_headers(self):
+        valid_header = run_header(1)
+        malformed_headers = {
+            "unknown status": (
+                f"{'b' * 32}  cancelled  job={JOB_ID}  source=schedule  "
+                "2026-08-14T17:00:00+08:00"
+            ),
+            "missing timestamp": (
+                f"{'b' * 32}  failed     job={JOB_ID}  source=schedule"
+            ),
+            "malformed execution ID": (
+                f"not-an-execution-id  failed     job={JOB_ID}  "
+                "source=schedule  2026-08-14T17:00:00+08:00"
+            ),
+            "malformed job ID": (
+                f"{'b' * 32}  failed     job=not-a-job-id  "
+                "source=schedule  2026-08-14T17:00:00+08:00"
+            ),
+        }
+
+        for case, malformed_header in malformed_headers.items():
+            with self.subTest(case=case), self.assertRaises(
+                ExecutionDiscoveryError
+            ):
+                parse_cron_runs(
+                    f"{valid_header}\n{malformed_header}\n", JOB_ID
+                )
+
     def test_parse_accepts_only_exact_no_records_line(self):
         self.assertEqual(
             parse_cron_runs("\nNo cron execution attempts recorded.\n\n", JOB_ID),
@@ -155,6 +194,26 @@ class HermesFeishuNotifierTests(unittest.TestCase):
                 ExecutionDiscoveryError
             ):
                 parse_cron_runs(output, JOB_ID)
+
+    def test_parse_rejects_non_string_job_id_safely(self):
+        with self.assertRaises(ExecutionDiscoveryError) as raised:
+            parse_cron_runs(RUNS_OUTPUT, 7)
+
+        self.assert_safe_discovery_error(raised.exception)
+
+    def test_parse_accepts_500_headers_and_rejects_501(self):
+        five_hundred = "\n".join(run_header(index) for index in range(500))
+
+        records = parse_cron_runs(five_hundred, JOB_ID)
+
+        self.assertEqual(len(records), 500)
+        self.assertEqual(records[0].execution_id, f"{499:032x}")
+        self.assertEqual(records[-1].execution_id, f"{0:032x}")
+
+        five_hundred_one = f"{five_hundred}\n{run_header(500)}\n"
+        with self.assertRaises(ExecutionDiscoveryError) as raised:
+            parse_cron_runs(five_hundred_one, JOB_ID)
+        self.assert_safe_discovery_error(raised.exception)
 
     def test_parse_normalizes_newest_first_and_preserves_cli_tie_order(self):
         output = "\n".join(
@@ -234,6 +293,19 @@ class HermesFeishuNotifierTests(unittest.TestCase):
 
         self.assert_safe_discovery_error(raised.exception)
 
+    def test_loader_rejects_unicode_decode_error_without_exposing_context(self):
+        def run(command, **kwargs):
+            raise UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "decode-marker-must-never-escape"
+            )
+
+        with self.assertRaises(ExecutionDiscoveryError) as raised:
+            load_cron_runs(JOB_ID, run_command=run)
+
+        self.assert_safe_discovery_error(
+            raised.exception, "decode-marker-must-never-escape"
+        )
+
     def test_loader_rejects_oserror_and_malformed_stdout_safely(self):
         def fail_to_start(command, **kwargs):
             raise OSError("DEEPSEEK_API_KEY=must-never-escape")
@@ -259,6 +331,19 @@ class HermesFeishuNotifierTests(unittest.TestCase):
                 JOB_ID, run_command=run, hermes_cli=Path("bin/hermes")
             )
 
+        self.assertFalse(called)
+
+    def test_loader_rejects_non_string_job_id_without_running_command(self):
+        called = False
+
+        def run(command, **kwargs):
+            nonlocal called
+            called = True
+
+        with self.assertRaises(ExecutionDiscoveryError) as raised:
+            load_cron_runs(7, run_command=run)
+
+        self.assert_safe_discovery_error(raised.exception)
         self.assertFalse(called)
 
     def test_discovery_rejects_cursor_missing_from_nonempty_window(self):
@@ -467,7 +552,29 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assertEqual(state.execution_cursors[JOB_ID], None)
         self.assertEqual(state.seen_execution_ids[JOB_ID], [])
 
-    def assert_safe_discovery_error(self, error):
+    def test_discovery_rejects_non_string_job_ids_without_state_change(self):
+        state = state_with_cursor(JOB_ID, None)
+        invalid_boundaries = (
+            {"job_id": 7, "daily_archive_job_id": ARCHIVE_JOB_ID},
+            {"job_id": JOB_ID, "daily_archive_job_id": 7},
+        )
+
+        for arguments in invalid_boundaries:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ExecutionDiscoveryError) as raised:
+                    discover_execution_events(
+                        state,
+                        "review_memory",
+                        arguments["job_id"],
+                        (),
+                        daily_archive_job_id=arguments[
+                            "daily_archive_job_id"
+                        ],
+                    )
+                self.assert_safe_discovery_error(raised.exception)
+                self.assertEqual(state, state_with_cursor(JOB_ID, None))
+
+    def assert_safe_discovery_error(self, error, *forbidden_markers):
         self.assertEqual(str(error), "Hermes execution history unavailable")
         self.assertEqual(error.args, ("Hermes execution history unavailable",))
         self.assertIsNone(error.__cause__)
@@ -476,6 +583,8 @@ class HermesFeishuNotifierTests(unittest.TestCase):
         self.assertNotIn("must-never-escape", rendered)
         self.assertNotIn("stdout", rendered)
         self.assertNotIn("stderr", rendered)
+        for marker in forbidden_markers:
+            self.assertNotIn(marker, rendered)
 
 
 if __name__ == "__main__":

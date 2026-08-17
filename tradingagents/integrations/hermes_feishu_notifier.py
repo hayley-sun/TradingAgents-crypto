@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeGuard
 
 from tradingagents.integrations.hermes_feishu_state import (
     NotificationEvent,
@@ -30,6 +30,7 @@ RUN_LINE = re.compile(
     r"job=(?P<job_id>[0-9a-f]{12})  "
     r"source=(?P<source>[^\s]+)  (?P<claimed_at>[^\s]+)$"
 )
+RUN_HEADER_SHAPE = re.compile(r"(?:^|\s)job=\S+\s+source=\S+(?:\s|$)")
 EXECUTION_ID = re.compile(r"^[0-9a-f]{32}$")
 JOB_ID = re.compile(r"^[0-9a-f]{12}$")
 
@@ -39,6 +40,10 @@ class ExecutionDiscoveryError(RuntimeError):
 
     def __init__(self, *_ignored: object) -> None:
         super().__init__(EXECUTION_ERROR_MESSAGE)
+
+
+def _is_job_id(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and JOB_ID.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -60,8 +65,7 @@ class CronExecution:
         valid = (
             isinstance(self.execution_id, str)
             and EXECUTION_ID.fullmatch(self.execution_id) is not None
-            and isinstance(self.job_id, str)
-            and JOB_ID.fullmatch(self.job_id) is not None
+            and _is_job_id(self.job_id)
             and isinstance(self.status, str)
             and self.status in EXECUTION_STATUSES
             and isinstance(self.source, str)
@@ -113,7 +117,7 @@ def _normalize_rows(rows: Sequence[CronExecution]) -> tuple[CronExecution, ...]:
 def parse_cron_runs(output: str, job_id: str) -> tuple[CronExecution, ...]:
     """Parse safe headers while discarding all execution detail lines."""
 
-    if not isinstance(output, str) or JOB_ID.fullmatch(job_id) is None:
+    if not isinstance(output, str) or not _is_job_id(job_id):
         raise ExecutionDiscoveryError()
 
     lines = output.splitlines()
@@ -136,6 +140,8 @@ def parse_cron_runs(output: str, job_id: str) -> tuple[CronExecution, ...]:
     for line in lines[first_nonempty:]:
         match = RUN_LINE.fullmatch(line)
         if match is None:
+            if RUN_HEADER_SHAPE.search(line) is not None:
+                raise ExecutionDiscoveryError()
             continue
 
         values = match.groupdict()
@@ -172,8 +178,10 @@ def load_cron_runs(
 ) -> tuple[CronExecution, ...]:
     """Load the bounded Hermes execution window through an absolute CLI path."""
 
+    if not _is_job_id(job_id):
+        raise ExecutionDiscoveryError()
     cli_path = Path(hermes_cli)
-    if not cli_path.is_absolute() or JOB_ID.fullmatch(job_id) is None:
+    if not cli_path.is_absolute():
         raise ExecutionDiscoveryError()
 
     command = [
@@ -194,7 +202,7 @@ def load_cron_runs(
             timeout=20,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         process_failed = True
 
     if process_failed or result is None or result.returncode != 0:
@@ -216,11 +224,11 @@ def discover_execution_events(
 ]:
     """Discover new failures and completed daily-archive executions."""
 
+    if not _is_job_id(job_id) or not _is_job_id(daily_archive_job_id):
+        raise ExecutionDiscoveryError()
     observed = tuple(rows)
     if (
-        JOB_ID.fullmatch(job_id) is None
-        or JOB_ID.fullmatch(daily_archive_job_id) is None
-        or len(observed) > MAX_EXECUTION_ROWS
+        len(observed) > MAX_EXECUTION_ROWS
         or any(not _valid_execution(row, job_id) for row in observed)
         or len({row.execution_id for row in observed}) != len(observed)
     ):
