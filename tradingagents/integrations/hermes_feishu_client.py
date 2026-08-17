@@ -26,6 +26,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from urllib3.exceptions import ReadTimeoutError
 
 from tradingagents.integrations.hermes_feishu_state import NotificationEvent
 
@@ -46,12 +47,12 @@ SIGNED_ENVELOPE_RESERVE_BYTES = 256
 MAX_RENDERED_CARD_BYTES = MAX_REQUEST_BYTES - SIGNED_ENVELOPE_RESERVE_BYTES
 REPORT_DISCLAIMER = "仅用于研究和模拟交易，不构成交易建议"
 TRUNCATION_NOTICE = "\n\n_其余内容因长度限制已省略_"
-SECRET_ASSIGNMENT = re.compile(
-    r"\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+SECRET_ASSIGNMENT_PREFIX = re.compile(
+    r"([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*)"
+    r"\s*[:=]\s*",
     re.IGNORECASE,
 )
-SECRET_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]+\b", re.IGNORECASE)
+SECRET_TOKEN = re.compile(r"sk-[A-Za-z0-9_-]+", re.IGNORECASE)
 
 
 class FeishuConfigError(RuntimeError):
@@ -209,6 +210,12 @@ def _strict_json_bytes(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _is_wrapped_read_timeout(error: requests.exceptions.ConnectionError) -> bool:
+    return any(
+        isinstance(argument, ReadTimeoutError) for argument in error.args
+    )
+
+
 class RequestsTransport:
     def __init__(self, connect_timeout: float = 3.05, read_timeout: float = 10):
         self.session = requests.Session()
@@ -225,11 +232,20 @@ class RequestsTransport:
             stream=True,
         )
         body = bytearray()
-        for chunk in response.iter_content(4096):
-            body.extend(chunk)
-            if len(body) > MAX_RESPONSE_BYTES:
-                response.close()
-                raise FeishuDeliveryError("response_too_large")
+        streamed_read_timed_out = False
+        try:
+            for chunk in response.iter_content(4096):
+                body.extend(chunk)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise FeishuDeliveryError("response_too_large")
+        except requests.exceptions.ConnectionError as error:
+            if not _is_wrapped_read_timeout(error):
+                raise
+            streamed_read_timed_out = True
+        finally:
+            response.close()
+        if streamed_read_timed_out:
+            raise requests.exceptions.Timeout()
         return TransportResponse(
             response.status_code,
             bytes(body),
@@ -240,10 +256,47 @@ class RequestsTransport:
 def _safe_free_field(value: object | None) -> str:
     if value is None:
         return "不可用"
-    normalized = re.sub(r"[\r\n]+", " ", str(value))
-    redacted = SECRET_ASSIGNMENT.sub(r"\1=[REDACTED]", normalized)
+    scalar_safe = "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in str(value)
+    )
+    normalized = re.sub(r"[\r\n]+", " ", scalar_safe)
+    redacted = _redact_secret_assignments(normalized)
     redacted = SECRET_TOKEN.sub("[REDACTED]", redacted)
     return redacted[:MAX_FREE_FIELD_CHARACTERS]
+
+
+def _redact_secret_assignments(value: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    while match := SECRET_ASSIGNMENT_PREFIX.search(value, cursor):
+        output.append(value[cursor : match.start()])
+        output.append(f"{match.group(1)}=[REDACTED]")
+        value_start = match.end()
+        if value_start >= len(value):
+            cursor = value_start
+            break
+        quote = value[value_start]
+        if quote not in ('"', "'"):
+            separator = re.search(r"[\s,;]", value[value_start:])
+            cursor = (
+                len(value)
+                if separator is None
+                else value_start + separator.start()
+            )
+            continue
+
+        cursor = value_start + 1
+        while cursor < len(value):
+            if value[cursor] == "\\":
+                cursor = min(cursor + 2, len(value))
+            elif value[cursor] == quote:
+                cursor += 1
+                break
+            else:
+                cursor += 1
+    output.append(value[cursor:])
+    return "".join(output)
 
 
 def _card_payload(title: str, color: str, body: str) -> dict[str, Any]:

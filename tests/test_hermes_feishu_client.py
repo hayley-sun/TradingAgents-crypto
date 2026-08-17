@@ -137,6 +137,17 @@ class LocalFeishuHandler(BaseHTTPRequestHandler):
         elif self.path == "/timeout":
             time.sleep(0.15)
             self._write_response(200, b'{"code":0}')
+        elif self.path == "/stream-timeout":
+            self.send_response(200)
+            self.send_header("Content-Length", "10")
+            self.end_headers()
+            try:
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                time.sleep(0.15)
+                self.wfile.write(b"x" * 9)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/invalid-json":
             self._write_response(200, b"not json")
         elif self.path == "/too-large":
@@ -216,6 +227,79 @@ class FeishuCardRenderingTests(unittest.TestCase):
 
         self.assertNotIn("sk-abc", text)
 
+    def test_report_card_redacts_secrets_without_word_boundary_assumptions(self):
+        cases = {
+            "unicode assignment": (
+                "前DEEPSEEK_API_KEY=visible-fragment",
+                "visible-fragment",
+            ),
+            "underscore assignment": (
+                "prefix_DEEPSEEK_API_KEY=underscore-fragment",
+                "underscore-fragment",
+            ),
+            "ASCII assignment": (
+                "prefixDEEPSEEK_API_KEY=ascii-fragment",
+                "ascii-fragment",
+            ),
+            "unicode token": (
+                "前sk-unicode-fragment",
+                "sk-unicode-fragment",
+            ),
+            "underscore token": (
+                "prefix_sk-underscore-fragment",
+                "sk-underscore-fragment",
+            ),
+            "ASCII token": (
+                "prefixsk-ascii-fragment",
+                "sk-ascii-fragment",
+            ),
+        }
+
+        for case, (value, secret_fragment) in cases.items():
+            payload = render_report_card(
+                report_card_fixture(decision=value), previous=None
+            )
+            rendered = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+            with self.subTest(case=case):
+                self.assertNotIn(secret_fragment, rendered)
+                self.assertIn("[REDACTED]", rendered)
+
+    def test_report_card_redacts_escaped_and_unclosed_quoted_assignments(self):
+        cases = {
+            "escaped double quote": (
+                r'API_KEY="double-fragment-a\"double-fragment-b"',
+                ("double-fragment-a", "double-fragment-b"),
+            ),
+            "escaped single quote": (
+                r"TOKEN='single-fragment-a\'single-fragment-b'",
+                ("single-fragment-a", "single-fragment-b"),
+            ),
+            "escaped backslash": (
+                r'PASSWORD="slash-fragment-a\\slash-fragment-b"',
+                ("slash-fragment-a", "slash-fragment-b"),
+            ),
+            "unclosed double quote": (
+                'SECRET="unclosed-double-fragment',
+                ("unclosed-double-fragment",),
+            ),
+            "unclosed single quote": (
+                "API_KEY='unclosed-single-fragment",
+                ("unclosed-single-fragment",),
+            ),
+        }
+
+        for case, (value, secret_fragments) in cases.items():
+            payload = render_report_card(
+                report_card_fixture(decision=value), previous=None
+            )
+            rendered = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+            with self.subTest(case=case):
+                for secret_fragment in secret_fragments:
+                    self.assertNotIn(secret_fragment, rendered)
+                self.assertIn("[REDACTED]", rendered)
+
     def test_report_card_contains_current_items_path_and_prior_comparison(self):
         report = report_card_fixture()
         previous = replace(
@@ -285,6 +369,26 @@ class FeishuCardRenderingTests(unittest.TestCase):
             with self.subTest(field=name):
                 self.assertNotIn(value, body)
                 self.assertIn(value[:500], body)
+
+    def test_report_card_replaces_lone_surrogates_before_serialization(self):
+        report = report_card_fixture(decision="before\ud800after")
+
+        try:
+            payload = render_report_card(report, previous=None)
+        except Exception as error:
+            raised = error
+            payload = None
+        else:
+            raised = None
+
+        self.assertIsNone(raised)
+        body = card_body(payload)
+        self.assertIn("before\ufffdafter", body)
+        self.assertNotIn("\ud800", body)
+        rendered = json.dumps(
+            payload, ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+        self.assertLessEqual(len(rendered), 20_000)
 
     def test_report_card_stays_bounded_with_many_items(self):
         items = tuple(
@@ -544,6 +648,20 @@ class FeishuClientTests(unittest.TestCase):
                 self.assertEqual(transport.calls, [])
                 self.assertNotIn(str(value), str(caught.exception).lower())
 
+    def test_client_maps_lone_surrogate_payload_to_safe_error(self):
+        transport = FakeTransport(TransportResponse(200, b'{"code":0}', None))
+        client = FeishuClient(config_fixture(), transport=transport)
+
+        with self.assertRaises(FeishuDeliveryError) as caught:
+            client.send(
+                {"msg_type": "interactive", "value": "before\ud800after"}
+            )
+
+        self.assertEqual(caught.exception.result, "http_error")
+        self.assertEqual(transport.calls, [])
+        self.assertIsNone(caught.exception.__context__)
+        self.assertNotIn("surrogate", str(caught.exception).lower())
+
     def test_client_maps_deeply_nested_outbound_json_to_safe_error(self):
         nested = "leaf"
         for _depth in range(10_000):
@@ -689,6 +807,21 @@ class RequestsTransportTests(unittest.TestCase):
             requests.exceptions.Timeout
         ):
             transport.post(base_url + "/timeout", {})
+
+    def test_transport_maps_streamed_body_read_timeout_without_raw_context(self):
+        transport = RequestsTransport(connect_timeout=0.1, read_timeout=0.02)
+
+        with local_feishu_server() as (base_url, _server):
+            try:
+                transport.post(base_url + "/stream-timeout", {})
+            except Exception as error:
+                raised = error
+            else:
+                raised = None
+
+        self.assertIsInstance(raised, requests.exceptions.Timeout)
+        self.assertIsNone(raised.__context__)
+        self.assertEqual(str(raised), "")
 
     def test_transport_rejects_response_over_65536_bytes(self):
         transport = RequestsTransport()
