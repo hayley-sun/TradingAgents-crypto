@@ -136,6 +136,35 @@ class FeishuNotificationStateTests(unittest.TestCase):
                         store.save(invalid_state)
                     self.assertEqual(store.path.read_bytes(), valid_bytes)
 
+    def test_store_save_rejects_malformed_delivery_containers(self):
+        now = datetime(2026, 8, 18, tzinfo=timezone.utc)
+        state = initialized_state(now, {}, [])
+
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(
+                Path(directory) / "feishu_notifications"
+            )
+            store.save(state)
+            valid_bytes = store.path.read_bytes()
+
+            for deliveries in ({"bad": {}}, []):
+                with self.subTest(deliveries=deliveries):
+                    malformed_state = state.model_copy(
+                        update={"deliveries": deliveries}
+                    )
+                    with self.assertRaises(
+                        NotificationStateError
+                    ) as raised:
+                        store.save(malformed_state)
+                    self.assertEqual(
+                        str(raised.exception),
+                        "notification state unavailable",
+                    )
+                    self.assertEqual(store.path.read_bytes(), valid_bytes)
+                    self.assertEqual(
+                        list(store.root.glob(".state.*.tmp")), []
+                    )
+
     def test_models_reject_naive_runtime_datetimes(self):
         aware = datetime(2026, 8, 18, tzinfo=timezone.utc)
         naive = aware.replace(tzinfo=None)

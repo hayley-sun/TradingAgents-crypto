@@ -212,10 +212,16 @@ class NotificationStateStore:
         temporary_path: Path | None = None
         try:
             self._prepare_root()
-            if any(
-                type(record.attempt_count) is not int
-                or not 0 <= record.attempt_count <= MAX_ATTEMPT_COUNT
-                for record in state.deliveries.values()
+            if (
+                not isinstance(state, NotificationState)
+                or type(state.deliveries) is not dict
+                or any(
+                    not isinstance(record, DeliveryRecord)
+                    or type(record.attempt_count) is not int
+                    or record.attempt_count < 0
+                    or record.attempt_count > MAX_ATTEMPT_COUNT
+                    for record in state.deliveries.values()
+                )
             ):
                 raise ValueError("invalid delivery state")
             payload = NotificationState.model_validate(
