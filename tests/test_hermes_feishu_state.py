@@ -86,6 +86,21 @@ class FeishuNotificationStateTests(unittest.TestCase):
                     with store.lock():
                         self.fail("second lock unexpectedly acquired")
 
+    def test_lock_preserves_oserror_raised_by_caller(self):
+        with TemporaryDirectory() as directory:
+            store = NotificationStateStore(Path(directory) / "feishu_notifications")
+            caller_error = OSError("caller failure")
+
+            try:
+                with store.lock():
+                    raise caller_error
+            except Exception as error:
+                raised_error = error
+            else:
+                self.fail("caller error was not raised")
+
+            self.assertIs(raised_error, caller_error)
+
     def test_malformed_json_is_rejected_without_rewrite(self):
         with TemporaryDirectory() as directory:
             store = NotificationStateStore(Path(directory) / "feishu_notifications")

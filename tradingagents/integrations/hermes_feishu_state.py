@@ -187,17 +187,42 @@ class NotificationStateStore:
     def lock(self) -> Iterator[None]:
         try:
             self._prepare_root()
-            with self.lock_path.open("a", encoding="ascii") as lock_file:
-                os.chmod(self.lock_path, 0o600)
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as error:
-                    raise NotificationAlreadyRunning(ALREADY_RUNNING_MESSAGE) from error
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        except NotificationAlreadyRunning:
-            raise
+            lock_file = self.lock_path.open("a", encoding="ascii")
         except OSError as error:
             raise NotificationStateError(STATE_ERROR_MESSAGE) from error
+
+        try:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+            raise NotificationAlreadyRunning(ALREADY_RUNNING_MESSAGE) from error
+        except OSError as error:
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+            raise NotificationStateError(STATE_ERROR_MESSAGE) from error
+
+        caller_failed = False
+        try:
+            yield
+        except BaseException:
+            caller_failed = True
+            raise
+        finally:
+            cleanup_error: OSError | None = None
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError as error:
+                cleanup_error = error
+            try:
+                lock_file.close()
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            if cleanup_error is not None and not caller_failed:
+                raise NotificationStateError(STATE_ERROR_MESSAGE) from cleanup_error
