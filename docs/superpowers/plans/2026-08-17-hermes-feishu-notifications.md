@@ -1244,7 +1244,25 @@ cd /home/ubuntu/workspace/TradingAgents-crypto
 test -z "$(git status --porcelain)"
 /home/ubuntu/.local/bin/hermes cron status
 /home/ubuntu/.local/bin/hermes cron list --all
-find results/hermes -type f ! -path '*/feishu_notifications/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum
+python - <<'PY'
+import hashlib
+import stat
+from pathlib import Path
+
+root = Path('results/hermes').resolve(strict=True)
+rows = []
+for dirname in ('report_batches', 'reports'):
+    allowed_root = root / dirname
+    if not allowed_root.exists():
+        continue
+    assert stat.S_ISDIR(allowed_root.lstat().st_mode)
+    assert allowed_root.resolve(strict=True).parent == root
+    for path in allowed_root.rglob('*'):
+        if stat.S_ISREG(path.lstat().st_mode):
+            relative = path.relative_to(root)
+            rows.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative.as_posix()}')
+print(hashlib.sha256(('\n'.join(sorted(rows)) + '\n').encode('ascii')).hexdigest())
+PY
 ```
 
 Expected: Gateway healthy, four production jobs active, and one artifact manifest. Record the hash
