@@ -422,7 +422,7 @@ class HermesReportMemoryTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.current_chars, len("operator memory\n"))
         self.assertEqual(result.configured_limit, 40000)
-        self.assertEqual(result.reserved_report_chars, 30897)
+        self.assertEqual(result.reserved_report_chars, 10297)
         self.assertEqual(result.available_chars, 40000 - len("operator memory\n"))
         self.assertEqual(
             set(result.model_dump()),

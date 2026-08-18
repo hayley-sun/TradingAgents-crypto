@@ -245,7 +245,7 @@ sudo journalctl -u tradingagents-hermes-maintenance.service -n 50 --no-pager
 
 ## 每日研究报告 Cron
 
-每日报告由两个无 agent 的 Hermes Cron job 组成。08:00 任务只提交 BTC、ETH、SOL 的异步研究批次；12:00 任务读取已持久化的会话并在所有会话终态时归档一份 Markdown 报告。它们均使用云主机 `Asia/Shanghai` 时区、Hermes 本地投递和项目结果目录，不配置 Telegram、Discord、邮件或其他外部投递。
+每日报告由两个无 agent 的 Hermes Cron job 组成。08:00 任务只提交 BTC 的异步研究批次；12:00 任务读取已持久化的会话并在会话终态时归档一份 Markdown 报告。它们均使用云主机 `Asia/Shanghai` 时区、Hermes 本地投递和项目结果目录，不配置 Telegram、Discord、邮件或其他外部投递。
 
 报告批次持久化到 `results/hermes/report_batches/<YYYY-MM-DD>.json`，归档保存为 `results/hermes/reports/<YYYY-MM-DD>.md`。同一天、同一配置的提交会返回既有批次，不会重复启动 worker。报告只能在所有会话已完成或失败时生成；有失败的终态批次生成标记为 degraded 的报告，不会自动重试。报告文件权限为 `600`，相同内容重试返回既有归档，不同内容不能覆盖历史报告。
 
@@ -333,13 +333,13 @@ hermes cron status
 hermes cron list --all
 ```
 
-首次修复凭据加载时，不得修改已经创建的当天 batch。保留两个生产 job 为 paused，并使用不晚于当前日期、且 `report_batches` 中不存在的历史日期创建临时历史日期无 agent job。临时 wrapper 只向现有 bootstrap 传入 `--trade-date`，不包含密钥；临时 job 必须在每次运行后暂停。依次验证 submit 创建三个 session、session 为 queued 或 running 时 archive 输出 active 且不创建报告、全部终态后 archive 创建一份权限 `600` 且包含研究和模拟交易声明的报告。完成后删除临时 job 和临时 wrapper；只有全部通过后才恢复生产 job。
+首次修复凭据加载时，不得修改已经创建的当天 batch。保留两个生产 job 为 paused，并使用不晚于当前日期、且 `report_batches` 中不存在的历史日期创建临时历史日期无 agent job。临时 wrapper 只向现有 bootstrap 传入 `--trade-date`，不包含密钥；临时 job 必须在每次运行后暂停。依次验证 submit 创建一个 BTC session、session 为 queued 或 running 时 archive 输出 active 且不创建报告、全部终态后 archive 创建一份权限 `600` 且包含研究和模拟交易声明的报告。完成后删除临时 job 和临时 wrapper；只有全部通过后才恢复生产 job。
 
 日常观测使用 `hermes cron status`、`hermes cron list --all` 与 `hermes cron runs <job-id>`。暂停某个 job 不会删除既有 batches、reports、sessions、reviews、learning indexes 或 Hermes memory。需要撤销调度时先 `hermes cron pause <job-id>`，确认后再使用 `hermes cron remove <job-id>`；不要删除报告目录作为回滚手段。
 
 ## T+1/T+7/T+15 自动复盘与长期记忆
 
-新版本归档的每个 BTC、ETH、SOL completed session 会注册 T+1、T+7、T+15 三个复盘项，计划保存在 `results/hermes/review_schedules/<trade_date>.json`。新归档必须带有 `scheduled_review_version: 2`；旧归档属于 `旧 v1`，保持原有 review 和 learning index 连续性，不会自动回填旧报告。T+N 表示精确 UTC 复盘价格日期，只有该日期完整结束（`review_date` 严格早于当前 UTC 日期）才会执行。
+新版本归档的每个 BTC completed session 会注册 T+1、T+7、T+15 三个复盘项，计划保存在 `results/hermes/review_schedules/<trade_date>.json`。新归档必须带有 `scheduled_review_version: 2`；旧归档属于 `旧 v1`，保持原有 review 和 learning index 连续性，不会自动回填旧报告。T+N 表示精确 UTC 复盘价格日期，只有该日期完整结束（`review_date` 严格早于当前 UTC 日期）才会执行。
 
 复盘使用一个共享的确定性 processor 和一个 Hermes Agent job，时区均为 `Asia/Shanghai`：08:15 processor 同时处理 v1 legacy review 与 v2 report fact，更新 `results/hermes/reviews`、`results/hermes/memories/<SYMBOL>.json` 和 `results/hermes/report_memories/<session_id>.json`；该项目索引持久保留全部复盘索引项，后续分析仍只注入最近 5 条 lesson。processor 绝不读取或写入 Hermes 长期 memory。08:30 Agent job 只加载专用 skill，通过内置 memory tool 完成旧 v1 add、v2 的 report-level add/replace，以及已完成报告的 bounded remove；任何脚本都不得通过脚本直接修改 `/home/ubuntu/.hermes/memories/MEMORY.md`。
 
@@ -389,7 +389,7 @@ payload = json.load(sys.stdin)
 assert payload.get("ok") is True
 assert payload.get("configured_limit") == 40000
 assert payload.get("current_chars") <= 9000
-assert payload.get("reserved_report_chars") == 30897
+assert payload.get("reserved_report_chars") == 10297
 assert payload.get("error_code") is None
 print(json.dumps({
     "current_chars": payload["current_chars"],
@@ -399,9 +399,9 @@ print(json.dumps({
 '
 ```
 
-固定部署只处理 BTC、ETH、SOL。每个币种最多预留 15 条 active/进行中报告和 5 条
-final completed 报告，共最多 60 条紧凑 Hermes entries；按每条 512 Unicode 字符和
-条目分隔符计算，`reserved_report_chars == 30897`。因此 `current_chars <= 9000` 是
+固定部署只处理 BTC。BTC 最多预留 15 条 active/进行中报告和 5 条
+final completed 报告，共最多 20 条紧凑 Hermes entries；按每条 512 Unicode 字符和
+条目分隔符计算，`reserved_report_chars == 10297`。因此 `current_chars <= 9000` 是
 部署前提，二者与 `memory_char_limit: 40000` 一起留出安全余量。
 
 active/进行中 reports remain pinned until confirmed T+15 and are never retired。每个币种
@@ -1256,7 +1256,7 @@ hermes cron runs "$feishu_notifier_job_id" --limit 5
 ```
 
 等待下一份按 `Asia/Shanghai` 自动推导交易日期生成的真实报告。先验证 canonical JSON
-与报告路径均为预期普通文件，再按 schema 验证日期文件名、SHA-256、有序 `BTC/ETH/SOL`
+与报告路径均为预期普通文件，再按 schema 验证日期文件名、SHA-256、有序 `BTC-only`
 及每项的 `processed_signal`、`final_trade_decision`、`error_code` 类型；只打印校验后的
 安全日期、状态、symbols 和摘要，绝不显示报告 narrative 或 memory artifact。
 
@@ -1300,7 +1300,7 @@ assert stat.S_ISREG(batch_path.lstat().st_mode)
 batch = DailyReportBatch.model_validate_json(batch_path.read_bytes())
 assert batch.schema_version == 1
 assert batch.request.trade_date == trade_date
-assert batch.request.symbols == ['BTC', 'ETH', 'SOL']
+assert batch.request.symbols == ['BTC']
 archive = batch.archive
 assert archive is not None
 archive_state = archive.state
@@ -1315,10 +1315,10 @@ assert report_path.resolve(strict=True).parent == reports_root.resolve(strict=Tr
 assert stat.S_ISREG(report_path.lstat().st_mode)
 report_bytes = report_path.read_bytes()
 assert hashlib.sha256(report_bytes).hexdigest() == archive.sha256
-assert len(archive.items) == 3
+assert len(archive.items) == 1
 items_by_symbol = {item.symbol: item for item in archive.items}
-assert list(items_by_symbol) == ['BTC', 'ETH', 'SOL']
-for expected_symbol, item in zip(['BTC', 'ETH', 'SOL'], archive.items, strict=True):
+assert list(items_by_symbol) == ['BTC']
+for expected_symbol, item in zip(['BTC'], archive.items, strict=True):
     assert item.symbol == expected_symbol
     if item.status == 'completed':
         assert type(item.processed_signal) is str
@@ -1332,18 +1332,10 @@ payload = items_by_symbol['BTC'].model_dump()
 assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
 assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
 assert payload['error_code'] is None or isinstance(payload['error_code'], str)
-payload = items_by_symbol['ETH'].model_dump()
-assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
-assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
-assert payload['error_code'] is None or isinstance(payload['error_code'], str)
-payload = items_by_symbol['SOL'].model_dump()
-assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
-assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
-assert payload['error_code'] is None or isinstance(payload['error_code'], str)
 safe_summary = {
     'trade_date': trade_date.isoformat(),
     'state': archive_state,
-    'symbols': ['BTC', 'ETH', 'SOL'],
+    'symbols': ['BTC'],
     'sha256': archive.sha256,
 }
 print(json.dumps(safe_summary, sort_keys=True))

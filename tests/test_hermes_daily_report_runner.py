@@ -32,7 +32,7 @@ class HermesDailyReportRunnerTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0]["trade_date"], "2026-07-30")
-        self.assertEqual(captured[0]["symbols"], ["BTC", "ETH", "SOL"])
+        self.assertEqual(captured[0]["symbols"], ["BTC"])
         self.assertEqual(captured[0]["analysts"], ["market", "news", "fundamentals"])
         self.assertEqual(captured[0]["research_depth"], 1)
         self.assertEqual(captured[0]["llm_provider"], "deepseek")

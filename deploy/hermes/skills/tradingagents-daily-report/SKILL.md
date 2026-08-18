@@ -19,7 +19,7 @@ and archive persistence.
 
 1. Determine the current `Asia/Shanghai` calendar date in `YYYY-MM-DD` form.
 2. Call `mcp__tradingagents_crypto__start_daily_report_batch` once with:
-   - `symbols=["BTC", "ETH", "SOL"]`
+   - `symbols=["BTC"]`
    - `analysts=["market", "news", "fundamentals"]`
    - `research_depth=1`
    - `llm_provider="deepseek"`

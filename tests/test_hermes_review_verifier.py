@@ -512,7 +512,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("stat.S_ISDIR(reports_root.lstat().st_mode)", acceptance)
         self.assertIn("reports_root.resolve(strict=True).parent == root", acceptance)
         self.assertIn("report_path.resolve(strict=True).parent == reports_root.resolve(strict=True)", acceptance)
-        for symbol in ("BTC", "ETH", "SOL"):
+        for symbol in ("BTC",):
             self.assertIn(f"payload = items_by_symbol['{symbol}']", acceptance)
         for field_name in ("processed_signal", "final_trade_decision"):
             self.assertRegex(
@@ -523,9 +523,9 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("if item.status == 'completed':", acceptance)
         self.assertIn("assert type(item.error_code) is str", acceptance)
         self.assertIn("'state': archive_state", acceptance)
-        self.assertIn("'symbols': ['BTC', 'ETH', 'SOL']", acceptance)
+        self.assertIn("'symbols': ['BTC']", acceptance)
         self.assertNotIn("'symbols': symbols", acceptance)
-        self.assertIn("BTC/ETH/SOL", section)
+        self.assertIn("BTC-only", section)
         self.assertIn("SHA-256", section)
 
     def test_feishu_runbook_static_deployment_guards(self):
@@ -625,7 +625,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("stat.S_ISREG", section)
         self.assertIn("stat.S_ISDIR(batch_root.lstat().st_mode)", section)
         self.assertIn("stat.S_ISDIR(reports_root.lstat().st_mode)", section)
-        self.assertIn("batch.request.symbols == ['BTC', 'ETH', 'SOL']", section)
+        self.assertIn("batch.request.symbols == ['BTC']", section)
         self.assertIn("type(item.processed_signal)", section)
         self.assertIn("type(item.final_trade_decision)", section)
         self.assertIn("type(item.error_code)", section)
@@ -1049,7 +1049,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("report-memory-capacity", text)
         self.assertIn("--memory-char-limit 40000", text)
         self.assertIn("current_chars <= 9000", text)
-        self.assertIn("reserved_report_chars == 30897", text)
+        self.assertIn("reserved_report_chars == 10297", text)
         self.assertIn("safe/no-memory-text", text)
         self.assertIn("T+15", text)
         self.assertIn("never retired", text)

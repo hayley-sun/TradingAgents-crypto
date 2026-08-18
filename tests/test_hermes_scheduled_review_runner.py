@@ -739,7 +739,7 @@ class HermesScheduledReviewRunnerTests(unittest.TestCase):
                 self.assertTrue(payload["ok"])
                 self.assertEqual(payload["configured_limit"], 40000)
                 self.assertEqual(payload["current_chars"], len(secret))
-                self.assertEqual(payload["reserved_report_chars"], 30897)
+                self.assertEqual(payload["reserved_report_chars"], 10297)
                 self.assertEqual(payload["available_chars"], 40000 - len(secret))
                 rendered = json.dumps(payload)
                 self.assertNotIn(secret, rendered)

@@ -22,7 +22,7 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 _SECRET_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 FIXED_REQUEST = {
-    "symbols": ["BTC", "ETH", "SOL"],
+    "symbols": ["BTC"],
     "analysts": ["market", "news", "fundamentals"],
     "research_depth": 1,
     "llm_provider": "deepseek",
