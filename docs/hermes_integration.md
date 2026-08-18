@@ -804,18 +804,18 @@ webhook URL 或签名 secret 写入本手册、示例或版本控制文件。
 `/home/ubuntu/.local/bin/hermes cron list --all`，确认以下四项仍存在且与本次部署前
 记录一致：
 
-| 配置键 | 生产 job ID |
-| --- | --- |
-| `daily_submit` | `2d445dfc1a8a` |
-| `daily_archive` | `5b7f7906306a` |
-| `review_processor` | `d6c0e087e5a8` |
-| `review_memory` | `e93cfab5f78e` |
+| 配置键 | 生产 Cron 名称 | 生产 job ID |
+| --- | --- | --- |
+| `daily_submit` | `tradingagents-daily-report-submit` | `2d445dfc1a8a` |
+| `daily_archive` | `tradingagents-daily-report-archive` | `5b7f7906306a` |
+| `review_processor` | `tradingagents-scheduled-review-process` | `d6c0e087e5a8` |
+| `review_memory` | `tradingagents-scheduled-review-memory` | `e93cfab5f78e` |
 
 ### 部署前证据
 
 以 `ubuntu` 登录后执行。`reviewed_notifier_commit` 必须是已评审、已推送的精确提交；
 工作树不干净或不是该提交时停止。清单只记录文件名和摘要，不读取报告正文，也不接触
-任何 memory 路径。
+任何 memory artifact。
 
 ```bash
 set -euo pipefail
@@ -829,6 +829,104 @@ hermes gateway status
 hermes cron status
 /home/ubuntu/.local/bin/hermes cron list --all
 
+HERMES=/home/ubuntu/.local/bin/hermes
+PYTHON="$PROJECT_DIR/.venv-hermes-mcp/bin/python"
+capture_production_cron_definitions() {
+  local list_path="$1"
+  local snapshot_path="$2"
+  "$HERMES" cron list --all > "$list_path"
+  "$PYTHON" - "$list_path" "$snapshot_path" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+snapshot_path = Path(sys.argv[2])
+expected_cron_bindings = {
+    'daily_submit': {
+        'name': 'tradingagents-daily-report-submit',
+        'id': '2d445dfc1a8a',
+    },
+    'daily_archive': {
+        'name': 'tradingagents-daily-report-archive',
+        'id': '5b7f7906306a',
+    },
+    'review_processor': {
+        'name': 'tradingagents-scheduled-review-process',
+        'id': 'd6c0e087e5a8',
+    },
+    'review_memory': {
+        'name': 'tradingagents-scheduled-review-memory',
+        'id': 'e93cfab5f78e',
+    },
+}
+PRODUCTION_CRON_BINDINGS = {
+    'daily_submit': '2d445dfc1a8a',
+    'daily_archive': '5b7f7906306a',
+    'review_processor': 'd6c0e087e5a8',
+    'review_memory': 'e93cfab5f78e',
+}
+lines = source_path.read_text(encoding='utf-8').splitlines()
+definitions = {}
+for config_key, binding in expected_cron_bindings.items():
+    job_name = binding['name']
+    job_id = binding['id']
+    assert PRODUCTION_CRON_BINDINGS[config_key] == job_id
+    matches = [line for line in lines if job_name in line and job_id in line]
+    if len(matches) != 1:
+        raise SystemExit(f'expected exactly one definition for {config_key}')
+    definitions[config_key] = matches[0]
+snapshot_path.write_text(
+    '\n'.join(definitions[name] for name in expected_cron_bindings) + '\n',
+    encoding='utf-8',
+)
+os.chmod(snapshot_path, 0o600)
+print(json.dumps({
+    name: hashlib.sha256(definition.encode('utf-8')).hexdigest()
+    for name, definition in definitions.items()
+}, sort_keys=True))
+PY
+}
+cron_list_before="$(mktemp /tmp/tradingagents-feishu-cron-before.XXXXXX)"
+cron_snapshot_before="$(mktemp /tmp/tradingagents-feishu-definitions-before.XXXXXX)"
+cron_definitions_before="$(capture_production_cron_definitions "$cron_list_before" "$cron_snapshot_before")"
+
+write_immutable_artifact_manifest() {
+  local manifest_path="$1"
+  "$PYTHON" - "$manifest_path" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+root = Path('results/hermes')
+allowed_manifest_paths = [
+    root / 'report_batches',
+    root / 'reports',
+]
+manifest_rows = []
+for allowed_path in allowed_manifest_paths:
+    if not allowed_path.is_dir():
+        continue
+    for path in allowed_path.rglob('*'):
+        if not stat.S_ISREG(path.lstat().st_mode):
+            continue
+        relative = path.relative_to(root)
+        assert relative.parts[0] in {'report_batches', 'reports'}
+        assert 'memory' not in relative.parts
+        assert relative.parts[0] != 'memories'
+        assert relative.parts[0] != 'report_memories'
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_rows.append(f'{digest}  {relative.as_posix()}')
+manifest_path.write_text('\n'.join(sorted(manifest_rows)) + '\n', encoding='ascii')
+os.chmod(manifest_path, 0o600)
+PY
+}
+
 test -x deploy/hermes/scripts/tradingagents-feishu-notifier.sh
 install -d -m 700 /home/ubuntu/.hermes/scripts
 install -m 700 deploy/hermes/scripts/tradingagents-feishu-notifier.sh \
@@ -838,8 +936,7 @@ cmp --silent deploy/hermes/scripts/tradingagents-feishu-notifier.sh \
 stat -c '%U %a %n' /home/ubuntu/.hermes/scripts/tradingagents-feishu-notifier.sh
 
 manifest_before="$(mktemp /tmp/tradingagents-feishu-artifacts-before.XXXXXX)"
-find results/hermes -type f ! -path '*/feishu_notifications/*' -print0 \
-  | LC_ALL=C sort -z | xargs -0 sha256sum > "$manifest_before"
+write_immutable_artifact_manifest "$manifest_before"
 ```
 
 最后一条 metadata 输出必须为 `ubuntu 700` 且目标是
@@ -878,6 +975,7 @@ payload = {
     },
 }
 assert set(payload) == {'version', 'webhook_url', 'signing_secret', 'jobs'}
+assert payload['version'] == 1
 assert set(payload['jobs']) == {
     'daily_submit', 'daily_archive', 'review_processor', 'review_memory'
 }
@@ -960,9 +1058,27 @@ hermes cron pause "$feishu_notifier_job_id"
 ```
 
 暂停后才执行以下只读确认：notifier 必须是 paused 且没有意外 run；四个固定 job
-仍为 active，定义与部署前一致。
+仍为 active，name/ID 绑定和完整定义与部署前快照完全一致。
 
 ```bash
+cron_list_after="$(mktemp /tmp/tradingagents-feishu-cron-after.XXXXXX)"
+cron_snapshot_after="$(mktemp /tmp/tradingagents-feishu-definitions-after.XXXXXX)"
+cron_definitions_after="$(capture_production_cron_definitions "$cron_list_after" "$cron_snapshot_after")"
+cron_definitions_after_create="$cron_definitions_after"
+test "$cron_definitions_before" = "$cron_definitions_after"
+assert_cron_immutability="$("$PYTHON" - "$cron_definitions_before" "$cron_definitions_after_create" <<'PY'
+import sys
+
+cron_definitions_before = sys.argv[1]
+cron_definitions_after_create = sys.argv[2]
+assert cron_definitions_after_create == cron_definitions_before
+print('production-cron-definitions-unchanged')
+PY
+)"
+test "$assert_cron_immutability" = 'production-cron-definitions-unchanged'
+cmp --silent "$cron_snapshot_before" "$cron_snapshot_after"
+rm -f "$cron_list_before" "$cron_snapshot_before" \
+  "$cron_list_after" "$cron_snapshot_after"
 hermes cron status
 hermes cron list --all
 hermes cron runs "$feishu_notifier_job_id" --limit 5
@@ -982,8 +1098,7 @@ fake transport 测试仅使用既有测试套件。除下一小节唯一的明�
   tests/test_hermes_feishu_notifier.py \
   tests/test_hermes_review_verifier.py
 manifest_paused="$(mktemp /tmp/tradingagents-feishu-artifacts-paused.XXXXXX)"
-find results/hermes -type f ! -path '*/feishu_notifications/*' -print0 \
-  | LC_ALL=C sort -z | xargs -0 sha256sum > "$manifest_paused"
+write_immutable_artifact_manifest "$manifest_paused"
 cmp --silent "$manifest_before" "$manifest_paused"
 ```
 
@@ -1009,34 +1124,92 @@ hermes cron list --all
 hermes cron runs "$feishu_notifier_job_id" --limit 5
 ```
 
-等待下一份按 `Asia/Shanghai` 交易日期生成的真实报告。只读取结构化 batch JSON 与报告
-字节，验证日期文件名、SHA-256 和有序 `BTC/ETH/SOL`；只打印安全的日期、状态、symbols
-和摘要，绝不显示报告 narrative 或 memory。
+等待下一份按 `Asia/Shanghai` 自动推导交易日期生成的真实报告。先验证 canonical JSON
+与报告路径均为预期普通文件，再按 schema 验证日期文件名、SHA-256、有序 `BTC/ETH/SOL`
+及每项的 `processed_signal`、`final_trade_decision`、`error_code` 类型；只打印校验后的
+安全日期、状态、symbols 和摘要，绝不显示报告 narrative 或 memory artifact。
 
 ```bash
-NEXT_TRADE_DATE='<next-Asia-Shanghai-YYYY-MM-DD>'
+NEXT_TRADE_DATE="$("$PYTHON" - <<'PY'
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+now = datetime.now(ZoneInfo('Asia/Shanghai'))
+assert isinstance(date.today(), date)
+trade_date = now.date()
+if now.time() >= time(12, 0):
+    trade_date = trade_date + timedelta(days=1)
+print(trade_date.isoformat())
+PY
+)"
 "$PROJECT_DIR/.venv-hermes-mcp/bin/python" - "$NEXT_TRADE_DATE" <<'PY'
 import hashlib
 import json
+import stat
 import sys
+from datetime import date
 from pathlib import Path
 
-trade_date = sys.argv[1]
+from tradingagents.integrations.schemas import DailyReportBatch
+
+trade_date = date.fromisoformat(sys.argv[1])
+assert trade_date.isoformat() == sys.argv[1]
 root = Path('/home/ubuntu/workspace/TradingAgents-crypto/results/hermes')
-batch = json.loads((root / 'report_batches' / f'{trade_date}.json').read_text(encoding='utf-8'))
-archive = batch['archive']
-report_path = root / 'reports' / archive['filename']
+batch_root = root / 'report_batches'
+reports_root = root / 'reports'
+canonical_batch_name = f'{trade_date.isoformat()}.json'
+canonical_report_name = f'{trade_date.isoformat()}.md'
+canonical_archive_name = f'{trade_date}.md'
+assert canonical_archive_name == canonical_report_name
+batch_path = batch_root / canonical_batch_name
+assert batch_path.parent == batch_root
+assert stat.S_ISREG(batch_path.lstat().st_mode)
+batch = DailyReportBatch.model_validate_json(batch_path.read_bytes())
+assert batch.schema_version == 1
+assert batch.request.trade_date == trade_date
+assert batch.request.symbols == ['BTC', 'ETH', 'SOL']
+archive = batch.archive
+assert archive is not None
+archive_state = archive.state
+assert archive.filename == canonical_report_name
+archive_filename = archive.filename
+assert archive_filename == canonical_archive_name
+assert not Path(archive_filename).is_absolute()
+assert Path(archive_filename).name == archive_filename
+report_path = root / 'reports' / canonical_archive_name
+assert report_path.parent == reports_root
+assert report_path.resolve(strict=True) == (root / 'reports' / canonical_archive_name).resolve(strict=True)
+assert stat.S_ISREG(report_path.lstat().st_mode)
 report_bytes = report_path.read_bytes()
-symbols = [item['symbol'] for item in archive['items']]
-assert archive['filename'] == f'{trade_date}.md'
-assert hashlib.sha256(report_bytes).hexdigest() == archive['sha256']
-assert symbols == ['BTC', 'ETH', 'SOL']
-print(json.dumps({
-    'trade_date': trade_date,
-    'state': archive['state'],
-    'symbols': symbols,
-    'sha256': archive['sha256'],
-}, sort_keys=True))
+assert hashlib.sha256(report_bytes).hexdigest() == archive.sha256
+assert len(archive.items) == 3
+items_by_symbol = {item.symbol: item for item in archive.items}
+assert list(items_by_symbol) == ['BTC', 'ETH', 'SOL']
+for expected_symbol, item in zip(['BTC', 'ETH', 'SOL'], archive.items, strict=True):
+    assert item.symbol == expected_symbol
+    assert item.status == 'completed'
+    assert type(item.processed_signal) is str
+    assert type(item.final_trade_decision) is str
+    assert type(item.error_code) is type(None)
+payload = items_by_symbol['BTC'].model_dump()
+assert isinstance(payload['processed_signal'], str)
+assert isinstance(payload['final_trade_decision'], str)
+assert payload['error_code'] is None or isinstance(payload['error_code'], str)
+payload = items_by_symbol['ETH'].model_dump()
+assert isinstance(payload['processed_signal'], str)
+assert isinstance(payload['final_trade_decision'], str)
+assert payload['error_code'] is None or isinstance(payload['error_code'], str)
+payload = items_by_symbol['SOL'].model_dump()
+assert isinstance(payload['processed_signal'], str)
+assert isinstance(payload['final_trade_decision'], str)
+assert payload['error_code'] is None or isinstance(payload['error_code'], str)
+safe_summary = {
+    'trade_date': trade_date.isoformat(),
+    'state': archive_state,
+    'symbols': ['BTC', 'ETH', 'SOL'],
+    'sha256': archive.sha256,
+}
+print(json.dumps(safe_summary, sort_keys=True))
 PY
 hermes cron runs "$feishu_notifier_job_id" --limit 5
 ```

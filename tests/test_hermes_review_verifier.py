@@ -82,6 +82,11 @@ def scheduled_acceptance_guard_script() -> str:
     return text[heredoc_start:heredoc_end]
 
 
+def feishu_runbook_section() -> str:
+    text = RUNBOOK_PATH.read_text(encoding="utf-8")
+    return text[text.index("## 飞书群机器人通知") :]
+
+
 def saved_review(results_root: Path) -> PaperDecisionReview:
     review = PaperDecisionReview(
         review_id=REVIEW_ID,
@@ -350,8 +355,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("不得读取、输出或修改 `MEMORY.md`", runbook)
 
     def test_feishu_runbook_initializes_before_test_and_resume(self):
-        text = RUNBOOK_PATH.read_text(encoding="utf-8")
-        section = text[text.index("## 飞书群机器人通知") :]
+        section = feishu_runbook_section()
         initialize = section.index("hermes_feishu_bootstrap initialize")
         create = section.index("hermes cron create --name tradingagents-feishu-notifier")
         pause = section.index('hermes cron pause "$feishu_notifier_job_id"')
@@ -362,34 +366,48 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertLess(pause, test_send)
         self.assertLess(test_send, resume)
 
-    def test_feishu_runbook_static_deployment_guards(self):
-        text = RUNBOOK_PATH.read_text(encoding="utf-8")
-        section = text[text.index("## 飞书群机器人通知") :]
+    def test_feishu_runbook_locks_exact_cron_name_id_bindings(self):
+        section = feishu_runbook_section()
+        expected_rows = {
+            "daily_submit": ("tradingagents-daily-report-submit", "2d445dfc1a8a"),
+            "daily_archive": ("tradingagents-daily-report-archive", "5b7f7906306a"),
+            "review_processor": ("tradingagents-scheduled-review-process", "d6c0e087e5a8"),
+            "review_memory": ("tradingagents-scheduled-review-memory", "e93cfab5f78e"),
+        }
 
-        for job_id in (
-            "2d445dfc1a8a",
-            "5b7f7906306a",
-            "d6c0e087e5a8",
-            "e93cfab5f78e",
-        ):
-            self.assertIn(job_id, section)
+        for config_key, (job_name, job_id) in expected_rows.items():
+            row_pattern = (
+                rf"\| `{config_key}` \| `{job_name}` \| `{job_id}` \|"
+            )
+            self.assertRegex(section, row_pattern)
+        self.assertIn("expected_cron_bindings = {", section)
+        self.assertIn("'id': '2d445dfc1a8a'", section)
+        self.assertIn("'name': 'tradingagents-daily-report-submit'", section)
+        self.assertIn("cron_definitions_before", section)
+        self.assertIn("cron_definitions_after_create", section)
+        self.assertIn("assert cron_definitions_after_create == cron_definitions_before", section)
         self.assertIn("/home/ubuntu/.local/bin/hermes cron list --all", section)
         self.assertIn(
             "install -m 700 deploy/hermes/scripts/tradingagents-feishu-notifier.sh",
             section,
         )
         self.assertIn("stat -c '%U %a %n'", section)
-        self.assertIn("getpass.getpass", section)
-        self.assertIn("NamedTemporaryFile", section)
-        self.assertIn("os.fsync", section)
-        self.assertIn("os.replace", section)
-        self.assertIn("chmod(0o600)", section)
-        self.assertIn("set(payload) == {'version', 'webhook_url', 'signing_secret', 'jobs'}", section)
-        self.assertIn("set(payload['jobs']) == {", section)
-        self.assertIn("'daily_submit', 'daily_archive', 'review_processor', 'review_memory'", section)
-        self.assertIn("uid=ubuntu mode=700", section)
-        self.assertIn("uid=ubuntu mode=600", section)
 
+    def test_feishu_runbook_manifest_uses_non_memory_allowlist(self):
+        section = feishu_runbook_section()
+        self.assertIn("allowed_manifest_paths = [", section)
+        self.assertIn("'report_batches'", section)
+        self.assertIn("'reports'", section)
+        self.assertIn("assert 'memory' not in relative.parts", section)
+        self.assertIn("assert relative.parts[0] != 'memories'", section)
+        self.assertIn("assert relative.parts[0] != 'report_memories'", section)
+        self.assertNotIn(
+            "find results/hermes -type f ! -path '*/feishu_notifications/*'",
+            section,
+        )
+
+    def test_feishu_runbook_create_pause_and_paused_acceptance_guards(self):
+        section = feishu_runbook_section()
         create_pause = '''create_output="$(hermes cron create --name tradingagents-feishu-notifier --deliver local --no-agent --script tradingagents-feishu-notifier.sh --workdir "$PROJECT_DIR" '*/5 * * * *')"
 feishu_notifier_job_id="$(printf '%s\\n' "$create_output" | sed -n 's/.*Created job: \\([0-9a-f]\\{12\\}\\).*/\\1/p')"
 test "${#feishu_notifier_job_id}" -eq 12
@@ -405,8 +423,34 @@ hermes cron pause "$feishu_notifier_job_id"'''
         self.assertEqual(section.count("test --confirm-external-send"), 1)
         self.assertIn("hermes cron status", section)
         self.assertIn('hermes cron runs "$feishu_notifier_job_id" --limit 5', section)
+
+    def test_feishu_runbook_report_acceptance_is_schema_safe(self):
+        section = feishu_runbook_section()
+        acceptance = section[section.index("### 恢复与下一份真实报告") :]
+        self.assertIn("ZoneInfo('Asia/Shanghai')", acceptance)
+        self.assertIn("date.today()", acceptance)
+        self.assertNotIn("NEXT_TRADE_DATE='<next-Asia-Shanghai-YYYY-MM-DD>'", acceptance)
+        self.assertIn("canonical_archive_name = f'{trade_date}.md'", acceptance)
+        self.assertIn("assert archive_filename == canonical_archive_name", acceptance)
+        self.assertIn("assert not Path(archive_filename).is_absolute()", acceptance)
+        self.assertIn("report_path.resolve(strict=True)", acceptance)
+        self.assertIn("root / 'reports' / canonical_archive_name", acceptance)
+        for symbol in ("BTC", "ETH", "SOL"):
+            self.assertIn(f"payload = items_by_symbol['{symbol}']", acceptance)
+        for field_name in ("processed_signal", "final_trade_decision"):
+            self.assertRegex(
+                acceptance,
+                rf"assert isinstance\(payload\['{field_name}'\], str\)",
+            )
+        self.assertIn("assert payload['error_code'] is None or isinstance(payload['error_code'], str)", acceptance)
+        self.assertIn("'state': archive_state", acceptance)
+        self.assertIn("'symbols': ['BTC', 'ETH', 'SOL']", acceptance)
+        self.assertNotIn("'symbols': symbols", acceptance)
         self.assertIn("BTC/ETH/SOL", section)
         self.assertIn("SHA-256", section)
+
+    def test_feishu_runbook_static_deployment_guards(self):
+        section = feishu_runbook_section()
         rollback = section[section.index("### 回滚") :]
         self.assertLess(
             rollback.index('hermes cron pause "$feishu_notifier_job_id"'),
@@ -418,6 +462,91 @@ hermes cron pause "$feishu_notifier_job_id"'''
         )
         self.assertIn("不得删除已有 session、report、review、index、journal 或 memory", section)
         self.assertIn("不得在 Git、shell history、Cron 参数、日志或输出中保存秘密", section)
+
+    def test_feishu_runbook_private_config_is_atomic_and_schema_locked(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        config = text[
+            text.index("### Owner-only 私有配置") : text.index("### 先初始化，再创建任务")
+        ]
+
+        self.assertIn("assert payload['version'] == 1", config)
+        self.assertIn("dir=config_path.parent", config)
+        self.assertIn("os.fsync(temporary_file.fileno())", config)
+        self.assertIn("os.replace(temporary_path, config_path)", config)
+        self.assertIn("temporary_path.unlink(missing_ok=True)", config)
+        self.assertLess(
+            config.index("os.fsync(temporary_file.fileno())"),
+            config.index("os.replace(temporary_path, config_path)"),
+        )
+        self.assertLess(
+            config.index("os.replace(temporary_path, config_path)"),
+            config.index("config_path.chmod(0o600)"),
+        )
+
+    def test_feishu_runbook_snapshots_exact_production_cron_bindings(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        section = text[text.index("## 飞书群机器人通知") :]
+        expected_bindings = {
+            "daily_submit": "2d445dfc1a8a",
+            "daily_archive": "5b7f7906306a",
+            "review_processor": "d6c0e087e5a8",
+            "review_memory": "e93cfab5f78e",
+        }
+
+        self.assertIn("PRODUCTION_CRON_BINDINGS", section)
+        for name, job_id in expected_bindings.items():
+            self.assertIn(f"'{name}': '{job_id}'", section)
+        self.assertIn("capture_production_cron_definitions", section)
+        self.assertIn("cron_definitions_before", section)
+        self.assertIn("cron_definitions_after", section)
+        self.assertIn(
+            'test "$cron_definitions_before" = "$cron_definitions_after"',
+            section,
+        )
+        self.assertLess(
+            section.index("cron_definitions_before"),
+            section.index("hermes cron create --name tradingagents-feishu-notifier"),
+        )
+        self.assertLess(
+            section.index('hermes cron pause "$feishu_notifier_job_id"'),
+            section.index("cron_definitions_after"),
+        )
+
+    def test_feishu_runbook_manifests_only_allowlisted_non_memory_artifacts(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        section = text[text.index("## 飞书群机器人通知") :]
+        manifest = section[
+            section.index("write_immutable_artifact_manifest") : section.index("### Owner-only 私有配置")
+        ]
+
+        self.assertIn("allowed_manifest_paths = [", manifest)
+        self.assertIn("root / 'report_batches'", manifest)
+        self.assertIn("root / 'reports'", manifest)
+        self.assertIn("write_immutable_artifact_manifest", manifest)
+        self.assertIn("assert 'memory' not in relative.parts", manifest)
+        self.assertIn("assert relative.parts[0] != 'memories'", manifest)
+        self.assertIn("assert relative.parts[0] != 'report_memories'", manifest)
+        self.assertNotIn("find results/hermes -type f ! -path", manifest)
+        self.assertNotIn("! -path", manifest)
+
+    def test_feishu_runbook_derives_shanghai_date_and_validates_report_schema(self):
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
+        section = text[text.index("### 恢复与下一份真实报告") : text.index("### 重试与回滚")]
+
+        self.assertIn("ZoneInfo('Asia/Shanghai')", section)
+        self.assertIn("NEXT_TRADE_DATE=\"$(", section)
+        self.assertNotIn("<next-Asia-Shanghai-YYYY-MM-DD>", section)
+        self.assertIn("date.fromisoformat", section)
+        self.assertIn("DailyReportBatch.model_validate_json", section)
+        self.assertIn("archive.filename == canonical_report_name", section)
+        self.assertIn("hexdigest() == archive.sha256", section)
+        self.assertNotIn("archive['", section)
+        self.assertIn("stat.S_ISREG", section)
+        self.assertIn("batch.request.symbols == ['BTC', 'ETH', 'SOL']", section)
+        self.assertIn("type(item.processed_signal)", section)
+        self.assertIn("type(item.final_trade_decision)", section)
+        self.assertIn("type(item.error_code)", section)
+        self.assertIn("safe_summary", section)
 
     def test_daily_report_runbook_uses_paused_no_agent_local_jobs(self):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
