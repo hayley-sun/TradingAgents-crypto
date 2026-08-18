@@ -882,10 +882,21 @@ def parse_cron_list_records(lines):
                 records.append(current)
                 current = {'raw': []}
             continue
-        if line.lower().startswith('id:') and current['raw']:
+        line_parts = line.split()
+        candidate_status = line_parts[1].strip('[]') if len(line_parts) > 1 else ''
+        starts_record = (
+            len(line_parts) > 1
+            and len(line_parts[0]) == 12
+            and all(character in '0123456789abcdef' for character in line_parts[0])
+            and candidate_status in {'active', 'paused'}
+        )
+        if (starts_record or line.lower().startswith('id:')) and current['raw']:
             records.append(current)
             current = {'raw': []}
         current['raw'].append(line)
+        if starts_record:
+            current['id'] = line_parts[0]
+            current['status'] = candidate_status
         if ':' in line:
             key, value = line.split(':', 1)
             current[normalized_key(key)] = value.strip()
@@ -895,7 +906,7 @@ def parse_cron_list_records(lines):
 
 
 sample_records = parse_cron_list_records([
-    'ID: 2d445dfc1a8a',
+    '2d445dfc1a8a active',
     'Name: tradingagents-daily-report-submit',
     'Schedule: 0 8 * * *',
     '',
