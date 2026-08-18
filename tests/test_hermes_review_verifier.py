@@ -399,6 +399,26 @@ class HermesReviewVerifierTests(unittest.TestCase):
         )
         self.assertIn("stat -c '%U %a %n'", section)
 
+    def test_feishu_runbook_requires_pushed_reviewed_notifier_commit(self):
+        section = feishu_runbook_section()
+        deployment = section[
+            section.index("### 部署前证据") : section.index("### Owner-only 私有配置")
+        ]
+
+        self.assertIn("reviewed_notifier_ref", deployment)
+        self.assertIn("git fetch origin --tags", deployment)
+        self.assertIn('git rev-parse --verify "$reviewed_notifier_ref^{commit}"', deployment)
+        self.assertIn('git cat-file -e "$reviewed_notifier_commit^{commit}"', deployment)
+        self.assertIn(
+            'git merge-base --is-ancestor "$reviewed_notifier_commit" "$reviewed_notifier_ref"',
+            deployment,
+        )
+        self.assertIn('git switch --detach "$reviewed_notifier_commit"', deployment)
+        self.assertLess(
+            deployment.index("git merge-base --is-ancestor"),
+            deployment.index("install -m 700 deploy/hermes/scripts/tradingagents-feishu-notifier.sh"),
+        )
+
     def test_feishu_runbook_manifest_uses_non_memory_allowlist(self):
         section = feishu_runbook_section()
         self.assertIn("allowed_manifest_paths = [", section)
@@ -431,6 +451,22 @@ hermes cron pause "$feishu_notifier_job_id"'''
         self.assertEqual(section.count("test --confirm-external-send"), 1)
         self.assertIn("hermes cron status", section)
         self.assertIn('hermes cron runs "$feishu_notifier_job_id" --limit 5', section)
+
+    def test_feishu_runbook_rechecks_immutability_immediately_before_resume(self):
+        section = feishu_runbook_section()
+        resume_section = section[
+            section.index("### 恢复与下一份真实报告") : section.index(
+                'hermes cron resume "$feishu_notifier_job_id"'
+            )
+        ]
+
+        self.assertIn("cron_definitions_before_resume", resume_section)
+        self.assertIn("cron_snapshot_before_resume", resume_section)
+        self.assertIn("manifest_before_resume", resume_section)
+        self.assertIn("capture_production_cron_definitions", resume_section)
+        self.assertIn('test "$cron_definitions_before" = "$cron_definitions_before_resume"', resume_section)
+        self.assertIn('cmp --silent "$cron_snapshot_before" "$cron_snapshot_before_resume"', resume_section)
+        self.assertIn('cmp --silent "$manifest_before" "$manifest_before_resume"', resume_section)
 
     def test_feishu_runbook_report_acceptance_is_schema_safe(self):
         section = feishu_runbook_section()

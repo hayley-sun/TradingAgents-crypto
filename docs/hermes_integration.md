@@ -823,6 +823,16 @@ export PATH="/home/ubuntu/.local/bin:$PATH"
 PROJECT_DIR=/home/ubuntu/workspace/TradingAgents-crypto
 cd "$PROJECT_DIR"
 reviewed_notifier_commit='<reviewed-commit-sha>'
+reviewed_notifier_ref='<reviewed-origin-ref-containing-commit>'
+test -z "$(git status --short)"
+git fetch origin --tags
+git rev-parse --verify "$reviewed_notifier_ref^{commit}" >/dev/null
+git cat-file -e "$reviewed_notifier_commit^{commit}"
+git merge-base --is-ancestor "$reviewed_notifier_commit" "$reviewed_notifier_ref" || {
+  echo "reviewed notifier commit is not reachable from $reviewed_notifier_ref" >&2
+  exit 1
+}
+git switch --detach "$reviewed_notifier_commit"
 test -z "$(git status --short)"
 test "$(git rev-parse HEAD)" = "$reviewed_notifier_commit"
 hermes gateway status
@@ -1066,8 +1076,8 @@ for raw_path, expected_mode in zip(sys.argv[1:], (0o700, 0o600), strict=True):
 PY
 ```
 
-两行 metadata-only 输出必须精确为 `uid=ubuntu mode=700` 与 `uid=ubuntu mode=600`；
-不要查看、复制、散列或打印配置内容。
+两行 metadata-only 输出必须分别以 `uid=ubuntu mode=700` 与 `uid=ubuntu mode=600`
+开头，并包含对应的 `/home/ubuntu/.hermes/secrets` 路径；不要查看、复制、散列或打印配置内容。
 
 ### 先初始化，再创建任务
 
@@ -1129,8 +1139,7 @@ PY
 )"
 test "$assert_cron_immutability" = 'production-cron-definitions-unchanged'
 cmp --silent "$cron_snapshot_before" "$cron_snapshot_after"
-rm -f "$cron_list_before" "$cron_snapshot_before" \
-  "$cron_list_after" "$cron_snapshot_after"
+rm -f "$cron_list_after" "$cron_snapshot_after"
 hermes cron status
 hermes cron list --all
 hermes cron runs "$feishu_notifier_job_id" --limit 5
@@ -1170,6 +1179,17 @@ cmp --silent "$manifest_before" "$manifest_paused"
 先检查前五条 run，预期完成且没有历史事件。不要恢复、暂停或改变四个原 job。
 
 ```bash
+cron_list_before_resume="$(mktemp /tmp/tradingagents-feishu-cron-before-resume.XXXXXX)"
+cron_snapshot_before_resume="$(mktemp /tmp/tradingagents-feishu-definitions-before-resume.XXXXXX)"
+cron_definitions_before_resume="$(capture_production_cron_definitions "$cron_list_before_resume" "$cron_snapshot_before_resume")"
+test "$cron_definitions_before" = "$cron_definitions_before_resume"
+cmp --silent "$cron_snapshot_before" "$cron_snapshot_before_resume"
+manifest_before_resume="$(mktemp /tmp/tradingagents-feishu-artifacts-before-resume.XXXXXX)"
+write_immutable_artifact_manifest "$manifest_before_resume"
+cmp --silent "$manifest_before" "$manifest_before_resume"
+rm -f "$cron_list_before" "$cron_snapshot_before" \
+  "$cron_list_before_resume" "$cron_snapshot_before_resume" \
+  "$manifest_before_resume"
 hermes cron resume "$feishu_notifier_job_id"
 hermes cron status
 hermes cron list --all
