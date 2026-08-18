@@ -45,6 +45,7 @@ MAX_RESPONSE_BYTES = 65_536
 MAX_RETRY_AFTER_SECONDS = 86_400
 SIGNED_ENVELOPE_RESERVE_BYTES = 256
 MAX_RENDERED_CARD_BYTES = MAX_REQUEST_BYTES - SIGNED_ENVELOPE_RESERVE_BYTES
+MAX_JSON_NESTING_DEPTH = 100
 REPORT_DISCLAIMER = "仅用于研究和模拟交易，不构成交易建议"
 TRUNCATION_NOTICE = "\n\n_其余内容因长度限制已省略_"
 SECRET_ASSIGNMENT_PREFIX = re.compile(
@@ -211,6 +212,51 @@ def _strict_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(
         payload, ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
+
+
+def json_value_exceeds_nesting_limit(value: object) -> bool:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_JSON_NESTING_DEPTH:
+            return True
+        if not isinstance(current, (dict, list, tuple)):
+            continue
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        next_depth = depth + 1
+        if isinstance(current, dict):
+            stack.extend((item, next_depth) for item in current.values())
+        else:
+            stack.extend((item, next_depth) for item in current)
+    return False
+
+
+def response_bytes_exceed_json_nesting_limit(value: bytes) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            if depth > MAX_JSON_NESTING_DEPTH:
+                return True
+        elif byte in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
+    return False
 
 
 def _is_wrapped_read_timeout(error: requests.exceptions.ConnectionError) -> bool:
@@ -426,6 +472,8 @@ def render_test_card(event_id: str, now: datetime) -> dict[str, Any]:
 
 
 def _serialize_payload(payload: dict[str, Any]) -> bytes | None:
+    if json_value_exceeds_nesting_limit(payload):
+        return None
     try:
         return _strict_json_bytes(payload)
     except (TypeError, ValueError, RecursionError):
@@ -490,6 +538,8 @@ class FeishuClient:
             )
         if not 200 <= response.status_code < 300:
             raise FeishuDeliveryError("http_error")
+        if response_bytes_exceed_json_nesting_limit(response.body):
+            raise FeishuDeliveryError("invalid_response")
         try:
             decoded = json.loads(
                 response.body, parse_constant=_reject_nonstandard_json_constant

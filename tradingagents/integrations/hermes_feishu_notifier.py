@@ -24,6 +24,7 @@ from tradingagents.integrations.hermes_feishu_client import (
     FeishuNotifierConfig,
     ReportCardData,
     ReportCardItem,
+    json_value_exceeds_nesting_limit,
     render_failure_card,
     render_missing_archive_card,
     render_report_card,
@@ -1433,6 +1434,8 @@ def _normalize_argv(argv: Sequence[str] | None) -> tuple[str, ...] | None:
 
 
 def _serialize_payload(payload: dict[str, object]) -> str:
+    if json_value_exceeds_nesting_limit(payload):
+        raise ValueError("payload exceeds nesting limit")
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, allow_nan=False)
 
 
