@@ -903,15 +903,17 @@ import sys
 from pathlib import Path
 
 manifest_path = Path(sys.argv[1])
-root = Path('results/hermes')
+root = Path('results/hermes').resolve(strict=True)
 allowed_manifest_paths = [
     root / 'report_batches',
     root / 'reports',
 ]
 manifest_rows = []
 for allowed_path in allowed_manifest_paths:
-    if not allowed_path.is_dir():
+    if not allowed_path.exists():
         continue
+    assert stat.S_ISDIR(allowed_path.lstat().st_mode)
+    assert allowed_path.resolve(strict=True).parent == root
     for path in allowed_path.rglob('*'):
         if not stat.S_ISREG(path.lstat().st_mode):
             continue

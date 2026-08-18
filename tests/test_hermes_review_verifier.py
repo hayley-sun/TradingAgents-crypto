@@ -401,6 +401,8 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("assert 'memory' not in relative.parts", section)
         self.assertIn("assert relative.parts[0] != 'memories'", section)
         self.assertIn("assert relative.parts[0] != 'report_memories'", section)
+        self.assertIn("stat.S_ISDIR(allowed_path.lstat().st_mode)", section)
+        self.assertIn("allowed_path.resolve(strict=True).parent == root", section)
         self.assertNotIn(
             "find results/hermes -type f ! -path '*/feishu_notifications/*'",
             section,
