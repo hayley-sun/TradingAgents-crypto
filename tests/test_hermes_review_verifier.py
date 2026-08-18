@@ -436,11 +436,19 @@ class HermesReviewVerifierTests(unittest.TestCase):
 
     def test_feishu_runbook_create_pause_and_paused_acceptance_guards(self):
         section = feishu_runbook_section()
-        create_pause = '''create_output="$(hermes cron create --name tradingagents-feishu-notifier --deliver local --no-agent --script tradingagents-feishu-notifier.sh --workdir "$PROJECT_DIR" '*/5 * * * *')"
-feishu_notifier_job_id="$(printf '%s\\n' "$create_output" | sed -n 's/.*Created job: \\([0-9a-f]\\{12\\}\\).*/\\1/p')"
-test "${#feishu_notifier_job_id}" -eq 12
-hermes cron pause "$feishu_notifier_job_id"'''
-        self.assertIn(create_pause, section)
+        create_section = section[
+            section.index("create_output=") : section.index("暂停后才执行以下只读确认")
+        ]
+        self.assertIn("resolve_created_notifier_job_id", create_section)
+        self.assertIn("create_list_after_parse_failure", create_section)
+        self.assertIn("tradingagents-feishu-notifier", create_section)
+        self.assertIn("record.get('name') == 'tradingagents-feishu-notifier'", create_section)
+        self.assertIn('feishu_notifier_job_id="$(resolve_created_notifier_job_id "$create_output")"', create_section)
+        self.assertIn('hermes cron pause "$feishu_notifier_job_id"', create_section)
+        self.assertLess(
+            create_section.index("resolve_created_notifier_job_id"),
+            create_section.index('hermes cron pause "$feishu_notifier_job_id"'),
+        )
         self.assertNotIn(
             "hermes cron create --name tradingagents-feishu-notifier",
             section[: section.index("hermes_feishu_bootstrap initialize")],
@@ -451,6 +459,25 @@ hermes cron pause "$feishu_notifier_job_id"'''
         self.assertEqual(section.count("test --confirm-external-send"), 1)
         self.assertIn("hermes cron status", section)
         self.assertIn('hermes cron runs "$feishu_notifier_job_id" --limit 5', section)
+
+    def test_feishu_plan_uses_guarded_create_pause_for_notifier_cron(self):
+        plan = (
+            PROJECT_ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-17-hermes-feishu-notifications.md"
+        ).read_text(encoding="utf-8")
+        step = plan[
+            plan.index("**Step 5: Create and immediately pause the fifth Cron**") :
+            plan.index("**Step 6: Run paused acceptance and one real test card**")
+        ]
+
+        self.assertIn("resolve_created_notifier_job_id", step)
+        self.assertIn("create_list_after_parse_failure", step)
+        self.assertIn("record.get('name') == 'tradingagents-feishu-notifier'", step)
+        self.assertIn('feishu_notifier_job_id="$(resolve_created_notifier_job_id "$create_output")"', step)
+        self.assertIn('"$HERMES" cron pause "$feishu_notifier_job_id"', step)
 
     def test_feishu_runbook_rechecks_immutability_immediately_before_resume(self):
         section = feishu_runbook_section()

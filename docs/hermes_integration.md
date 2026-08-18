@@ -1109,12 +1109,67 @@ print(json.dumps({
 PY
 ```
 
-立即创建并暂停。以下块不得插入任何 Hermes 命令，且不得在 `initialize` 前运行任何
-notifier create：
+立即创建并暂停。正常路径中 create 与 pause 之间不得插入任何 Hermes 命令；如果
+create 输出格式变化导致 job ID 无法解析，唯一允许的恢复命令是立即 `cron list --all`
+按精确 notifier 名称找回新 job ID 并暂停。不得在 `initialize` 前运行任何 notifier create：
 
 ```bash
+resolve_created_notifier_job_id() {
+  local create_output="$1" parsed_job_id create_list_after_parse_failure
+  parsed_job_id="$(printf '%s\n' "$create_output" | sed -n 's/.*Created job: \([0-9a-f]\{12\}\).*/\1/p')"
+  if [ "${#parsed_job_id}" -eq 12 ]; then
+    printf '%s\n' "$parsed_job_id"
+    return 0
+  fi
+  create_list_after_parse_failure="$(mktemp /tmp/tradingagents-feishu-create-list.XXXXXX)"
+  hermes cron list --all > "$create_list_after_parse_failure"
+  "$PYTHON" - "$create_list_after_parse_failure" <<'PY'
+import sys
+from pathlib import Path
+
+list_path = Path(sys.argv[1])
+records = []
+current = {'raw': []}
+for raw_line in list_path.read_text(encoding='utf-8').splitlines():
+    line = raw_line.strip()
+    if not line:
+        if current['raw']:
+            records.append(current)
+            current = {'raw': []}
+        continue
+    line_parts = line.split()
+    candidate_status = line_parts[1].strip('[]') if len(line_parts) > 1 else ''
+    starts_record = (
+        len(line_parts) > 1
+        and len(line_parts[0]) == 12
+        and all(character in '0123456789abcdef' for character in line_parts[0])
+        and candidate_status in {'active', 'paused'}
+    )
+    if starts_record and current['raw']:
+        records.append(current)
+        current = {'raw': []}
+    current['raw'].append(line)
+    if starts_record:
+        current['id'] = line_parts[0]
+    if ':' in line:
+        key, value = line.split(':', 1)
+        current[key.strip().lower().replace(' ', '_').replace('-', '_')] = value.strip()
+if current['raw']:
+    records.append(current)
+matches = [
+    record for record in records
+    if record.get('name') == 'tradingagents-feishu-notifier'
+]
+if len(matches) != 1:
+    raise SystemExit('expected exactly one tradingagents-feishu-notifier job after create')
+print(matches[0]['id'])
+PY
+}
 create_output="$(hermes cron create --name tradingagents-feishu-notifier --deliver local --no-agent --script tradingagents-feishu-notifier.sh --workdir "$PROJECT_DIR" '*/5 * * * *')"
-feishu_notifier_job_id="$(printf '%s\n' "$create_output" | sed -n 's/.*Created job: \([0-9a-f]\{12\}\).*/\1/p')"
+feishu_notifier_job_id="$(resolve_created_notifier_job_id "$create_output")" || {
+  printf 'Safe create output follows; pause the new tradingagents-feishu-notifier job before continuing:\n%s\n' "$create_output" >&2
+  exit 1
+}
 test "${#feishu_notifier_job_id}" -eq 12
 hermes cron pause "$feishu_notifier_job_id"
 ```
