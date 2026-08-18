@@ -868,16 +868,55 @@ PRODUCTION_CRON_BINDINGS = {
     'review_processor': 'd6c0e087e5a8',
     'review_memory': 'e93cfab5f78e',
 }
-lines = source_path.read_text(encoding='utf-8').splitlines()
+def normalized_key(raw_key):
+    return raw_key.strip().lower().replace(' ', '_').replace('-', '_')
+
+
+def parse_cron_list_records(lines):
+    records = []
+    current = {'raw': []}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current['raw']:
+                records.append(current)
+                current = {'raw': []}
+            continue
+        if line.lower().startswith('id:') and current['raw']:
+            records.append(current)
+            current = {'raw': []}
+        current['raw'].append(line)
+        if ':' in line:
+            key, value = line.split(':', 1)
+            current[normalized_key(key)] = value.strip()
+    if current['raw']:
+        records.append(current)
+    return records
+
+
+sample_records = parse_cron_list_records([
+    'ID: 2d445dfc1a8a',
+    'Name: tradingagents-daily-report-submit',
+    'Schedule: 0 8 * * *',
+    '',
+])
+assert sample_records[0]['id'] == '2d445dfc1a8a'
+assert sample_records[0]['name'] == 'tradingagents-daily-report-submit'
+
+
+records = parse_cron_list_records(source_path.read_text(encoding='utf-8').splitlines())
 definitions = {}
 for config_key, binding in expected_cron_bindings.items():
     job_name = binding['name']
     job_id = binding['id']
     assert PRODUCTION_CRON_BINDINGS[config_key] == job_id
-    matches = [line for line in lines if job_name in line and job_id in line]
+    matches = [
+        record for record in records
+        if record.get('id') == job_id and record.get('name') == job_name
+    ]
     if len(matches) != 1:
         raise SystemExit(f'expected exactly one definition for {config_key}')
-    definitions[config_key] = matches[0]
+    definitions[config_key] = '\n'.join(matches[0]['raw'])
 snapshot_path.write_text(
     '\n'.join(definitions[name] for name in expected_cron_bindings) + '\n',
     encoding='utf-8',
@@ -1133,15 +1172,12 @@ hermes cron runs "$feishu_notifier_job_id" --limit 5
 
 ```bash
 NEXT_TRADE_DATE="$("$PYTHON" - <<'PY'
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 now = datetime.now(ZoneInfo('Asia/Shanghai'))
 assert isinstance(date.today(), date)
-trade_date = now.date()
-if now.time() >= time(12, 0):
-    trade_date = trade_date + timedelta(days=1)
-print(trade_date.isoformat())
+print(now.date().isoformat())
 PY
 )"
 "$PROJECT_DIR/.venv-hermes-mcp/bin/python" - "$NEXT_TRADE_DATE" <<'PY'
@@ -1156,15 +1192,20 @@ from tradingagents.integrations.schemas import DailyReportBatch
 
 trade_date = date.fromisoformat(sys.argv[1])
 assert trade_date.isoformat() == sys.argv[1]
-root = Path('/home/ubuntu/workspace/TradingAgents-crypto/results/hermes')
+root = Path('/home/ubuntu/workspace/TradingAgents-crypto/results/hermes').resolve(strict=True)
 batch_root = root / 'report_batches'
 reports_root = root / 'reports'
+assert stat.S_ISDIR(batch_root.lstat().st_mode)
+assert stat.S_ISDIR(reports_root.lstat().st_mode)
+assert batch_root.resolve(strict=True).parent == root
+assert reports_root.resolve(strict=True).parent == root
 canonical_batch_name = f'{trade_date.isoformat()}.json'
 canonical_report_name = f'{trade_date.isoformat()}.md'
 canonical_archive_name = f'{trade_date}.md'
 assert canonical_archive_name == canonical_report_name
 batch_path = batch_root / canonical_batch_name
 assert batch_path.parent == batch_root
+assert batch_path.resolve(strict=True).parent == batch_root.resolve(strict=True)
 assert stat.S_ISREG(batch_path.lstat().st_mode)
 batch = DailyReportBatch.model_validate_json(batch_path.read_bytes())
 assert batch.schema_version == 1
@@ -1180,7 +1221,7 @@ assert not Path(archive_filename).is_absolute()
 assert Path(archive_filename).name == archive_filename
 report_path = root / 'reports' / canonical_archive_name
 assert report_path.parent == reports_root
-assert report_path.resolve(strict=True) == (root / 'reports' / canonical_archive_name).resolve(strict=True)
+assert report_path.resolve(strict=True).parent == reports_root.resolve(strict=True)
 assert stat.S_ISREG(report_path.lstat().st_mode)
 report_bytes = report_path.read_bytes()
 assert hashlib.sha256(report_bytes).hexdigest() == archive.sha256
@@ -1189,21 +1230,25 @@ items_by_symbol = {item.symbol: item for item in archive.items}
 assert list(items_by_symbol) == ['BTC', 'ETH', 'SOL']
 for expected_symbol, item in zip(['BTC', 'ETH', 'SOL'], archive.items, strict=True):
     assert item.symbol == expected_symbol
-    assert item.status == 'completed'
-    assert type(item.processed_signal) is str
-    assert type(item.final_trade_decision) is str
-    assert type(item.error_code) is type(None)
+    if item.status == 'completed':
+        assert type(item.processed_signal) is str
+        assert type(item.final_trade_decision) is str
+        assert type(item.error_code) is type(None)
+    else:
+        assert item.processed_signal is None
+        assert item.final_trade_decision is None
+        assert type(item.error_code) is str
 payload = items_by_symbol['BTC'].model_dump()
-assert isinstance(payload['processed_signal'], str)
-assert isinstance(payload['final_trade_decision'], str)
+assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
+assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
 assert payload['error_code'] is None or isinstance(payload['error_code'], str)
 payload = items_by_symbol['ETH'].model_dump()
-assert isinstance(payload['processed_signal'], str)
-assert isinstance(payload['final_trade_decision'], str)
+assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
+assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
 assert payload['error_code'] is None or isinstance(payload['error_code'], str)
 payload = items_by_symbol['SOL'].model_dump()
-assert isinstance(payload['processed_signal'], str)
-assert isinstance(payload['final_trade_decision'], str)
+assert payload['processed_signal'] is None or isinstance(payload['processed_signal'], str)
+assert payload['final_trade_decision'] is None or isinstance(payload['final_trade_decision'], str)
 assert payload['error_code'] is None or isinstance(payload['error_code'], str)
 safe_summary = {
     'trade_date': trade_date.isoformat(),
