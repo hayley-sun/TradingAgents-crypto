@@ -9,12 +9,16 @@ Run this fixed, bounded protocol only when the attached Hermes Cron explicitly
 requests scheduled TradingAgents paper-review memory promotion. This is research
 and paper trading only, never a real order.
 
+Each list command in this Agent-owned 08:30 run is intentionally capped at 3
+items to keep one external-model turn small. Do not loop back to fetch another page.
+Do not increase the limits during the run; leave remaining items for later scheduled runs.
+
 ## 1. Drain legacy review memory (v1)
 
 Run exactly once:
 
 ```bash
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 3
 ```
 
 Continue only for JSON with `ok: true`. Report `unavailable_count` and the
@@ -38,10 +42,10 @@ in this run. Continue with independent later legacy items.
 
 ## 2. Reflect bounded report evidence (v2)
 
-List metadata only, at most 18 items:
+List metadata only, at most 3 items:
 
 ```bash
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 3
 ```
 
 Treat each listed `session_id` and `revision` pair as one evidence fetch and one submit
@@ -87,10 +91,10 @@ the safe error and continue with independent items.
 
 ## 3. Promote one report memory entry at a time
 
-List report-memory metadata, bounded to 18:
+List report-memory metadata, bounded to 3:
 
 ```bash
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-pending --limit 3
 ```
 
 Inspect each listed item's `memory_state` before starting it. For
@@ -140,10 +144,10 @@ their direct `verification_pending` confirmations. Retirement is independent:
 an unavailable or quarantined retirement must not block active report
 replacements or later work for another symbol.
 
-List retirement metadata only, bounded to 18:
+List retirement metadata only, bounded to 3:
 
 ```bash
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 3
 ```
 
 Accept only JSON with `ok: true` and `items`. If the list result is unexpected,

@@ -687,7 +687,8 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertNotIn("API_KEY", process_script)
         self.assertNotIn("MEMORY.md", process_script)
 
-        self.assertIn("memory-pending --limit 18", skill)
+        self.assertIn("memory-pending --limit 3", skill)
+        self.assertIn("leave remaining items for later scheduled runs", skill)
         self.assertIn("memory tool", normalized_skill)
         self.assertIn("action=add", skill)
         self.assertIn("Entry added", skill)
@@ -721,8 +722,9 @@ class HermesReviewVerifierTests(unittest.TestCase):
     def test_scheduled_skill_promotes_legacy_then_report_memory(self):
         skill = SCHEDULED_REVIEW_SKILL_PATH.read_text(encoding="ascii")
 
-        self.assertIn("memory-pending --limit 18", skill)
-        self.assertIn("report-reflection-pending --limit 18", skill)
+        self.assertIn("memory-pending --limit 3", skill)
+        self.assertIn("report-reflection-pending --limit 3", skill)
+        self.assertIn("Do not loop back to fetch another page", skill)
         self.assertIn("report-reflection-evidence", skill)
         self.assertIn("submit_report_reflection", skill)
         self.assertIn("begin-report-memory", skill)
@@ -994,12 +996,12 @@ class HermesReviewVerifierTests(unittest.TestCase):
         self.assertIn("do not call `begin-report-memory` again", verification_pending)
         self.assertNotIn("memory(action=", verification_pending)
         self.assertLess(
-            skill.index("memory-pending --limit 18"),
-            skill.index("report-reflection-pending --limit 18"),
+            skill.index("memory-pending --limit 3"),
+            skill.index("report-reflection-pending --limit 3"),
         )
         self.assertLess(
-            skill.index("report-reflection-pending --limit 18"),
-            skill.index("report-memory-pending --limit 18"),
+            skill.index("report-reflection-pending --limit 3"),
+            skill.index("report-memory-pending --limit 3"),
         )
 
     def test_scheduled_skill_uses_agent_owned_completed_report_retirement(self):
@@ -1013,7 +1015,7 @@ class HermesReviewVerifierTests(unittest.TestCase):
         ]
         normalized_verification_pending = " ".join(verification_pending.split())
 
-        self.assertIn("report-memory-retirement-pending --limit 18", retirement)
+        self.assertIn("report-memory-retirement-pending --limit 3", retirement)
         self.assertIn("begin-report-memory-retirement", retirement)
         self.assertIn(
             "memory(action=remove,target=memory,old_text=<returned marker>)",
@@ -1036,8 +1038,8 @@ class HermesReviewVerifierTests(unittest.TestCase):
         )
         self.assertNotIn("memory(action=read", skill)
         self.assertLess(
-            skill.index("report-memory-pending --limit 18"),
-            skill.index("report-memory-retirement-pending --limit 18"),
+            skill.index("report-memory-pending --limit 3"),
+            skill.index("report-memory-retirement-pending --limit 3"),
         )
 
     def test_runbook_documents_bounded_report_memory_capacity_and_retention(self):

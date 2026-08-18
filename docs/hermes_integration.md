@@ -429,6 +429,9 @@ hermes cron list --all
 processor bootstrap 只从 `mcp_servers.tradingagents_crypto.env` 加载结果目录和价格
 提供商白名单值，不加载 DeepSeek key；配置缺失时安全失败。安装前确认 memory
 tool/injection 均 enabled，且工作树、结果目录和 Hermes 目录权限正确。
+08:30 memory job 由 Hermes Agent 执行，会调用外部模型生成 report reflection；skill
+每阶段只取 3 个 pending items，剩余队列留给后续 scheduled runs。不要在同一 Agent run
+内循环扩批，也不要先通过提高 API timeout 掩盖单次 run 过大的问题。
 
 ### 新 v2 验收与 T+ 检查
 
@@ -607,8 +610,8 @@ processor，再运行 08:30 Agent，并从安全 pending 输出记录三个 sess
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+1-next-UTC-date>
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 18
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap memory-pending --limit 3
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 3
 T1_SESSION_IDS='<three-space-separated-session-ids-from-pending-output>'
 run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
 for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 1; done
@@ -622,7 +625,7 @@ for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 1
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+7-next-UTC-date>
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 3
 run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
 for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 2; done
 ```
@@ -635,7 +638,7 @@ for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 2
 
 ```bash
 /home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap process-due --current-utc-date <T+15-next-UTC-date>
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-reflection-pending --limit 3
 run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id" --accept-hooks
 for session_id in $T1_SESSION_IDS; do verify_report_memory_stage "$session_id" 3; done
 find /home/ubuntu/workspace/TradingAgents-crypto/results/hermes/review_schedules -maxdepth 1 -type f -name '*.json' -printf '%m %f\n'
@@ -657,9 +660,9 @@ session。不得为了检查这一点读取、搜索或打印 Hermes memory 正�
 只读取 bounded pending metadata，再运行一次 Agent job：
 
 ```bash
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 3
 run_scheduled_job_once_and_pause "$scheduled_review_memory_job_id"
-/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 18
+/home/ubuntu/workspace/TradingAgents-crypto/.venv-hermes-mcp/bin/python -m tradingagents.integrations.hermes_scheduled_review_bootstrap report-memory-retirement-pending --limit 3
 ```
 
 第一个安全列表只能给出 six completed reports for one symbol 中最旧 final report 的
@@ -753,6 +756,7 @@ key，不访问交易所、不真实下单，也不发送外部消息。
 | `SESSION_NOT_COMPLETED` | 仅已完成的分析可复盘；失败、排队中或运行中的会话不能复盘。 |
 | `INVALID_REVIEW_REQUEST` | 使用 `analyze_crypto` 返回的会话 ID，并选择晚于原 `trade_date`、不晚于当前 UTC 日期的 ISO `review_date`。 |
 | `PRICE_DATA_UNAVAILABLE` | CoinGecko、CryptoCompare 和 Coinbase 都未能提供同一来源的精确历史 USD 价格。不得以实时价、其他日期或混合来源替代；稍后重试并检查私有 Hermes 配置中的可选数据提供商密钥。 |
+| `tradingagents-scheduled-review-memory` API timeout | 这是 08:30 Agent/model 层等待外部 API 的问题，不属于 Feishu notifier。先确认已安装最新 skill 且 pending commands 使用 `--limit 3`；不要直接增大 timeout。若仍超过 600 秒，保留 run 输出并排查 Hermes provider/model、streaming/retry/fallback 能力。 |
 | `REVIEW_STORE_UNAVAILABLE` | 检查 `results/hermes/reviews`、`results/hermes/memories` 的所有者、可用空间与 `TRADINGAGENTS_RESULTS_DIR`。 |
 | `REVIEW_WRITE_FAILED` | 保留已有文件，检查复盘目录写权限后重试。 |
 | `LEARNING_WRITE_FAILED` | 规范复盘可能已保存但学习索引未更新；检查学习目录写权限，然后以相同 `session_id` 和 `review_date` 重试以修复索引。 |
