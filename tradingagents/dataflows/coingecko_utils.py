@@ -32,6 +32,7 @@ class CoinGeckoAPI:
         self.api_key, self.api_plan = self._resolve_api_credentials(api_key, api_plan)
         self.base_url = self.PRO_BASE_URL if self.api_plan == "pro" else self.PUBLIC_BASE_URL
         self.session = requests.Session()
+        self.session.trust_env = False
 
         if self.api_key and self.api_plan == "pro":
             self.session.headers.update({"x-cg-pro-api-key": self.api_key})

@@ -117,6 +117,22 @@ class DataflowRequestTest(unittest.TestCase):
         self.assertNotIn("x-cg-demo-api-key", api.session.headers)
         self.assertNotIn("x-cg-pro-api-key", api.session.headers)
 
+    def test_coingecko_session_ignores_environment_proxy(self):
+        module = load_module("coingecko_utils_no_proxy_under_test", "tradingagents/dataflows/coingecko_utils.py")
+
+        with patch.dict(
+            module.os.environ,
+            {
+                "HTTP_PROXY": "http://127.0.0.1:9",
+                "HTTPS_PROXY": "http://127.0.0.1:9",
+                "ALL_PROXY": "socks5://127.0.0.1:9",
+            },
+            clear=True,
+        ):
+            api = module.CoinGeckoAPI()
+
+        self.assertIs(api.session.trust_env, False)
+
     def test_demo_price_range_is_capped_below_public_api_limit(self):
         module = load_module("coingecko_utils_range_limit_under_test", "tradingagents/dataflows/coingecko_utils.py")
         captured_params = {}
