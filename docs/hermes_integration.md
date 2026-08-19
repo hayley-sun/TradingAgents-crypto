@@ -810,10 +810,10 @@ webhook URL 或签名 secret 写入本手册、示例或版本控制文件。
 
 | 配置键 | 生产 Cron 名称 | 生产 job ID |
 | --- | --- | --- |
-| `daily_submit` | `tradingagents-daily-report-submit` | `2d445dfc1a8a` |
-| `daily_archive` | `tradingagents-daily-report-archive` | `5b7f7906306a` |
-| `review_processor` | `tradingagents-scheduled-review-process` | `d6c0e087e5a8` |
-| `review_memory` | `tradingagents-scheduled-review-memory` | `e93cfab5f78e` |
+| `daily_submit` | `tradingagents-daily-report-submit` | `dc5c47e92a5e` |
+| `daily_archive` | `tradingagents-daily-report-archive` | `7ba64082900f` |
+| `review_processor` | `tradingagents-scheduled-review-process` | `89a56b2f1057` |
+| `review_memory` | `tradingagents-scheduled-review-memory` | `b6f0e430405e` |
 
 ### 部署前证据
 
@@ -861,26 +861,26 @@ snapshot_path = Path(sys.argv[2])
 expected_cron_bindings = {
     'daily_submit': {
         'name': 'tradingagents-daily-report-submit',
-        'id': '2d445dfc1a8a',
+        'id': 'dc5c47e92a5e',
     },
     'daily_archive': {
         'name': 'tradingagents-daily-report-archive',
-        'id': '5b7f7906306a',
+        'id': '7ba64082900f',
     },
     'review_processor': {
         'name': 'tradingagents-scheduled-review-process',
-        'id': 'd6c0e087e5a8',
+        'id': '89a56b2f1057',
     },
     'review_memory': {
         'name': 'tradingagents-scheduled-review-memory',
-        'id': 'e93cfab5f78e',
+        'id': 'b6f0e430405e',
     },
 }
 PRODUCTION_CRON_BINDINGS = {
-    'daily_submit': '2d445dfc1a8a',
-    'daily_archive': '5b7f7906306a',
-    'review_processor': 'd6c0e087e5a8',
-    'review_memory': 'e93cfab5f78e',
+    'daily_submit': 'dc5c47e92a5e',
+    'daily_archive': '7ba64082900f',
+    'review_processor': '89a56b2f1057',
+    'review_memory': 'b6f0e430405e',
 }
 def normalized_key(raw_key):
     return raw_key.strip().lower().replace(' ', '_').replace('-', '_')
@@ -920,12 +920,12 @@ def parse_cron_list_records(lines):
 
 
 sample_records = parse_cron_list_records([
-    '2d445dfc1a8a active',
+    'dc5c47e92a5e active',
     'Name: tradingagents-daily-report-submit',
     'Schedule: 0 8 * * *',
     '',
 ])
-assert sample_records[0]['id'] == '2d445dfc1a8a'
+assert sample_records[0]['id'] == 'dc5c47e92a5e'
 assert sample_records[0]['name'] == 'tradingagents-daily-report-submit'
 
 
@@ -1034,10 +1034,10 @@ payload = {
     'webhook_url': webhook_url,
     'signing_secret': signing_secret,
     'jobs': {
-        'daily_submit': '2d445dfc1a8a',
-        'daily_archive': '5b7f7906306a',
-        'review_processor': 'd6c0e087e5a8',
-        'review_memory': 'e93cfab5f78e',
+        'daily_submit': 'dc5c47e92a5e',
+        'daily_archive': '7ba64082900f',
+        'review_processor': '89a56b2f1057',
+        'review_memory': 'b6f0e430405e',
     },
 }
 assert set(payload) == {'version', 'webhook_url', 'signing_secret', 'jobs'}
