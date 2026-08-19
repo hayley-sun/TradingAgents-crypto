@@ -879,6 +879,47 @@ class HermesMcpTests(unittest.TestCase):
         self.assertEqual(launcher_calls, [(session.session_id, store)])
         provider_key.assert_called_once_with("openai")
 
+    def test_launch_analysis_worker_drops_proxy_environment(self):
+        captured = {}
+
+        class FakeProcess:
+            pid = 4242
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeProcess()
+
+        with TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://127.0.0.1:9",
+                "HTTPS_PROXY": "http://127.0.0.1:9",
+                "ALL_PROXY": "socks5://127.0.0.1:9",
+                "NO_PROXY": "localhost",
+                "TRADINGAGENTS_RESULTS_DIR": temp_dir,
+            },
+            clear=False,
+        ), patch("tradingagents.integrations.hermes_mcp.subprocess.Popen", fake_popen):
+            pid = hermes_mcp.launch_analysis_worker(
+                "hermes_0123456789abcdef",
+                SessionStore(Path(temp_dir) / "sessions"),
+            )
+
+        self.assertEqual(pid, 4242)
+        launched_env = captured["kwargs"]["env"]
+        self.assertEqual(launched_env["TRADINGAGENTS_RESULTS_DIR"], temp_dir)
+        for proxy_key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ):
+            self.assertNotIn(proxy_key, launched_env)
+
     @patch("tradingagents.integrations.hermes_mcp.get_provider_api_key", return_value="api-key")
     def test_start_analysis_persists_worker_launch_failure(self, provider_key):
         def fail_to_launch(session_id, store):
