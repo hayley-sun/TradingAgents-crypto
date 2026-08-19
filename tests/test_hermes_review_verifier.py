@@ -369,10 +369,10 @@ class HermesReviewVerifierTests(unittest.TestCase):
     def test_feishu_runbook_locks_exact_cron_name_id_bindings(self):
         section = feishu_runbook_section()
         expected_rows = {
-            "daily_submit": ("tradingagents-daily-report-submit", "dc5c47e92a5e"),
-            "daily_archive": ("tradingagents-daily-report-archive", "7ba64082900f"),
-            "review_processor": ("tradingagents-scheduled-review-process", "89a56b2f1057"),
-            "review_memory": ("tradingagents-scheduled-review-memory", "b6f0e430405e"),
+            "daily_submit": ("tradingagents-daily-report-submit", "2d445dfc1a8a"),
+            "daily_archive": ("tradingagents-daily-report-archive", "5b7f7906306a"),
+            "review_processor": ("tradingagents-scheduled-review-process", "d6c0e087e5a8"),
+            "review_memory": ("tradingagents-scheduled-review-memory", "e93cfab5f78e"),
         }
 
         for config_key, (job_name, job_id) in expected_rows.items():
@@ -381,10 +381,10 @@ class HermesReviewVerifierTests(unittest.TestCase):
             )
             self.assertRegex(section, row_pattern)
         self.assertIn("expected_cron_bindings = {", section)
-        self.assertIn("'id': 'dc5c47e92a5e'", section)
+        self.assertIn("'id': '2d445dfc1a8a'", section)
         self.assertIn("'name': 'tradingagents-daily-report-submit'", section)
         self.assertIn("parse_cron_list_records", section)
-        self.assertIn("'dc5c47e92a5e active'", section)
+        self.assertIn("'2d445dfc1a8a active'", section)
         self.assertIn("'Name: tradingagents-daily-report-submit'", section)
         self.assertIn("candidate_status = line_parts[1].strip('[]')", section)
         self.assertIn("record.get('id') == job_id", section)
@@ -566,10 +566,10 @@ class HermesReviewVerifierTests(unittest.TestCase):
         text = RUNBOOK_PATH.read_text(encoding="utf-8")
         section = text[text.index("## 飞书群机器人通知") :]
         expected_bindings = {
-            "daily_submit": "dc5c47e92a5e",
-            "daily_archive": "7ba64082900f",
-            "review_processor": "89a56b2f1057",
-            "review_memory": "b6f0e430405e",
+            "daily_submit": "2d445dfc1a8a",
+            "daily_archive": "5b7f7906306a",
+            "review_processor": "d6c0e087e5a8",
+            "review_memory": "e93cfab5f78e",
         }
 
         self.assertIn("PRODUCTION_CRON_BINDINGS", section)

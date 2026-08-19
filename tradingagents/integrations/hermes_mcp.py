@@ -79,18 +79,6 @@ MCP = FastMCP("tradingagents_crypto")
 _SESSION_STORE_CONSTRUCTION_ERRORS = (OSError, RuntimeError, ValueError)
 _REVIEW_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
-_PROXY_ENVIRONMENT_KEYS = frozenset(
-    {
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-    }
-)
 SESSION_MEMORY_COLLECTION_BASE_NAMES = (
     "bull_memory",
     "bear_memory",
@@ -690,11 +678,6 @@ def launch_analysis_worker(session_id: str, store: SessionStore) -> int:
     log_directory = store.root.parent / "logs"
     log_directory.mkdir(parents=True, exist_ok=True)
     log_path = log_directory / f"{session_id}.log"
-    worker_environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in _PROXY_ENVIRONMENT_KEYS
-    }
 
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
@@ -710,7 +693,6 @@ def launch_analysis_worker(session_id: str, store: SessionStore) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
-            env=worker_environment,
         )
     return process.pid
 
